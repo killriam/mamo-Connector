@@ -1,3 +1,5 @@
+mod commands;
+mod deck;
 mod deeplink;
 mod registration;
 mod ui;
@@ -10,13 +12,14 @@ use registration::RegistrationOutcome;
 const SCHEME: &str = "mamoConnector";
 const SCHEME_PREFIX: &str = "mamoConnector://";
 
-fn main() {
-    if let Err(err) = run() {
+#[tokio::main]
+async fn main() {
+    if let Err(err) = run().await {
         error!("Application error: {err:?}");
     }
 }
 
-fn run() -> Result<()> {
+async fn run() -> Result<()> {
     init_logging();
 
     info!("Starting Mamo Connector launcher");
@@ -31,9 +34,16 @@ fn run() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let deeplink = parse_deeplink(&args, SCHEME_PREFIX);
 
+    // Handle command if deeplink is present
+    let command_result = if let Some(ref dl) = deeplink {
+        Some(commands::handle_command(dl).await)
+    } else {
+        None
+    };
+
     info!("Launching UI with {} arguments", args.len());
 
-    ui::launch(registration, args, deeplink)?;
+    ui::launch(registration, args, deeplink, command_result)?;
 
     Ok(())
 }

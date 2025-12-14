@@ -1,6 +1,7 @@
 use anyhow::Result;
 use eframe::{NativeOptions, egui};
 
+use crate::commands::CommandResult;
 use crate::deeplink::Deeplink;
 use crate::registration::{RegistrationOutcome, RegistrationStatus};
 
@@ -9,25 +10,28 @@ struct AppState {
     registration: RegistrationOutcome,
     args: Vec<String>,
     deeplink: Option<Deeplink>,
+    command_result: Option<CommandResult>,
 }
 
 pub fn launch(
     registration: RegistrationOutcome,
     args: Vec<String>,
     deeplink: Option<Deeplink>,
+    command_result: Option<CommandResult>,
 ) -> Result<()> {
     let state = AppState {
         registration,
         args,
         deeplink,
+        command_result,
     };
 
     let native_options = NativeOptions::default();
     eframe::run_native(
         "Mamo Connector",
         native_options,
-        Box::new(move |_cc| Box::new(LauncherApp::new(state.clone()))),
-    )?;
+        Box::new(move |_cc| Ok(Box::new(LauncherApp::new(state.clone())))),
+    ).map_err(|e| anyhow::anyhow!("Failed to run native app: {}", e))?;
 
     Ok(())
 }
@@ -111,8 +115,37 @@ impl eframe::App for LauncherApp {
                     ui.label("Document ID");
                     ui.monospace(doc);
                 }
+
+                if let Some(deck_id) = &deeplink.deck_id {
+                    ui.separator();
+                    ui.label("Deck ID");
+                    ui.monospace(deck_id);
+                }
             } else {
                 ui.label("No mamoConnector deep link detected in the arguments.");
+            }
+
+            // Show command execution results
+            if let Some(command_result) = &self.state.command_result {
+                ui.separator();
+                ui.heading("Command Result");
+                
+                let result_text = if command_result.is_success() {
+                    egui::RichText::new(&command_result.get_message())
+                        .color(egui::Color32::from_rgb(0, 128, 0))
+                } else {
+                    egui::RichText::new(&command_result.get_message())
+                        .color(egui::Color32::from_rgb(176, 0, 32))
+                };
+                
+                ui.label(result_text);
+                
+                // Show additional details for deck creation
+                if let CommandResult::DeckCreated(deck_result) = command_result {
+                    if let Some(deck_path) = &deck_result.deck_path {
+                        ui.small(format!("Deck file: {:?}", deck_path));
+                    }
+                }
             }
         });
     }

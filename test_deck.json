@@ -1,0 +1,40 @@
+{
+    "name": "Test EDH Deck",
+    "commander": [
+        {
+            "name": "Ashling, Flame Dancer",
+            "set": "MH3",
+            "quantity": 1,
+            "collector_number": "1"
+        }
+    ],
+    "main": [
+        {
+            "name": "Lightning Bolt",
+            "set": "M20",
+            "quantity": 4,
+            "collector_number": "123"
+        },
+        {
+            "name": "Mountain",
+            "set": "UNH",
+            "quantity": 35,
+            "collector_number": "138"
+        },
+        {
+            "name": "Sol Ring",
+            "set": "C21",
+            "quantity": 1,
+            "collector_number": "247"
+        }
+    ],
+    "sideboard": [
+        {
+            "name": "Pyroblast",
+            "set": "ICE",
+            "quantity": 1,
+            "collector_number": "213"
+        }
+    ],
+    "attractions": []
+}

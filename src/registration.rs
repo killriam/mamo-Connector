@@ -55,7 +55,6 @@ pub fn ensure_registered(scheme: &str) -> Result<RegistrationOutcome> {
 
 #[cfg(windows)]
 fn register_windows(scheme: &str) -> Result<RegistrationOutcome> {
-    use std::path::Path;
     use winreg::RegKey;
     use winreg::enums::HKEY_CURRENT_USER;
 
@@ -86,7 +85,7 @@ fn register_windows(scheme: &str) -> Result<RegistrationOutcome> {
 }
 
 #[cfg(windows)]
-fn format_path(path: &Path) -> String {
+fn format_path(path: &std::path::Path) -> String {
     path.to_string_lossy().into_owned()
 }
 
