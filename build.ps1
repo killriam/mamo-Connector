@@ -21,7 +21,8 @@ if (-not $SkipBuild) {
         exit 1
     }
     Write-Host "Build successful!" -ForegroundColor Green
-} else {
+}
+else {
     Write-Host "`n[1/3] Skipping build (using existing)" -ForegroundColor Gray
 }
 
@@ -61,7 +62,8 @@ if (-not $SkipInstaller) {
         Write-Host ""
         Write-Host "After installing Inno Setup, run:" -ForegroundColor White
         Write-Host '  & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" .\installer\mamo-connector.iss' -ForegroundColor Gray
-    } else {
+    }
+    else {
         Write-Host "Found Inno Setup at: $isccPath" -ForegroundColor Gray
         
         # Create output directory
@@ -80,12 +82,14 @@ if (-not $SkipInstaller) {
                 Write-Host "Output: $($installerPath.FullName)" -ForegroundColor Cyan
                 Write-Host "Size: $([math]::Round($installerPath.Length/1MB, 2)) MB" -ForegroundColor Gray
             }
-        } else {
+        }
+        else {
             Write-Host "ERROR: Installer creation failed!" -ForegroundColor Red
             exit 1
         }
     }
-} else {
+}
+else {
     Write-Host "`n[3/3] Skipping installer creation" -ForegroundColor Gray
 }
 
