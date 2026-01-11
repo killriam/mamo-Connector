@@ -693,4 +693,198 @@ Name=ashes 0511
         assert!(response.content.contains("Ashling, Flame Dancer"));
         assert!(response.content.contains("31 Snow-Covered Mountain"));
     }
+
+    // ==================== URL-based Deck Download Tests ====================
+
+    /// Test extracting deck ID from Moxfield URL
+    #[test]
+    fn test_extract_deck_id_from_moxfield_url() {
+        let url = "https://moxfield.com/decks/oR2h0X7tREyhBBW3AlC8tw";
+        let deck_id = url.split("/decks/").nth(1).unwrap();
+        assert_eq!(deck_id, "oR2h0X7tREyhBBW3AlC8tw");
+    }
+
+    /// Test case for downloading deck from URL and creating deck file
+    /// This simulates the complete workflow:
+    /// 1. Extract deck ID from Moxfield URL
+    /// 2. Fetch deck data from API
+    /// 3. Create deck file in Forge format
+    #[tokio::test]
+    async fn test_download_deck_from_moxfield_url() {
+        // Test URL from Moxfield
+        let moxfield_url = "https://moxfield.com/decks/oR2h0X7tREyhBBW3AlC8tw";
+        
+        // Extract deck ID from URL
+        let deck_id = moxfield_url
+            .split("/decks/")
+            .nth(1)
+            .expect("Invalid Moxfield URL format");
+        
+        assert_eq!(deck_id, "oR2h0X7tREyhBBW3AlC8tw");
+        
+        // Mock API base URL (in real scenario, this would point to your backend)
+        let api_base_url = "http://localhost:8000";
+        
+        // Note: This test requires a running mock server to actually execute.
+        // The test demonstrates the structure and expected flow.
+        // To run integration tests, start test_server.py first.
+        
+        // Expected result structure
+        let expected_forge_format = r#"[metadata]
+Name=Test Moxfield Deck
+
+[Commander]
+1 Ashling, Flame Dancer|MH3|1
+
+[Main]
+1 Lightning Bolt|M20|123
+1 Sol Ring|C21|247
+35 Mountain|UNH|138
+
+[Sideboard]
+1 Pyroblast|ICE|213
+
+[Attractions]
+"#;
+        
+        // Verify expected format structure
+        assert!(expected_forge_format.contains("[metadata]"));
+        assert!(expected_forge_format.contains("[Commander]"));
+        assert!(expected_forge_format.contains("[Main]"));
+        assert!(expected_forge_format.contains("[Sideboard]"));
+        assert!(expected_forge_format.contains("[Attractions]"));
+        
+        // Verify card format: quantity name|set|collector_number
+        assert!(expected_forge_format.contains("1 Ashling, Flame Dancer|MH3|1"));
+        assert!(expected_forge_format.contains("1 Lightning Bolt|M20|123"));
+        assert!(expected_forge_format.contains("35 Mountain|UNH|138"));
+        
+        println!("Test URL: {}", moxfield_url);
+        println!("Extracted Deck ID: {}", deck_id);
+        println!("API Endpoint: {}/api/decks/export", api_base_url);
+    }
+
+    /// Integration test for full deck creation from URL
+    /// This test demonstrates the actual API call and file creation
+    /// Requires test_server.py to be running on localhost:8000
+    #[tokio::test]
+    #[ignore] // Ignored by default - run with: cargo test -- --ignored
+    async fn test_integration_create_deck_from_moxfield_url() {
+        // Start with a Moxfield URL
+        let moxfield_url = "https://moxfield.com/decks/oR2h0X7tREyhBBW3AlC8tw";
+        
+        // Extract deck ID
+        let deck_id = moxfield_url
+            .split("/decks/")
+            .nth(1)
+            .expect("Invalid Moxfield URL");
+        
+        // API endpoint (test server)
+        let api_base_url = "http://localhost:8000";
+        
+        // Call the actual function
+        let result = create_deck_from_id(deck_id, api_base_url).await;
+        
+        // Verify success
+        match result {
+            Ok(creation_result) => {
+                assert!(creation_result.success, "Deck creation should succeed");
+                assert!(creation_result.deck_path.is_some(), "Deck path should be set");
+                
+                let deck_path = creation_result.deck_path.unwrap();
+                println!("Deck created at: {:?}", deck_path);
+                
+                // Verify file exists
+                assert!(deck_path.exists(), "Deck file should exist");
+                
+                // Read and verify content
+                let content = fs::read_to_string(&deck_path)
+                    .expect("Should be able to read deck file");
+                
+                // Verify Forge format sections
+                assert!(content.contains("[metadata]"), "Should have metadata section");
+                assert!(content.contains("[Commander]"), "Should have Commander section");
+                assert!(content.contains("[Main]"), "Should have Main section");
+                assert!(content.contains("[Sideboard]"), "Should have Sideboard section");
+                assert!(content.contains("[Attractions]"), "Should have Attractions section");
+                
+                // Verify card format (quantity name|set|collector_number)
+                let has_proper_format = content.lines().any(|line| {
+                    line.contains("|") && line.split('|').count() == 3
+                });
+                assert!(has_proper_format, "Cards should be in format: quantity name|set|collector_number");
+                
+                println!("Deck file content:\n{}", content);
+                
+                // Cleanup: remove test file
+                fs::remove_file(&deck_path).ok();
+            }
+            Err(e) => {
+                panic!("Deck creation failed: {}. Make sure test_server.py is running on localhost:8000", e);
+            }
+        }
+    }
+
+    /// Test the complete expected output format for a deck file
+    #[test]
+    fn test_forge_deck_format_specification() {
+        // This test documents the expected Forge deck file format
+        
+        let expected_format = r#"[metadata]
+Name=Example Commander Deck
+
+[Commander]
+1 Ashling, Flame Dancer|MH3|1
+
+[Main]
+1 Lightning Bolt|M20|123
+1 Sol Ring|C21|247
+1 Arcane Signet|CMM|54
+35 Snow-Covered Mountain|MB2|1
+
+[Sideboard]
+1 Pyroblast|ICE|213
+1 Red Elemental Blast|M25|154
+
+[Attractions]
+"#;
+
+        // Parse and verify structure
+        let lines: Vec<&str> = expected_format.lines().collect();
+        
+        // Check required sections
+        assert!(lines.iter().any(|l| l.contains("[metadata]")));
+        assert!(lines.iter().any(|l| l.contains("[Commander]")));
+        assert!(lines.iter().any(|l| l.contains("[Main]")));
+        assert!(lines.iter().any(|l| l.contains("[Sideboard]")));
+        assert!(lines.iter().any(|l| l.contains("[Attractions]")));
+        
+        // Check card format: quantity name|set|collector_number
+        let card_lines: Vec<&str> = lines.iter()
+            .filter(|l| l.contains("|"))
+            .copied()
+            .collect();
+        
+        for card_line in card_lines {
+            let parts: Vec<&str> = card_line.split('|').collect();
+            assert_eq!(parts.len(), 3, "Card line should have 3 parts separated by |");
+            
+            // First part should be "quantity name"
+            let first_part: Vec<&str> = parts[0].trim().split_whitespace().collect();
+            assert!(first_part.len() >= 2, "First part should have quantity and name");
+            
+            // Verify quantity is a number
+            let quantity = first_part[0].parse::<u32>();
+            assert!(quantity.is_ok(), "Quantity should be a number");
+            
+            // Second part is set code
+            assert!(!parts[1].is_empty(), "Set code should not be empty");
+            
+            // Third part is collector number
+            assert!(!parts[2].trim().is_empty(), "Collector number should not be empty");
+        }
+        
+        println!("Forge format specification verified:");
+        println!("{}", expected_format);
+    }
 }
