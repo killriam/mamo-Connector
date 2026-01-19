@@ -9,6 +9,7 @@ pub struct Deeplink {
     pub token: Option<String>,
     pub doc: Option<String>,
     pub deck_id: Option<String>,
+    pub username: Option<String>,
 }
 
 pub fn parse_deeplink(args: &[String], scheme_prefix: &str) -> Option<Deeplink> {
@@ -28,6 +29,7 @@ pub fn parse_deeplink_url(raw: &str) -> Option<Deeplink> {
             let mut token = None;
             let mut doc = None;
             let mut deck_id = None;
+            let mut username = None;
             for (key, value) in url.query_pairs() {
                 let value = value.to_string();
                 if key == "token" {
@@ -39,6 +41,9 @@ pub fn parse_deeplink_url(raw: &str) -> Option<Deeplink> {
                 if key == "id" || key == "deck_id" || key == "deckId" {
                     deck_id = Some(value.clone());
                 }
+                if key == "username" || key == "user" {
+                    username = Some(value.clone());
+                }
                 params.push((key.to_string(), value));
             }
             Some(Deeplink {
@@ -48,6 +53,7 @@ pub fn parse_deeplink_url(raw: &str) -> Option<Deeplink> {
                 token,
                 doc,
                 deck_id,
+                username,
             })
         }
         Err(err) => {
@@ -168,6 +174,7 @@ mod tests {
         assert_eq!(result.action, "create-deck");
         assert!(result.params.is_empty());
         assert!(result.deck_id.is_none());
+        assert!(result.username.is_none());
     }
 
     #[test]
@@ -176,5 +183,44 @@ mod tests {
         let result = parse_deeplink_url(url);
         
         assert!(result.is_none());
+    }
+
+    // ==================== Username Parameter Tests ====================
+
+    #[test]
+    fn test_parse_import_user_decks_with_username() {
+        let url = "mamoConnector://import-user-decks?username=IceMagma&api_url=http://localhost:8080";
+        let result = parse_deeplink_url(url).unwrap();
+        
+        assert_eq!(result.action, "import-user-decks");
+        assert_eq!(result.username, Some("IceMagma".to_string()));
+        assert!(result.params.iter().any(|(k, v)| k == "api_url" && v == "http://localhost:8080"));
+    }
+
+    #[test]
+    fn test_parse_import_user_decks_with_user_param() {
+        let url = "mamoConnector://import-user-decks?user=TestUser";
+        let result = parse_deeplink_url(url).unwrap();
+        
+        assert_eq!(result.action, "import-user-decks");
+        assert_eq!(result.username, Some("TestUser".to_string()));
+    }
+
+    #[test]
+    fn test_parse_list_user_decks() {
+        let url = "mamoConnector://list-user-decks?username=IceMagma";
+        let result = parse_deeplink_url(url).unwrap();
+        
+        assert_eq!(result.action, "list-user-decks");
+        assert_eq!(result.username, Some("IceMagma".to_string()));
+    }
+
+    #[test]
+    fn test_parse_deeplink_no_username() {
+        let url = "mamoConnector://import-user-decks?api_url=http://localhost";
+        let result = parse_deeplink_url(url).unwrap();
+        
+        assert_eq!(result.action, "import-user-decks");
+        assert!(result.username.is_none());
     }
 }

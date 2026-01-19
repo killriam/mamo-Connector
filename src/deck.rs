@@ -1,8 +1,91 @@
 use anyhow::{Context, Result};
-use log::info;
+use log::{info, warn};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
+use std::process::Command;
+
+// ==================== Moxfield API Types ====================
+
+/// Represents a deck entry from Moxfield user's deck list
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MoxfieldDeckEntry {
+    pub public_id: String,
+    pub name: String,
+    pub format: Option<String>,
+    #[serde(default)]
+    pub colors: Vec<String>,
+    #[serde(default)]
+    pub color_percentages: serde_json::Value,
+    pub main_card_id: Option<String>,
+    pub has_primer: Option<bool>,
+    #[serde(default)]
+    pub view_count: u32,
+    #[serde(default)]
+    pub like_count: u32,
+    #[serde(default)]
+    pub comment_count: u32,
+    pub are_comments_enabled: Option<bool>,
+    pub is_shared: Option<bool>,
+    pub visibility: Option<String>,
+    pub public_url: Option<String>,
+    pub created_at_utc: Option<String>,
+    pub last_updated_at_utc: Option<String>,
+}
+
+/// Response from Moxfield API when fetching user decks
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MoxfieldUserDecksResponse {
+    pub page_number: u32,
+    pub page_size: u32,
+    pub total_results: u32,
+    pub total_pages: u32,
+    pub data: Vec<MoxfieldDeckEntry>,
+}
+
+/// Result of importing multiple decks from a user profile
+#[derive(Debug, Clone)]
+pub struct UserDecksImportResult {
+    pub success: bool,
+    pub message: String,
+    pub username: String,
+    pub total_decks: usize,
+    pub imported_decks: Vec<DeckCreationResult>,
+    pub failed_decks: Vec<(String, String)>, // (deck_name, error_message)
+}
+
+impl UserDecksImportResult {
+    pub fn success(username: String, imported: Vec<DeckCreationResult>, failed: Vec<(String, String)>) -> Self {
+        let total = imported.len() + failed.len();
+        let success_count = imported.iter().filter(|d| d.success).count();
+        Self {
+            success: !imported.is_empty() && failed.is_empty(),
+            message: format!(
+                "Imported {}/{} decks for user '{}' ({} failed)",
+                success_count, total, username, failed.len()
+            ),
+            username,
+            total_decks: total,
+            imported_decks: imported,
+            failed_decks: failed,
+        }
+    }
+
+    pub fn failed(username: String, error: String) -> Self {
+        Self {
+            success: false,
+            message: format!("Failed to fetch decks for user '{}': {}", username, error),
+            username,
+            total_decks: 0,
+            imported_decks: vec![],
+            failed_decks: vec![],
+        }
+    }
+}
+
+// ==================== Original Types ====================
 
 #[derive(Debug, Deserialize, Serialize)]
 pub struct Card {
@@ -67,7 +150,164 @@ impl DeckCreationResult {
     }
 }
 
-/// Create a deck file by fetching from API with forge format
+// ==================== Direct Moxfield Access (using curl) ====================
+
+const MOXFIELD_API_URL: &str = "https://api2.moxfield.com/v2";
+
+/// Fetch data from Moxfield API using curl (bypasses Cloudflare)
+fn fetch_with_curl(url: &str) -> Result<String> {
+    info!("Fetching from Moxfield via curl: {}", url);
+    
+    let output = Command::new("curl")
+        .args([
+            "-s",
+            "-H", "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            "-H", "Accept: application/json",
+            "-H", "Referer: https://www.moxfield.com/",
+            url,
+        ])
+        .output()
+        .context("Failed to execute curl command")?;
+    
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(anyhow::anyhow!("curl failed: {}", stderr));
+    }
+    
+    let body = String::from_utf8(output.stdout)
+        .context("Invalid UTF-8 in curl response")?;
+    
+    // Check for Cloudflare block (HTML response)
+    if body.contains("<!DOCTYPE html>") || body.contains("Cloudflare") {
+        return Err(anyhow::anyhow!("Cloudflare blocked the request"));
+    }
+    
+    Ok(body)
+}
+
+/// Moxfield full deck response structure
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct MoxfieldFullDeck {
+    name: String,
+    #[serde(default)]
+    created_by_user: Option<MoxfieldUser>,
+    #[serde(default)]
+    last_updated_at_utc: Option<String>,
+    #[serde(default)]
+    commanders: serde_json::Value,
+    #[serde(default)]
+    mainboard: serde_json::Value,
+    #[serde(default)]
+    sideboard: serde_json::Value,
+    #[serde(default)]
+    companions: serde_json::Value,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct MoxfieldUser {
+    user_name: String,
+}
+
+/// Create a deck directly from Moxfield (no backend needed)
+pub async fn create_deck_from_moxfield(deck_id: &str) -> Result<DeckCreationResult> {
+    info!("Creating deck directly from Moxfield: {}", deck_id);
+    
+    let url = format!("{}/decks/all/{}", MOXFIELD_API_URL, deck_id);
+    let body = fetch_with_curl(&url)?;
+    
+    let deck: MoxfieldFullDeck = serde_json::from_str(&body)
+        .context("Failed to parse Moxfield deck response")?;
+    
+    // Build filename with author and date: "user - Name of deck (date)"
+    let author = deck.created_by_user.as_ref()
+        .map(|u| u.user_name.as_str())
+        .unwrap_or("Unknown");
+    
+    let date = deck.last_updated_at_utc.as_ref()
+        .and_then(|d| d.split('T').next())  // Extract just the date part (YYYY-MM-DD)
+        .unwrap_or("Unknown");
+    
+    let full_name = format!("{} - {} ({})", author, deck.name, date);
+    
+    // Convert to Forge format
+    let forge_content = convert_moxfield_to_forge(&full_name, &body)?;
+    
+    // Write the deck file with full name including author/date
+    let deck_path = write_deck_file(&full_name, &forge_content).await
+        .context("Failed to create deck file")?;
+    
+    Ok(DeckCreationResult::success(
+        format!("Successfully created deck '{}' at {:?}", full_name, deck_path),
+        deck_path,
+    ))
+}
+
+/// Convert Moxfield deck JSON to Forge .dck format
+fn convert_moxfield_to_forge(deck_name: &str, raw_json: &str) -> Result<String> {
+    let mut lines = Vec::new();
+    
+    // Metadata
+    lines.push("[metadata]".to_string());
+    lines.push(format!("Name={}", deck_name));
+    lines.push(String::new());
+    
+    // Parse the raw JSON to access card data
+    let parsed: serde_json::Value = serde_json::from_str(raw_json)?;
+    
+    // Commander section
+    lines.push("[Commander]".to_string());
+    if let Some(commanders) = parsed.get("commanders").and_then(|c| c.as_object()) {
+        for (_, card_entry) in commanders {
+            if let Some(card_line) = format_moxfield_card(card_entry) {
+                lines.push(card_line);
+            }
+        }
+    }
+    lines.push(String::new());
+    
+    // Main deck section
+    lines.push("[Main]".to_string());
+    if let Some(mainboard) = parsed.get("mainboard").and_then(|c| c.as_object()) {
+        for (_, card_entry) in mainboard {
+            if let Some(card_line) = format_moxfield_card(card_entry) {
+                lines.push(card_line);
+            }
+        }
+    }
+    lines.push(String::new());
+    
+    // Sideboard section
+    lines.push("[Sideboard]".to_string());
+    if let Some(sideboard) = parsed.get("sideboard").and_then(|c| c.as_object()) {
+        for (_, card_entry) in sideboard {
+            if let Some(card_line) = format_moxfield_card(card_entry) {
+                lines.push(card_line);
+            }
+        }
+    }
+    
+    Ok(lines.join("\n"))
+}
+
+/// Format a single card from Moxfield JSON to Forge format
+fn format_moxfield_card(card_entry: &serde_json::Value) -> Option<String> {
+    let quantity = card_entry.get("quantity")?.as_u64().unwrap_or(1);
+    let card = card_entry.get("card")?;
+    let full_name = card.get("name")?.as_str()?;
+    
+    // For double-faced cards like "Brightclimb Pathway // Grimclimb Pathway",
+    // Forge only recognizes the front face name
+    let name = full_name.split(" // ").next().unwrap_or(full_name);
+    
+    let set = card.get("set")?.as_str()?.to_uppercase();
+    let collector_number = card.get("cn").and_then(|c| c.as_str()).unwrap_or("1");
+    
+    Some(format!("{} {}|{}|{}", quantity, name, set, collector_number))
+}
+
+/// Create a deck file by fetching from API with forge format (uses backend proxy)
 pub async fn create_deck_from_id(deck_id: &str, api_base_url: &str) -> Result<DeckCreationResult> {
     info!("Creating deck from ID: {} with FORGE format", deck_id);
 
@@ -85,21 +325,211 @@ pub async fn create_deck_from_id(deck_id: &str, api_base_url: &str) -> Result<De
     ))
 }
 
-/// Fetch deck export from API using POST with deckId and format=forge
-async fn fetch_deck_export(deck_id: &str, api_base_url: &str) -> Result<DeckExportResponse> {
+// ==================== Moxfield User Decks Functions ====================
+
+const MOXFIELD_API_BASE: &str = "https://api2.moxfield.com/v2";
+
+/// Fetch all public decks for a Moxfield user directly from Moxfield API
+/// Note: This may be blocked by Cloudflare protection. Use fetch_user_decks_via_backend for reliability.
+pub async fn fetch_moxfield_user_decks(username: &str) -> Result<Vec<MoxfieldDeckEntry>> {
+    info!("Fetching decks for Moxfield user: {} (direct API)", username);
+    
+    let client = reqwest::Client::builder()
+        .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+        .build()
+        .context("Failed to create HTTP client")?;
+    
+    let mut all_decks = Vec::new();
+    let mut page = 1;
+    let page_size = 100;
+    
+    loop {
+        let url = format!(
+            "{}/users/{}/decks?pageNumber={}&pageSize={}",
+            MOXFIELD_API_BASE, username, page, page_size
+        );
+        
+        info!("Fetching page {} from: {}", page, url);
+        
+        let response = client
+            .get(&url)
+            .header("Accept", "application/json")
+            .header("Accept-Language", "en-US,en;q=0.9")
+            .header("Origin", "https://www.moxfield.com")
+            .header("Referer", format!("https://www.moxfield.com/users/{}", username))
+            .send()
+            .await
+            .context("Failed to send request to Moxfield API")?;
+        
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            return Err(anyhow::anyhow!(
+                "Moxfield API returned error status: {} - {}",
+                status, body
+            ));
+        }
+        
+        let page_response: MoxfieldUserDecksResponse = response
+            .json()
+            .await
+            .context("Failed to parse Moxfield user decks response")?;
+        
+        info!("Fetched {} decks (page {}/{})", 
+              page_response.data.len(), 
+              page_response.page_number, 
+              page_response.total_pages);
+        
+        all_decks.extend(page_response.data);
+        
+        if page >= page_response.total_pages {
+            break;
+        }
+        page += 1;
+    }
+    
+    info!("Total decks fetched for user '{}': {}", username, all_decks.len());
+    Ok(all_decks)
+}
+
+/// Fetch user decks list via the backend API (recommended - avoids Cloudflare blocking)
+/// The backend should have an endpoint like: GET /api/moxfield/users/{username}/decks
+pub async fn fetch_user_decks_via_backend(username: &str, api_base_url: &str) -> Result<Vec<MoxfieldDeckEntry>> {
+    info!("Fetching decks for user '{}' via backend: {}", username, api_base_url);
+    
     let client = reqwest::Client::new();
-    let url = format!("{}/api/decks/export", api_base_url);
+    let url = format!("{}/api/moxfield/users/{}/decks", api_base_url, username);
     
-    let request_body = DeckExportRequest {
-        deck_id: deck_id.to_string(),
-        format: "forge".to_string(),
-    };
-    
-    info!("Fetching deck export from: {} with deckId: {}, format: forge", url, deck_id);
+    info!("Fetching from: {}", url);
     
     let response = client
-        .post(&url)
-        .json(&request_body)
+        .get(&url)
+        .send()
+        .await
+        .context("Failed to send request to backend API")?;
+    
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        return Err(anyhow::anyhow!(
+            "Backend API returned error status: {} - {}",
+            status, body
+        ));
+    }
+    
+    let decks: Vec<MoxfieldDeckEntry> = response
+        .json()
+        .await
+        .context("Failed to parse user decks response from backend")?;
+    
+    info!("Fetched {} decks for user '{}' via backend", decks.len(), username);
+    Ok(decks)
+}
+
+/// Import all decks from a Moxfield user profile
+/// First tries the backend API, falls back to direct Moxfield API if backend fails
+pub async fn import_user_decks(username: &str, api_base_url: &str) -> Result<UserDecksImportResult> {
+    info!("Importing all decks for Moxfield user: {} via API: {}", username, api_base_url);
+    
+    // Try backend API first, then fall back to direct Moxfield API
+    let decks = match fetch_user_decks_via_backend(username, api_base_url).await {
+        Ok(d) => {
+            info!("Successfully fetched deck list via backend");
+            d
+        }
+        Err(backend_err) => {
+            warn!("Backend API failed ({}), trying direct Moxfield API...", backend_err);
+            match fetch_moxfield_user_decks(username).await {
+                Ok(d) => d,
+                Err(moxfield_err) => {
+                    return Ok(UserDecksImportResult::failed(
+                        username.to_string(),
+                        format!("Backend: {} | Moxfield: {}", backend_err, moxfield_err)
+                    ));
+                }
+            }
+        }
+    };
+    
+    if decks.is_empty() {
+        return Ok(UserDecksImportResult::failed(
+            username.to_string(),
+            "No public decks found for this user".to_string()
+        ));
+    }
+    
+    info!("Found {} decks for user '{}', starting import...", decks.len(), username);
+    
+    let mut imported = Vec::new();
+    let mut failed = Vec::new();
+    
+    for deck in decks {
+        info!("Importing deck: {} (ID: {})", deck.name, deck.public_id);
+        
+        match create_deck_from_id(&deck.public_id, api_base_url).await {
+            Ok(result) => {
+                if result.success {
+                    info!("Successfully imported: {}", deck.name);
+                } else {
+                    warn!("Deck import reported failure: {}", result.message);
+                }
+                imported.push(result);
+            }
+            Err(e) => {
+                warn!("Failed to import deck '{}': {}", deck.name, e);
+                failed.push((deck.name.clone(), e.to_string()));
+            }
+        }
+    }
+    
+    Ok(UserDecksImportResult::success(username.to_string(), imported, failed))
+}
+/// Fetch the list of decks for a user (without importing them)
+/// Uses backend proxy to avoid Cloudflare blocking
+pub async fn list_moxfield_user_decks(username: &str, api_base_url: &str) -> Result<Vec<MoxfieldDeckEntry>> {
+    // Use backend proxy to avoid Cloudflare blocking
+    fetch_user_decks_via_backend(username, api_base_url).await
+}
+
+/// Import selected decks from a list of deck IDs
+pub async fn import_selected_decks(
+    deck_ids: &[String], 
+    api_base_url: &str,
+    username: &str,
+) -> Result<UserDecksImportResult> {
+    info!("Importing {} selected decks via API: {}", deck_ids.len(), api_base_url);
+    
+    let mut imported = Vec::new();
+    let mut failed = Vec::new();
+    
+    for deck_id in deck_ids {
+        info!("Importing deck ID: {}", deck_id);
+        
+        match create_deck_from_id(deck_id, api_base_url).await {
+            Ok(result) => {
+                imported.push(result);
+            }
+            Err(e) => {
+                warn!("Failed to import deck '{}': {}", deck_id, e);
+                failed.push((deck_id.clone(), e.to_string()));
+            }
+        }
+    }
+    
+    Ok(UserDecksImportResult::success(username.to_string(), imported, failed))
+}
+
+// ==================== Helper Functions ====================
+
+/// Fetch deck export from API using GET with deckId in path
+async fn fetch_deck_export(deck_id: &str, api_base_url: &str) -> Result<DeckExportResponse> {
+    let client = reqwest::Client::new();
+    let url = format!("{}/api/moxfield/decks/{}/export?format=forge", api_base_url, deck_id);
+    
+    info!("Fetching deck export from: {}", url);
+    
+    let response = client
+        .get(&url)
         .send()
         .await
         .context("Failed to send request to API")?;
@@ -761,7 +1191,7 @@ Name=Test Moxfield Deck
         
         println!("Test URL: {}", moxfield_url);
         println!("Extracted Deck ID: {}", deck_id);
-        println!("API Endpoint: {}/api/decks/export", api_base_url);
+        println!("API Endpoint: {}/api/moxfield/decks/{}/export?format=forge", api_base_url, deck_id);
     }
 
     /// Integration test for full deck creation from URL
@@ -886,5 +1316,166 @@ Name=Example Commander Deck
         
         println!("Forge format specification verified:");
         println!("{}", expected_format);
+    }
+
+    // ==================== Moxfield User Decks Tests ====================
+
+    #[test]
+    fn test_moxfield_deck_entry_deserialization() {
+        let json = r#"{
+            "publicId": "abc123",
+            "name": "Test Commander Deck",
+            "format": "commander",
+            "colors": ["W", "U"],
+            "viewCount": 100,
+            "likeCount": 5,
+            "commentCount": 2
+        }"#;
+        
+        let entry: MoxfieldDeckEntry = serde_json::from_str(json).unwrap();
+        assert_eq!(entry.public_id, "abc123");
+        assert_eq!(entry.name, "Test Commander Deck");
+        assert_eq!(entry.format, Some("commander".to_string()));
+        assert_eq!(entry.colors.len(), 2);
+        assert_eq!(entry.view_count, 100);
+    }
+
+    #[test]
+    fn test_moxfield_deck_entry_minimal_deserialization() {
+        // Test with only required fields
+        let json = r#"{
+            "publicId": "xyz789",
+            "name": "Minimal Deck"
+        }"#;
+        
+        let entry: MoxfieldDeckEntry = serde_json::from_str(json).unwrap();
+        assert_eq!(entry.public_id, "xyz789");
+        assert_eq!(entry.name, "Minimal Deck");
+        assert!(entry.format.is_none());
+        assert!(entry.colors.is_empty());
+        assert_eq!(entry.view_count, 0);
+    }
+
+    #[test]
+    fn test_moxfield_user_decks_response_deserialization() {
+        let json = r#"{
+            "pageNumber": 1,
+            "pageSize": 10,
+            "totalResults": 2,
+            "totalPages": 1,
+            "data": [
+                {"publicId": "deck1", "name": "Deck One"},
+                {"publicId": "deck2", "name": "Deck Two"}
+            ]
+        }"#;
+        
+        let response: MoxfieldUserDecksResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(response.page_number, 1);
+        assert_eq!(response.page_size, 10);
+        assert_eq!(response.total_results, 2);
+        assert_eq!(response.total_pages, 1);
+        assert_eq!(response.data.len(), 2);
+        assert_eq!(response.data[0].name, "Deck One");
+    }
+
+    #[test]
+    fn test_user_decks_import_result_success() {
+        let imported = vec![
+            DeckCreationResult::success("Deck 1".to_string(), PathBuf::from("/test/deck1.dck")),
+            DeckCreationResult::success("Deck 2".to_string(), PathBuf::from("/test/deck2.dck")),
+        ];
+        let failed: Vec<(String, String)> = vec![];
+        
+        let result = UserDecksImportResult::success("TestUser".to_string(), imported, failed);
+        
+        assert!(result.success);
+        assert_eq!(result.username, "TestUser");
+        assert_eq!(result.total_decks, 2);
+        assert_eq!(result.imported_decks.len(), 2);
+        assert!(result.failed_decks.is_empty());
+        assert!(result.message.contains("2/2"));
+    }
+
+    #[test]
+    fn test_user_decks_import_result_partial_failure() {
+        let imported = vec![
+            DeckCreationResult::success("Deck 1".to_string(), PathBuf::from("/test/deck1.dck")),
+        ];
+        let failed = vec![
+            ("Deck 2".to_string(), "API error".to_string()),
+        ];
+        
+        let result = UserDecksImportResult::success("TestUser".to_string(), imported, failed);
+        
+        assert!(!result.success); // Has failures
+        assert_eq!(result.total_decks, 2);
+        assert_eq!(result.imported_decks.len(), 1);
+        assert_eq!(result.failed_decks.len(), 1);
+        assert!(result.message.contains("1 failed"));
+    }
+
+    #[test]
+    fn test_user_decks_import_result_failed() {
+        let result = UserDecksImportResult::failed(
+            "TestUser".to_string(), 
+            "User not found".to_string()
+        );
+        
+        assert!(!result.success);
+        assert_eq!(result.username, "TestUser");
+        assert_eq!(result.total_decks, 0);
+        assert!(result.message.contains("Failed"));
+        assert!(result.message.contains("User not found"));
+    }
+
+    /// Integration test for fetching real Moxfield user decks
+    /// This test requires network access to Moxfield API
+    #[tokio::test]
+    #[ignore] // Ignored by default - run with: cargo test -- --ignored
+    async fn test_integration_fetch_moxfield_user_decks() {
+        let username = "IceMagma";
+        
+        let result = fetch_moxfield_user_decks(username).await;
+        
+        match result {
+            Ok(decks) => {
+                println!("Found {} decks for user '{}'", decks.len(), username);
+                assert!(!decks.is_empty(), "User should have some public decks");
+                
+                // Print first few decks
+                for (i, deck) in decks.iter().take(5).enumerate() {
+                    println!("  {}. {} (ID: {}, Format: {:?})", 
+                             i + 1, deck.name, deck.public_id, deck.format);
+                }
+            }
+            Err(e) => {
+                panic!("Failed to fetch user decks: {}. Check network connectivity.", e);
+            }
+        }
+    }
+
+    /// Integration test for listing user decks via the public function
+    #[tokio::test]
+    #[ignore]
+    async fn test_integration_list_moxfield_user_decks() {
+        let username = "IceMagma";
+        
+        let result = list_moxfield_user_decks(username).await;
+        
+        match result {
+            Ok(decks) => {
+                println!("Listed {} decks for user '{}'", decks.len(), username);
+                
+                // Verify we get the expected structure
+                for deck in decks.iter().take(3) {
+                    assert!(!deck.public_id.is_empty());
+                    assert!(!deck.name.is_empty());
+                    println!("  - {} ({})", deck.name, deck.public_id);
+                }
+            }
+            Err(e) => {
+                println!("Could not list decks (network may be unavailable): {}", e);
+            }
+        }
     }
 }

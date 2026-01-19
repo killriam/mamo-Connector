@@ -1,10 +1,12 @@
 use log::{error, info, warn};
 use crate::deeplink::Deeplink;
-use crate::deck::{create_deck_from_id, DeckCreationResult};
+use crate::deck::{create_deck_from_id, DeckCreationResult, UserDecksImportResult, import_user_decks, list_moxfield_user_decks, MoxfieldDeckEntry};
 
 #[derive(Debug, Clone)]
 pub enum CommandResult {
     DeckCreated(DeckCreationResult),
+    UserDecksImported(UserDecksImportResult),
+    UserDecksList(Vec<MoxfieldDeckEntry>),
     UnknownAction(String),
     MissingParameters(String),
     Error(String),
@@ -14,6 +16,8 @@ impl CommandResult {
     pub fn get_message(&self) -> String {
         match self {
             CommandResult::DeckCreated(result) => result.message.clone(),
+            CommandResult::UserDecksImported(result) => result.message.clone(),
+            CommandResult::UserDecksList(decks) => format!("Found {} decks", decks.len()),
             CommandResult::UnknownAction(action) => format!("Unknown action: {}", action),
             CommandResult::MissingParameters(msg) => format!("Missing parameters: {}", msg),
             CommandResult::Error(msg) => format!("Error: {}", msg),
@@ -23,6 +27,8 @@ impl CommandResult {
     pub fn is_success(&self) -> bool {
         match self {
             CommandResult::DeckCreated(result) => result.success,
+            CommandResult::UserDecksImported(result) => result.success,
+            CommandResult::UserDecksList(decks) => !decks.is_empty(),
             _ => false,
         }
     }
@@ -34,6 +40,8 @@ pub async fn handle_command(deeplink: &Deeplink) -> CommandResult {
     match deeplink.action.as_str() {
         "create-deck" => handle_create_deck(deeplink).await,
         "createdeck" => handle_create_deck(deeplink).await, // Alternative format
+        "import-user-decks" | "importuserdecks" => handle_import_user_decks(deeplink).await,
+        "list-user-decks" | "listuserdecks" => handle_list_user_decks(deeplink).await,
         "" => CommandResult::MissingParameters("No action specified in deeplink".to_string()),
         action => {
             warn!("Unknown action received: {}", action);
@@ -69,6 +77,71 @@ async fn handle_create_deck(deeplink: &Deeplink) -> CommandResult {
         Err(err) => {
             error!("Failed to create deck: {:?}", err);
             CommandResult::Error(format!("Failed to create deck: {}", err))
+        }
+    }
+}
+
+async fn handle_import_user_decks(deeplink: &Deeplink) -> CommandResult {
+    // Extract username from parameters
+    let username = match get_parameter(&deeplink.params, "username")
+        .or_else(|| get_parameter(&deeplink.params, "user"))
+        .or_else(|| deeplink.username.clone())
+    {
+        Some(u) => u,
+        None => {
+            error!("No username provided in import-user-decks command");
+            return CommandResult::MissingParameters(
+                "Username is required. Use 'username' or 'user' parameter".to_string()
+            );
+        }
+    };
+
+    // Extract API base URL (with default fallback)
+    let api_base_url = get_parameter(&deeplink.params, "api_url")
+        .or_else(|| get_parameter(&deeplink.params, "api"))
+        .unwrap_or_else(|| "https://api.example.com".to_string());
+
+    info!("Importing decks for user: {} from API: {}", username, api_base_url);
+
+    match import_user_decks(&username, &api_base_url).await {
+        Ok(result) => CommandResult::UserDecksImported(result),
+        Err(err) => {
+            error!("Failed to import user decks: {:?}", err);
+            CommandResult::Error(format!("Failed to import user decks: {}", err))
+        }
+    }
+}
+
+async fn handle_list_user_decks(deeplink: &Deeplink) -> CommandResult {
+    // Extract username from parameters
+    let username = match get_parameter(&deeplink.params, "username")
+        .or_else(|| get_parameter(&deeplink.params, "user"))
+        .or_else(|| deeplink.username.clone())
+    {
+        Some(u) => u,
+        None => {
+            error!("No username provided in list-user-decks command");
+            return CommandResult::MissingParameters(
+                "Username is required. Use 'username' or 'user' parameter".to_string()
+            );
+        }
+    };
+
+    // Extract API base URL (with default fallback to Vercel backend)
+    let api_base_url = get_parameter(&deeplink.params, "api_url")
+        .or_else(|| get_parameter(&deeplink.params, "api"))
+        .unwrap_or_else(|| "https://new-backend-two-eosin.vercel.app".to_string());
+
+    info!("Listing decks for Moxfield user: {} via API: {}", username, api_base_url);
+
+    match list_moxfield_user_decks(&username, &api_base_url).await {
+        Ok(decks) => {
+            info!("Found {} decks for user '{}'", decks.len(), username);
+            CommandResult::UserDecksList(decks)
+        }
+        Err(err) => {
+            error!("Failed to list user decks: {:?}", err);
+            CommandResult::Error(format!("Failed to list user decks: {}", err))
         }
     }
 }
@@ -207,6 +280,10 @@ mod tests {
             .find(|(k, _)| k == "id" || k == "deck_id" || k == "deckId")
             .map(|(_, v)| v.clone());
         
+        let username = params.iter()
+            .find(|(k, _)| k == "username" || k == "user")
+            .map(|(_, v)| v.clone());
+        
         Deeplink {
             raw: format!("mamoConnector://{}?test", action),
             action: action.to_string(),
@@ -214,6 +291,7 @@ mod tests {
             token: None,
             doc: None,
             deck_id,
+            username,
         }
     }
 
@@ -326,6 +404,94 @@ mod tests {
             }
             CommandResult::DeckCreated(_) => {}
             _ => panic!("Expected Error or DeckCreated result"),
+        }
+    }
+
+    // ==================== Import User Decks Tests ====================
+
+    #[tokio::test]
+    async fn test_handle_command_import_user_decks_missing_username() {
+        let deeplink = create_test_deeplink("import-user-decks", vec![
+            ("api_url", "http://localhost:8080")
+        ]);
+        let result = handle_command(&deeplink).await;
+        
+        match result {
+            CommandResult::MissingParameters(msg) => {
+                assert!(msg.contains("Username"));
+            }
+            _ => panic!("Expected MissingParameters result for missing username"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_handle_command_import_user_decks_with_username() {
+        let deeplink = create_test_deeplink("import-user-decks", vec![
+            ("username", "IceMagma"),
+            ("api_url", "http://invalid-url-for-test.local")
+        ]);
+        let result = handle_command(&deeplink).await;
+        
+        // Should attempt to fetch from Moxfield first, then fail on API
+        match result {
+            CommandResult::UserDecksImported(import_result) => {
+                // Either success (if Moxfield is reachable) or failed (if not)
+                assert_eq!(import_result.username, "IceMagma");
+            }
+            CommandResult::Error(_) => {
+                // Network error is also acceptable
+            }
+            _ => panic!("Expected UserDecksImported or Error result"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_handle_command_import_user_decks_alternative_format() {
+        let deeplink = create_test_deeplink("importuserdecks", vec![
+            ("user", "TestUser"),
+        ]);
+        let result = handle_command(&deeplink).await;
+        
+        // Should handle importuserdecks the same as import-user-decks
+        match result {
+            CommandResult::UserDecksImported(import_result) => {
+                assert_eq!(import_result.username, "TestUser");
+            }
+            CommandResult::Error(_) => {}
+            _ => panic!("Expected UserDecksImported or Error result"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_handle_command_list_user_decks_missing_username() {
+        let deeplink = create_test_deeplink("list-user-decks", vec![]);
+        let result = handle_command(&deeplink).await;
+        
+        match result {
+            CommandResult::MissingParameters(msg) => {
+                assert!(msg.contains("Username"));
+            }
+            _ => panic!("Expected MissingParameters result for missing username"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_handle_command_list_user_decks_with_username() {
+        let deeplink = create_test_deeplink("list-user-decks", vec![
+            ("username", "IceMagma")
+        ]);
+        let result = handle_command(&deeplink).await;
+        
+        match result {
+            CommandResult::UserDecksList(decks) => {
+                // If Moxfield is reachable, we should get some decks
+                // IceMagma has public decks
+                println!("Found {} decks for IceMagma", decks.len());
+            }
+            CommandResult::Error(_) => {
+                // Network error is acceptable in test environment
+            }
+            _ => panic!("Expected UserDecksList or Error result"),
         }
     }
 }
