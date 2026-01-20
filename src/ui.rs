@@ -3,31 +3,35 @@ use eframe::{NativeOptions, egui};
 use std::sync::{Arc, Mutex};
 
 use crate::commands::CommandResult;
-use crate::deck::{create_deck_from_id, create_deck_from_moxfield, MoxfieldDeckEntry, list_moxfield_user_decks, import_selected_decks};
+use crate::deck::{create_deck_from_moxfield, MoxfieldDeckEntry, DeckStatus, fetch_user_decks_direct, create_deck_from_archidekt, create_deck_from_deckstats, create_deck_from_mamo, parse_archidekt_url, parse_deckstats_url, parse_mamo_url};
 use crate::deeplink::Deeplink;
 use crate::registration::{RegistrationOutcome, RegistrationStatus};
 
 #[derive(Clone, PartialEq, Eq)]
 enum Tab {
     Status,
-    SingleDeck,
-    UserDecks,
+    Import,
+}
+
+/// Detected URL type for auto-detection
+#[derive(Clone, PartialEq, Eq, Debug)]
+enum UrlType {
+    MoxfieldDeck(String),         // Deck ID
+    MoxfieldUser(String),         // Username
+    ArchidektDeck(String),        // Deck ID
+    DeckstatsDeck(String, String), // Owner ID, Deck ID
+    MamoDeck(String),             // MaMo Deck UUID
+    Unknown,
+    Empty,
 }
 
 #[derive(Clone, Default)]
-struct UserDecksState {
-    username_input: String,
-    decks: Vec<MoxfieldDeckEntry>,
-    selected_decks: Vec<bool>,
-    is_loading: bool,
-    error_message: Option<String>,
-    import_result: Option<String>,
-}
-
-#[derive(Clone, Default)]
-struct SingleDeckState {
+struct ImportState {
     is_loading: bool,
     result_message: Option<String>,
+    // For user decks
+    decks: Vec<MoxfieldDeckEntry>,
+    selected_decks: Vec<bool>,
 }
 
 #[derive(Clone)]
@@ -87,24 +91,18 @@ pub fn launch(
 
 struct LauncherApp {
     state: AppState,
-    deck_url_input: String,
-    api_url_input: String,
-    use_direct_mode: bool,  // Direct Moxfield access using curl (no backend)
+    url_input: String,
     current_tab: Tab,
-    user_decks_state: Arc<Mutex<UserDecksState>>,
-    single_deck_state: Arc<Mutex<SingleDeckState>>,
+    import_state: Arc<Mutex<ImportState>>,
 }
 
 impl LauncherApp {
     fn new(state: AppState) -> Self {
         Self {
             state,
-            deck_url_input: String::new(),
-            api_url_input: "http://localhost:3001".to_string(),
-            use_direct_mode: true,  // Default to direct mode (no backend needed)
-            current_tab: Tab::Status,
-            user_decks_state: Arc::new(Mutex::new(UserDecksState::default())),
-            single_deck_state: Arc::new(Mutex::new(SingleDeckState::default())),
+            url_input: String::new(),
+            current_tab: Tab::Import,
+            import_state: Arc::new(Mutex::new(ImportState::default())),
         }
     }
 }
@@ -125,11 +123,8 @@ impl eframe::App for LauncherApp {
                     if ui.selectable_label(self.current_tab == Tab::Status, "Status").clicked() {
                         self.current_tab = Tab::Status;
                     }
-                    if ui.selectable_label(self.current_tab == Tab::SingleDeck, "Single Deck").clicked() {
-                        self.current_tab = Tab::SingleDeck;
-                    }
-                    if ui.selectable_label(self.current_tab == Tab::UserDecks, "User Decks").clicked() {
-                        self.current_tab = Tab::UserDecks;
+                    if ui.selectable_label(self.current_tab == Tab::Import, "Import Decks").clicked() {
+                        self.current_tab = Tab::Import;
                     }
                 });
                 ui.separator();
@@ -137,8 +132,7 @@ impl eframe::App for LauncherApp {
                 // Tab content
                 match self.current_tab {
                     Tab::Status => self.render_status_tab(ui),
-                    Tab::SingleDeck => self.render_single_deck_tab(ui, ctx),
-                    Tab::UserDecks => self.render_user_decks_tab(ui, ctx),
+                    Tab::Import => self.render_import_tab(ui, ctx),
                 }
             });
     }
@@ -218,281 +212,346 @@ impl LauncherApp {
         }
     }
     
-    fn render_single_deck_tab(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
-        ui.label("Import a single deck from Moxfield");
-        ui.add_space(10.0);
+    fn detect_url_type(&self, url: &str) -> UrlType {
+        let url = url.trim();
         
-        // Direct mode checkbox
-        ui.horizontal(|ui| {
-            ui.checkbox(&mut self.use_direct_mode, "Direct mode (no backend needed)");
-        });
-        ui.small("Uses curl to fetch directly from Moxfield. Works without running the backend.");
-        ui.add_space(10.0);
-        
-        // Only show API URL if not using direct mode
-        if !self.use_direct_mode {
-            ui.horizontal(|ui| {
-                ui.label("API URL:");
-                ui.text_edit_singleline(&mut self.api_url_input);
-            });
-            ui.add_space(5.0);
+        if url.is_empty() {
+            return UrlType::Empty;
         }
         
+        // Moxfield user: https://moxfield.com/users/USERNAME
+        if url.contains("moxfield.com/users/") {
+            if let Some(username) = url.split("/users/").nth(1) {
+                let username = username.split(&['/', '?', '#'][..]).next().unwrap_or(username);
+                if !username.is_empty() {
+                    return UrlType::MoxfieldUser(username.to_string());
+                }
+            }
+        }
+        
+        // Moxfield deck: https://moxfield.com/decks/DECK_ID
+        if url.contains("moxfield.com/decks/") {
+            if let Some(deck_id) = url.split("/decks/").nth(1) {
+                let deck_id = deck_id.split(&['/', '?', '#'][..]).next().unwrap_or(deck_id);
+                if !deck_id.is_empty() {
+                    return UrlType::MoxfieldDeck(deck_id.to_string());
+                }
+            }
+        }
+        
+        // Archidekt: https://archidekt.com/decks/12345678/deck_name
+        if let Some(deck_id) = parse_archidekt_url(url) {
+            return UrlType::ArchidektDeck(deck_id);
+        }
+        
+        // Deckstats: https://deckstats.net/decks/123456/7890123-deck_name
+        if let Some((owner_id, deck_id)) = parse_deckstats_url(url) {
+            return UrlType::DeckstatsDeck(owner_id, deck_id);
+        }
+        
+        // MaMo: https://ma-mo-frontend.vercel.app/deckId=UUID or similar
+        if let Some(deck_uuid) = parse_mamo_url(url) {
+            return UrlType::MamoDeck(deck_uuid);
+        }
+        
+        // Plain Moxfield deck ID (no URL)
+        if !url.contains("://") && !url.contains(".") && url.len() > 5 {
+            return UrlType::MoxfieldDeck(url.to_string());
+        }
+        
+        UrlType::Unknown
+    }
+    
+    fn render_import_tab(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        ui.label(egui::RichText::new("Import Decks").strong());
+        ui.add_space(5.0);
+        
+        // Description
+        ui.label("Paste a URL or username/deck ID to import decks. Supported sources:");
+        ui.add_space(3.0);
+        
+        egui::Grid::new("sources_grid")
+            .num_columns(2)
+            .spacing([20.0, 4.0])
+            .show(ui, |ui| {
+                ui.label(egui::RichText::new("Moxfield Deck:").strong());
+                ui.label("https://moxfield.com/decks/DECK_ID or just the deck ID");
+                ui.end_row();
+                
+                ui.label(egui::RichText::new("Moxfield User:").strong());
+                ui.label("https://moxfield.com/users/USERNAME → lists all user decks");
+                ui.end_row();
+                
+                ui.label(egui::RichText::new("Archidekt:").strong());
+                ui.label("https://archidekt.com/decks/12345678/deck_name");
+                ui.end_row();
+                
+                ui.label(egui::RichText::new("Deckstats:").strong());
+                ui.label("https://deckstats.net/decks/123456/7890123-deck_name");
+                ui.end_row();
+                
+                ui.label(egui::RichText::new("MaMo:").strong());
+                ui.label("https://ma-mo-frontend.vercel.app/deckId=UUID");
+                ui.end_row();
+            });
+        
+        ui.add_space(10.0);
+        ui.separator();
+        ui.add_space(10.0);
+        
+        // URL input
         ui.horizontal(|ui| {
-            ui.label("Deck URL:");
-            ui.text_edit_singleline(&mut self.deck_url_input);
+            ui.label("URL / ID:");
+            let response = ui.add(egui::TextEdit::singleline(&mut self.url_input).desired_width(500.0));
+            if response.changed() {
+                // Clear state when URL changes
+                let mut state = self.import_state.lock().unwrap();
+                state.decks.clear();
+                state.selected_decks.clear();
+                state.result_message = None;
+            }
         });
         
-        ui.add_space(5.0);
-        ui.small("Example: https://moxfield.com/decks/abc123 or just the deck ID");
+        ui.add_space(10.0);
+        
+        // Detect URL type
+        let url_type = self.detect_url_type(&self.url_input);
+        
+        // Show detection result
+        match &url_type {
+            UrlType::MoxfieldDeck(id) => {
+                ui.label(egui::RichText::new(format!("✓ Moxfield Deck: {}", id)).color(egui::Color32::from_rgb(0, 128, 0)));
+            }
+            UrlType::MoxfieldUser(username) => {
+                ui.label(egui::RichText::new(format!("✓ Moxfield User: {} → will list all decks", username)).color(egui::Color32::from_rgb(0, 128, 0)));
+            }
+            UrlType::ArchidektDeck(id) => {
+                ui.label(egui::RichText::new(format!("✓ Archidekt Deck: {}", id)).color(egui::Color32::from_rgb(0, 128, 0)));
+            }
+            UrlType::DeckstatsDeck(owner, deck) => {
+                ui.label(egui::RichText::new(format!("✓ Deckstats Deck: {}/{}", owner, deck)).color(egui::Color32::from_rgb(0, 128, 0)));
+            }
+            UrlType::MamoDeck(uuid) => {
+                ui.label(egui::RichText::new(format!("✓ MaMo Deck: {}", uuid)).color(egui::Color32::from_rgb(0, 128, 0)));
+            }
+            UrlType::Unknown => {
+                ui.label(egui::RichText::new("⚠ Unknown URL format").color(egui::Color32::from_rgb(200, 100, 0)));
+            }
+            UrlType::Empty => {}
+        }
+        
         ui.add_space(10.0);
         
         // Get current state
-        let (is_loading, result_message) = {
-            let state = self.single_deck_state.lock().unwrap();
-            (state.is_loading, state.result_message.clone())
-        };
-        
-        if ui.add_enabled(!is_loading, egui::Button::new("Download Deck")).clicked() {
-            self.handle_download_deck(ctx);
-        }
-        
-        if is_loading {
-            ui.spinner();
-            ui.label("Loading...");
-        }
-        
-        if let Some(ref result) = result_message {
-            ui.separator();
-            ui.label(result);
-        }
-    }
-    
-    fn render_user_decks_tab(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
-        ui.label("Import decks from a Moxfield user profile");
-        ui.add_space(10.0);
-        
-        ui.horizontal(|ui| {
-            ui.label("API URL:");
-            ui.text_edit_singleline(&mut self.api_url_input);
-        });
-        ui.add_space(5.0);
-        
-        // Get a snapshot of the state values we need
-        let (is_loading, username_input, has_decks, has_error, error_msg, decks_info) = {
-            let state = self.user_decks_state.lock().unwrap();
+        let (is_loading, result_message, has_decks, decks_info) = {
+            let state = self.import_state.lock().unwrap();
             (
                 state.is_loading,
-                state.username_input.clone(),
+                state.result_message.clone(),
                 !state.decks.is_empty(),
-                state.error_message.is_some(),
-                state.error_message.clone(),
                 state.decks.iter().enumerate().map(|(i, d)| {
-                    (i, d.public_id.clone(), d.name.clone(), d.format.clone(), d.view_count, state.selected_decks.get(i).copied().unwrap_or(false))
+                    (i, d.public_id.clone(), d.name.clone(), d.format.clone(), 
+                     state.selected_decks.get(i).copied().unwrap_or(false),
+                     d.local_status.clone(), d.local_date.clone(),
+                     d.last_updated_at_utc.as_ref().and_then(|dt| dt.split('T').next()).map(|s| s.to_string()))
                 }).collect::<Vec<_>>(),
             )
         };
         
-        // Username input and fetch button
-        let mut new_username = username_input.clone();
-        ui.horizontal(|ui| {
-            ui.label("Username:");
-            ui.text_edit_singleline(&mut new_username);
-        });
-        
-        // Update username if changed
-        if new_username != username_input {
-            let mut state = self.user_decks_state.lock().unwrap();
-            state.username_input = new_username.clone();
-        }
-        
-        let can_fetch = !is_loading && !new_username.trim().is_empty();
-        if ui.add_enabled(can_fetch, egui::Button::new("Fetch Decks")).clicked() {
-            let username = new_username.trim().to_string();
-            let api_url = self.api_url_input.clone();
-            let state_clone = Arc::clone(&self.user_decks_state);
-            let ctx_clone = ctx.clone();
-            
-            {
-                let mut state = self.user_decks_state.lock().unwrap();
-                state.is_loading = true;
-                state.error_message = None;
-                state.decks.clear();
-                state.selected_decks.clear();
-                state.import_result = None;
-            }
-            
-            tokio::spawn(async move {
-                let result = list_moxfield_user_decks(&username, &api_url).await;
-                
-                let mut state = state_clone.lock().unwrap();
-                state.is_loading = false;
-                
-                match result {
-                    Ok(decks) => {
-                        state.selected_decks = vec![false; decks.len()];
-                        state.decks = decks;
-                        state.error_message = None;
-                    }
-                    Err(e) => {
-                        state.error_message = Some(format!("Failed to fetch decks: {}", e));
+        // Main action button based on URL type
+        match &url_type {
+            UrlType::MoxfieldUser(username) => {
+                if !has_decks {
+                    // Show "Fetch Decks" button
+                    if ui.add_enabled(!is_loading, egui::Button::new("Fetch User Decks")).clicked() {
+                        self.fetch_user_decks(username.clone(), ctx);
                     }
                 }
-                
-                ctx_clone.request_repaint();
+            }
+            UrlType::MoxfieldDeck(_) | UrlType::ArchidektDeck(_) | UrlType::DeckstatsDeck(_, _) | UrlType::MamoDeck(_) => {
+                if ui.add_enabled(!is_loading, egui::Button::new("Import Deck")).clicked() {
+                    self.import_single_deck(&url_type, ctx);
+                }
+            }
+            _ => {}
+        }
+        
+        if is_loading {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label("Loading...");
             });
         }
         
-        ui.add_space(5.0);
-        ui.small("Enter a Moxfield username (e.g., IceMagma)");
-        ui.add_space(10.0);
-        
-        if is_loading {
-            ui.spinner();
-            ui.label("Loading decks...");
-            return;
-        }
-        
-        if has_error {
-            if let Some(error) = error_msg {
-                ui.label(egui::RichText::new(error).color(egui::Color32::from_rgb(176, 0, 32)));
-            }
-            return;
-        }
-        
+        // Show user decks list if available
         if has_decks {
             ui.separator();
+            ui.add_space(5.0);
             
             // Selection controls
             ui.horizontal(|ui| {
                 if ui.button("Select All").clicked() {
-                    let mut state = self.user_decks_state.lock().unwrap();
+                    let mut state = self.import_state.lock().unwrap();
                     for selected in &mut state.selected_decks {
                         *selected = true;
                     }
                 }
                 if ui.button("Select None").clicked() {
-                    let mut state = self.user_decks_state.lock().unwrap();
+                    let mut state = self.import_state.lock().unwrap();
                     for selected in &mut state.selected_decks {
                         *selected = false;
                     }
                 }
+                if ui.button("Select New/Updated").clicked() {
+                    let mut state = self.import_state.lock().unwrap();
+                    let indices_to_select: Vec<usize> = state.decks.iter().enumerate()
+                        .filter(|(_, deck)| deck.local_status.as_ref() != Some(&DeckStatus::UpToDate))
+                        .map(|(i, _)| i)
+                        .collect();
+                    for (i, selected) in state.selected_decks.iter_mut().enumerate() {
+                        *selected = indices_to_select.contains(&i);
+                    }
+                }
                 
-                let selected_count = decks_info.iter().filter(|(_, _, _, _, _, s)| *s).count();
+                let selected_count = decks_info.iter().filter(|(_, _, _, _, s, _, _, _)| *s).count();
                 ui.label(format!("{}/{} selected", selected_count, decks_info.len()));
+            });
+            
+            // Status legend
+            ui.horizontal(|ui| {
+                ui.label("Status: ");
+                ui.label(egui::RichText::new("● New").color(egui::Color32::from_rgb(0, 150, 0)));
+                ui.label(egui::RichText::new("● Needs Update").color(egui::Color32::from_rgb(255, 165, 0)));
+                ui.label(egui::RichText::new("● Up to date").color(egui::Color32::from_rgb(100, 100, 100)));
             });
             
             ui.add_space(5.0);
             
             // Deck list with scrolling
+            let available_height = ui.available_height() - 60.0;
             egui::ScrollArea::vertical()
-                .max_height(300.0)
+                .max_height(available_height.max(100.0))
                 .show(ui, |ui| {
-                    for (i, _deck_id, name, format, views, is_selected) in &decks_info {
+                    for (i, _deck_id, name, format, is_selected, local_status, local_date, moxfield_date) in &decks_info {
                         let mut selected = *is_selected;
                         ui.horizontal(|ui| {
                             if ui.checkbox(&mut selected, "").changed() {
-                                let mut state = self.user_decks_state.lock().unwrap();
+                                let mut state = self.import_state.lock().unwrap();
                                 if let Some(s) = state.selected_decks.get_mut(*i) {
                                     *s = selected;
                                 }
                             }
+                            
+                            // Status indicator
+                            let (status_char, status_color) = match local_status {
+                                Some(DeckStatus::New) => ("●", egui::Color32::from_rgb(0, 150, 0)),
+                                Some(DeckStatus::NeedsUpdate) => ("●", egui::Color32::from_rgb(255, 165, 0)),
+                                Some(DeckStatus::UpToDate) => ("●", egui::Color32::from_rgb(100, 100, 100)),
+                                None => ("?", egui::Color32::GRAY),
+                            };
+                            ui.label(egui::RichText::new(status_char).color(status_color));
+                            
                             ui.label(name);
                             let format_str = format.as_deref().unwrap_or("Unknown");
-                            ui.label(egui::RichText::new(format_str).weak());
-                            ui.label(egui::RichText::new(format!("{} views", views)).weak());
+                            ui.label(egui::RichText::new(format!("[{}]", format_str)).weak());
+                            
+                            if let Some(mox_date) = moxfield_date {
+                                ui.label(egui::RichText::new(format!("Moxfield: {}", mox_date)).weak().small());
+                            }
+                            if let Some(loc_date) = local_date {
+                                ui.label(egui::RichText::new(format!("Local: {}", loc_date)).weak().small());
+                            }
                         });
                     }
                 });
             
             ui.add_space(10.0);
             
-            // Import button
-            let selected_count = decks_info.iter().filter(|(_, _, _, _, _, s)| *s).count();
+            // Import selected button
+            let selected_count = decks_info.iter().filter(|(_, _, _, _, s, _, _, _)| *s).count();
             let selected_deck_ids: Vec<String> = decks_info.iter()
-                .filter(|(_, _, _, _, _, s)| *s)
-                .map(|(_, id, _, _, _, _)| id.clone())
+                .filter(|(_, _, _, _, s, _, _, _)| *s)
+                .map(|(_, id, _, _, _, _, _, _)| id.clone())
                 .collect();
             
-            if ui.add_enabled(selected_count > 0, egui::Button::new(format!("Import {} Selected Decks", selected_count))).clicked() {
-                let api_url = self.api_url_input.clone();
-                let username = new_username.clone();
-                let state_clone = Arc::clone(&self.user_decks_state);
-                let ctx_clone = ctx.clone();
-                
-                {
-                    let mut state = self.user_decks_state.lock().unwrap();
-                    state.is_loading = true;
-                    state.import_result = None;
-                }
-                
-                tokio::spawn(async move {
-                    let result = import_selected_decks(&selected_deck_ids, &api_url, &username).await;
-                    
-                    let mut state = state_clone.lock().unwrap();
-                    state.is_loading = false;
-                    
-                    match result {
-                        Ok(import_result) => {
-                            let success_count = import_result.imported_decks.iter().filter(|d| d.success).count();
-                            state.import_result = Some(format!(
-                                "Successfully imported {} of {} decks",
-                                success_count,
-                                import_result.total_decks
-                            ));
-                        }
-                        Err(e) => {
-                            state.error_message = Some(format!("Import failed: {}", e));
-                        }
-                    }
-                    
-                    ctx_clone.request_repaint();
-                });
+            if ui.add_enabled(selected_count > 0 && !is_loading, egui::Button::new(format!("Import {} Selected Decks", selected_count))).clicked() {
+                self.import_selected_decks(selected_deck_ids, ctx);
             }
-            
-            // Show import result
-            let import_result = {
-                let state = self.user_decks_state.lock().unwrap();
-                state.import_result.clone()
+        }
+        
+        // Show result message
+        if let Some(msg) = result_message {
+            ui.separator();
+            let color = if msg.starts_with("Error") || msg.contains("failed") {
+                egui::Color32::from_rgb(176, 0, 32)
+            } else if msg.contains("Successfully") || msg.contains("Imported") {
+                egui::Color32::from_rgb(0, 128, 0)
+            } else {
+                egui::Color32::DARK_GRAY
             };
-            if let Some(result) = import_result {
-                ui.label(egui::RichText::new(result).color(egui::Color32::from_rgb(0, 128, 0)));
-            }
+            ui.label(egui::RichText::new(msg).color(color));
         }
     }
     
-    fn handle_download_deck(&mut self, ctx: &egui::Context) {
-        // Extract deck ID from URL
-        let deck_id = if let Some(id) = self.extract_deck_id_from_url(&self.deck_url_input) {
-            id
-        } else {
-            let mut state = self.single_deck_state.lock().unwrap();
-            state.result_message = Some("Error: Invalid deck URL format. Expected format like: https://moxfield.com/decks/DECK_ID".to_string());
-            return;
-        };
+    fn fetch_user_decks(&mut self, username: String, ctx: &egui::Context) {
+        let state_clone = Arc::clone(&self.import_state);
+        let ctx_clone = ctx.clone();
         
-        let use_direct = self.use_direct_mode;
-        let api_url = self.api_url_input.clone();
-        let deck_id_clone = deck_id.clone();
-        let state_clone = Arc::clone(&self.single_deck_state);
-        
-        // Set loading state
         {
-            let mut state = self.single_deck_state.lock().unwrap();
+            let mut state = self.import_state.lock().unwrap();
             state.is_loading = true;
-            let mode_str = if use_direct { "directly from Moxfield" } else { "via backend" };
-            state.result_message = Some(format!("Downloading deck {} {}...", deck_id, mode_str));
+            state.result_message = None;
+            state.decks.clear();
+            state.selected_decks.clear();
         }
         
-        // Create async task
-        let ctx_clone = ctx.clone();
         tokio::spawn(async move {
-            let result = if use_direct {
-                // Direct mode: use curl to fetch from Moxfield
-                create_deck_from_moxfield(&deck_id_clone).await
-            } else {
-                // Backend mode: use the API proxy
-                create_deck_from_id(&deck_id_clone, &api_url).await
+            let result = fetch_user_decks_direct(&username);
+            
+            let mut state = state_clone.lock().unwrap();
+            state.is_loading = false;
+            
+            match result {
+                Ok(decks) => {
+                    state.selected_decks = vec![false; decks.len()];
+                    state.result_message = Some(format!("Found {} decks for {}", decks.len(), username));
+                    state.decks = decks;
+                }
+                Err(e) => {
+                    state.result_message = Some(format!("Error: Failed to fetch decks: {}", e));
+                }
+            }
+            
+            ctx_clone.request_repaint();
+        });
+    }
+    
+    fn import_single_deck(&mut self, url_type: &UrlType, ctx: &egui::Context) {
+        let url_type = url_type.clone();
+        let state_clone = Arc::clone(&self.import_state);
+        let ctx_clone = ctx.clone();
+        
+        {
+            let mut state = self.import_state.lock().unwrap();
+            state.is_loading = true;
+            state.result_message = Some("Fetching deck...".to_string());
+        }
+        
+        tokio::spawn(async move {
+            let result = match url_type {
+                UrlType::MoxfieldDeck(deck_id) => {
+                    create_deck_from_moxfield(&deck_id).await
+                }
+                UrlType::ArchidektDeck(deck_id) => {
+                    create_deck_from_archidekt(&deck_id).await
+                }
+                UrlType::DeckstatsDeck(owner_id, deck_id) => {
+                    create_deck_from_deckstats(&owner_id, &deck_id).await
+                }
+                UrlType::MamoDeck(deck_uuid) => {
+                    create_deck_from_mamo(&deck_uuid).await
+                }
+                _ => Err(anyhow::anyhow!("Invalid URL type for single deck import"))
             };
             
             let mut state = state_clone.lock().unwrap();
@@ -500,11 +559,9 @@ impl LauncherApp {
             
             match result {
                 Ok(deck_result) => {
-                    log::info!("Deck creation result: {}", deck_result.message);
                     state.result_message = Some(deck_result.message);
                 }
                 Err(e) => {
-                    log::error!("Failed to create deck: {:?}", e);
                     state.result_message = Some(format!("Error: {}", e));
                 }
             }
@@ -513,20 +570,41 @@ impl LauncherApp {
         });
     }
     
-    fn extract_deck_id_from_url(&self, url: &str) -> Option<String> {
-        // Handle Moxfield URLs: https://moxfield.com/decks/DECK_ID
-        if url.contains("moxfield.com/decks/") {
-            return url.split("/decks/").nth(1).map(|s| {
-                // Remove any trailing slashes or query parameters
-                s.split(&['/', '?', '#'][..]).next().unwrap_or(s).to_string()
-            });
+    fn import_selected_decks(&mut self, deck_ids: Vec<String>, ctx: &egui::Context) {
+        let state_clone = Arc::clone(&self.import_state);
+        let ctx_clone = ctx.clone();
+        let total = deck_ids.len();
+        
+        {
+            let mut state = self.import_state.lock().unwrap();
+            state.is_loading = true;
+            state.result_message = Some(format!("Importing {} decks...", total));
         }
         
-        // If it's just a deck ID (no URL), use it directly
-        if !url.contains("://") && !url.is_empty() {
-            return Some(url.trim().to_string());
-        }
-        
-        None
+        tokio::spawn(async move {
+            let mut success_count = 0;
+            let mut fail_count = 0;
+            
+            for deck_id in &deck_ids {
+                let result = create_deck_from_moxfield(deck_id).await;
+                
+                match result {
+                    Ok(_) => success_count += 1,
+                    Err(e) => {
+                        log::warn!("Failed to import deck {}: {}", deck_id, e);
+                        fail_count += 1;
+                    }
+                }
+            }
+            
+            let mut state = state_clone.lock().unwrap();
+            state.is_loading = false;
+            state.result_message = Some(format!(
+                "Imported {} of {} decks ({} failed)",
+                success_count, total, fail_count
+            ));
+            
+            ctx_clone.request_repaint();
+        });
     }
 }

@@ -30,6 +30,8 @@ pub fn parse_deeplink_url(raw: &str) -> Option<Deeplink> {
             let mut doc = None;
             let mut deck_id = None;
             let mut username = None;
+            
+            // Parse query parameters
             for (key, value) in url.query_pairs() {
                 let value = value.to_string();
                 if key == "token" {
@@ -46,6 +48,21 @@ pub fn parse_deeplink_url(raw: &str) -> Option<Deeplink> {
                 }
                 params.push((key.to_string(), value));
             }
+            
+            // Also check path for deck ID (e.g., mamoConnector://deck/DECK_ID)
+            let path = url.path();
+            if !path.is_empty() && path != "/" {
+                let path_parts: Vec<&str> = path.trim_start_matches('/').split('/').collect();
+                if !path_parts.is_empty() && !path_parts[0].is_empty() {
+                    // If action is "deck", "mamo", or "user", the path is the ID/username
+                    if (action == "deck" || action == "mamo") && deck_id.is_none() {
+                        deck_id = Some(path_parts[0].to_string());
+                    } else if action == "user" && username.is_none() {
+                        username = Some(path_parts[0].to_string());
+                    }
+                }
+            }
+            
             Some(Deeplink {
                 raw,
                 action,

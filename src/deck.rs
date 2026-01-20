@@ -7,7 +7,24 @@ use std::process::Command;
 
 // ==================== Moxfield API Types ====================
 
-/// Represents a deck entry from Moxfield user's deck list
+/// Status of a deck compared to local files
+#[derive(Debug, Clone, PartialEq)]
+pub enum DeckStatus {
+    New,           // Deck doesn't exist locally
+    UpToDate,      // Local deck has same or newer date
+    NeedsUpdate,   // Moxfield deck is newer than local
+}
+
+/// User info from Moxfield API
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MoxfieldUserInfo {
+    pub user_name: String,
+    #[serde(default)]
+    pub display_name: Option<String>,
+}
+
+/// Represents a deck entry from Moxfield user's deck list with local status
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MoxfieldDeckEntry {
@@ -32,6 +49,12 @@ pub struct MoxfieldDeckEntry {
     pub public_url: Option<String>,
     pub created_at_utc: Option<String>,
     pub last_updated_at_utc: Option<String>,
+    #[serde(default)]
+    pub created_by_user: Option<MoxfieldUserInfo>,
+    #[serde(skip)]
+    pub local_status: Option<DeckStatus>,
+    #[serde(skip)]
+    pub local_date: Option<String>,
 }
 
 /// Response from Moxfield API when fetching user decks
@@ -150,22 +173,27 @@ impl DeckCreationResult {
     }
 }
 
-// ==================== Direct Moxfield Access (using curl) ====================
+// ==================== Common Helpers ====================
 
-const MOXFIELD_API_URL: &str = "https://api2.moxfield.com/v2";
-
-/// Fetch data from Moxfield API using curl (bypasses Cloudflare)
+/// Generic fetch using curl (handles Cloudflare and user agent)
 fn fetch_with_curl(url: &str) -> Result<String> {
-    info!("Fetching from Moxfield via curl: {}", url);
+    fetch_with_curl_custom(url, &[
+        "-H", "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "-H", "Accept: application/json",
+        "-H", "Referer: https://www.moxfield.com/",
+    ])
+}
+
+/// Fetch URL with custom headers using curl
+fn fetch_with_curl_custom(url: &str, extra_args: &[&str]) -> Result<String> {
+    info!("Fetching via curl: {}", url);
+    
+    let mut args = vec!["-s"];
+    args.extend(extra_args);
+    args.push(url);
     
     let output = Command::new("curl")
-        .args([
-            "-s",
-            "-H", "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-            "-H", "Accept: application/json",
-            "-H", "Referer: https://www.moxfield.com/",
-            url,
-        ])
+        .args(&args)
         .output()
         .context("Failed to execute curl command")?;
     
@@ -178,12 +206,16 @@ fn fetch_with_curl(url: &str) -> Result<String> {
         .context("Invalid UTF-8 in curl response")?;
     
     // Check for Cloudflare block (HTML response)
-    if body.contains("<!DOCTYPE html>") || body.contains("Cloudflare") {
+    if body.contains("<!DOCTYPE html>") && body.contains("Cloudflare") {
         return Err(anyhow::anyhow!("Cloudflare blocked the request"));
     }
     
     Ok(body)
 }
+
+// ==================== Direct Moxfield Access ====================
+
+const MOXFIELD_API_URL: &str = "https://api2.moxfield.com/v2";
 
 /// Moxfield full deck response structure
 #[derive(Debug, Deserialize)]
@@ -242,6 +274,109 @@ pub async fn create_deck_from_moxfield(deck_id: &str) -> Result<DeckCreationResu
         format!("Successfully created deck '{}' at {:?}", full_name, deck_path),
         deck_path,
     ))
+}
+
+/// Fetch user decks directly from Moxfield using curl (bypasses Cloudflare)
+/// Also checks local deck directory and sets status for each deck
+pub fn fetch_user_decks_direct(username: &str) -> Result<Vec<MoxfieldDeckEntry>> {
+    info!("Fetching decks for user '{}' directly via curl", username);
+    
+    let mut all_decks = Vec::new();
+    let mut page = 1;
+    let page_size = 100;
+    
+    loop {
+        let url = format!(
+            "{}/users/{}/decks?pageNumber={}&pageSize={}",
+            MOXFIELD_API_URL, username, page, page_size
+        );
+        
+        let body = fetch_with_curl(&url)?;
+        
+        let page_response: MoxfieldUserDecksResponse = serde_json::from_str(&body)
+            .context("Failed to parse Moxfield user decks response")?;
+        
+        info!("Fetched {} decks (page {}/{})", 
+              page_response.data.len(), 
+              page_response.page_number, 
+              page_response.total_pages);
+        
+        all_decks.extend(page_response.data);
+        
+        if page >= page_response.total_pages {
+            break;
+        }
+        page += 1;
+    }
+    
+    // Check local status for each deck
+    let deck_dir = get_deck_directory().ok();
+    let mut decks_with_status = all_decks;
+    
+    for deck in &mut decks_with_status {
+        let moxfield_date = deck.last_updated_at_utc.as_ref()
+            .and_then(|d| d.split('T').next())
+            .map(|s| s.to_string());
+        
+        // Use the actual deck author, not the profile username
+        let author = deck.created_by_user.as_ref()
+            .map(|u| u.user_name.as_str())
+            .unwrap_or(username);
+        
+        // Build the expected filename pattern: "author - deckname (date)"
+        let (status, local_date) = check_deck_exists_locally(author, &deck.name, &deck_dir);
+        deck.local_status = Some(status.clone());
+        deck.local_date = local_date.clone();
+        
+        // If deck exists locally, compare dates
+        if status == DeckStatus::UpToDate {
+            if let (Some(mox_date), Some(loc_date)) = (&moxfield_date, &local_date) {
+                if mox_date > loc_date {
+                    deck.local_status = Some(DeckStatus::NeedsUpdate);
+                }
+            }
+        }
+    }
+    
+    info!("Total decks fetched for user '{}': {}", username, decks_with_status.len());
+    Ok(decks_with_status)
+}
+
+/// Check if a deck already exists locally and extract its date
+fn check_deck_exists_locally(username: &str, deck_name: &str, deck_dir: &Option<PathBuf>) -> (DeckStatus, Option<String>) {
+    let Some(dir) = deck_dir else {
+        return (DeckStatus::New, None);
+    };
+    
+    if !dir.exists() {
+        return (DeckStatus::New, None);
+    }
+    
+    // Look for files matching pattern: "username - deck_name (date).dck"
+    // Must sanitize the name since filenames have special characters replaced
+    let sanitized_deck_name = sanitize_filename(deck_name);
+    let pattern_start = format!("{} - {}", username, sanitized_deck_name);
+    
+    if let Ok(entries) = fs::read_dir(dir) {
+        for entry in entries.filter_map(|e| e.ok()) {
+            let filename = entry.file_name().to_string_lossy().to_string();
+            
+            // Check if filename matches our pattern
+            if filename.starts_with(&pattern_start) && filename.ends_with(".dck") {
+                // Extract date from filename: "user - name (YYYY-MM-DD).dck"
+                if let Some(date_start) = filename.rfind('(') {
+                    if let Some(date_end) = filename.rfind(')') {
+                        let date = &filename[date_start + 1..date_end];
+                        return (DeckStatus::UpToDate, Some(date.to_string()));
+                    }
+                }
+                // File exists but couldn't extract date
+                return (DeckStatus::UpToDate, None);
+            }
+        }
+    }
+    
+    (DeckStatus::New, None)
 }
 
 /// Convert Moxfield deck JSON to Forge .dck format
@@ -550,6 +685,397 @@ async fn fetch_deck_export(deck_id: &str, api_base_url: &str) -> Result<DeckExpo
     info!("Successfully fetched deck export for: {}", export_response.name);
     Ok(export_response)
 }
+
+// ==================== Archidekt Support ====================
+
+/// Archidekt deck response structure
+#[derive(Debug, Deserialize)]
+struct ArchidektDeck {
+    name: String,
+    #[serde(default)]
+    owner: Option<ArchidektOwner>,
+    #[serde(default, rename = "updatedAt")]
+    updated_at: Option<String>,
+    #[serde(default)]
+    cards: Vec<ArchidektCard>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ArchidektOwner {
+    username: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ArchidektCard {
+    quantity: u32,
+    categories: Vec<String>,
+    card: ArchidektCardInfo,
+}
+
+#[derive(Debug, Deserialize)]
+struct ArchidektCardInfo {
+    #[serde(rename = "oracleCard")]
+    oracle_card: ArchidektOracleCard,
+    edition: ArchidektEdition,
+}
+
+#[derive(Debug, Deserialize)]
+struct ArchidektOracleCard {
+    name: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ArchidektEdition {
+    #[serde(rename = "editioncode")]
+    edition_code: String,
+}
+
+/// Create a deck from an Archidekt URL
+/// URL format: https://archidekt.com/decks/{deck_id}/{deck_name}
+pub async fn create_deck_from_archidekt(deck_id: &str) -> Result<DeckCreationResult> {
+    info!("Creating deck from Archidekt: {}", deck_id);
+    
+    let url = format!("https://archidekt.com/api/decks/{}/", deck_id);
+    let body = fetch_with_curl_custom(&url, &[
+        "-H", "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "-H", "Accept: application/json",
+    ])?;
+    
+    let deck: ArchidektDeck = serde_json::from_str(&body)
+        .context("Failed to parse Archidekt deck response")?;
+    
+    // Build filename with author and date
+    let author = deck.owner.as_ref()
+        .map(|o| o.username.as_str())
+        .unwrap_or("Unknown");
+    
+    let date = deck.updated_at.as_ref()
+        .and_then(|d| d.split('T').next())
+        .unwrap_or("Unknown");
+    
+    let full_name = format!("{} - {} ({})", author, deck.name, date);
+    
+    // Convert to Forge format
+    let forge_content = convert_archidekt_to_forge(&full_name, &deck)?;
+    
+    // Write the deck file
+    let deck_path = write_deck_file(&full_name, &forge_content).await
+        .context("Failed to create deck file")?;
+    
+    Ok(DeckCreationResult::success(
+        format!("Successfully created deck '{}' at {:?}", full_name, deck_path),
+        deck_path,
+    ))
+}
+
+/// Convert Archidekt deck to Forge .dck format
+fn convert_archidekt_to_forge(deck_name: &str, deck: &ArchidektDeck) -> Result<String> {
+    let mut lines = Vec::new();
+    
+    // Metadata
+    lines.push("[metadata]".to_string());
+    lines.push(format!("Name={}", deck_name));
+    lines.push(String::new());
+    
+    // Separate cards by category
+    let mut commanders = Vec::new();
+    let mut mainboard = Vec::new();
+    let mut sideboard = Vec::new();
+    
+    for card in &deck.cards {
+        let is_commander = card.categories.iter()
+            .any(|c| c.to_lowercase().contains("commander"));
+        let is_sideboard = card.categories.iter()
+            .any(|c| c.to_lowercase().contains("sideboard") || c.to_lowercase().contains("maybeboard"));
+        
+        // Take only the front face for double-faced cards
+        let name = card.card.oracle_card.name.split(" // ").next()
+            .unwrap_or(&card.card.oracle_card.name);
+        let set = card.card.edition.edition_code.to_uppercase();
+        let line = format!("{} {}|{}|1", card.quantity, name, set);
+        
+        if is_commander {
+            commanders.push(line);
+        } else if is_sideboard {
+            sideboard.push(line);
+        } else {
+            mainboard.push(line);
+        }
+    }
+    
+    // Commander section
+    lines.push("[Commander]".to_string());
+    for line in commanders {
+        lines.push(line);
+    }
+    lines.push(String::new());
+    
+    // Main deck section
+    lines.push("[Main]".to_string());
+    for line in mainboard {
+        lines.push(line);
+    }
+    lines.push(String::new());
+    
+    // Sideboard section
+    lines.push("[Sideboard]".to_string());
+    for line in sideboard {
+        lines.push(line);
+    }
+    
+    Ok(lines.join("\n"))
+}
+
+/// Parse an Archidekt URL and extract the deck ID
+/// URL format: https://archidekt.com/decks/{deck_id}/{deck_name}
+pub fn parse_archidekt_url(url: &str) -> Option<String> {
+    let url = url.trim();
+    
+    // Match patterns like https://archidekt.com/decks/12345/deck_name
+    if url.contains("archidekt.com/decks/") {
+        let parts: Vec<&str> = url.split("/decks/").collect();
+        if parts.len() >= 2 {
+            // Extract just the numeric ID
+            let id_part = parts[1].split('/').next()?;
+            if id_part.chars().all(|c| c.is_ascii_digit()) {
+                return Some(id_part.to_string());
+            }
+        }
+    }
+    
+    None
+}
+
+// ==================== Deckstats Support ====================
+
+/// Create a deck from a Deckstats URL
+/// URL format: https://deckstats.net/decks/{owner_id}/{deck_id}-{deck_name}
+pub async fn create_deck_from_deckstats(owner_id: &str, deck_id: &str) -> Result<DeckCreationResult> {
+    info!("Creating deck from Deckstats: owner={} deck={}", owner_id, deck_id);
+    
+    // Deckstats has a simple export endpoint that returns plain text
+    let url = format!(
+        "https://deckstats.net/decks/{}/{}-deck?export_dec=1",
+        owner_id, deck_id
+    );
+    
+    let body = fetch_with_curl_custom(&url, &[
+        "-H", "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+    ])?;
+    
+    // Parse the deckstats export format
+    // First line is typically: //NAME: Deck Name from deckstats.net
+    let deck_name = body.lines()
+        .find(|line| line.starts_with("//NAME:"))
+        .map(|line| line.trim_start_matches("//NAME:").trim())
+        .unwrap_or("Unknown Deck");
+    
+    // Get today's date for filename
+    let date = chrono::Local::now().format("%Y-%m-%d").to_string();
+    let full_name = format!("Deckstats - {} ({})", deck_name, date);
+    
+    // Convert to Forge format
+    let forge_content = convert_deckstats_to_forge(&full_name, &body)?;
+    
+    // Write the deck file
+    let deck_path = write_deck_file(&full_name, &forge_content).await
+        .context("Failed to create deck file")?;
+    
+    Ok(DeckCreationResult::success(
+        format!("Successfully created deck '{}' at {:?}", full_name, deck_path),
+        deck_path,
+    ))
+}
+
+/// Convert Deckstats export to Forge .dck format
+fn convert_deckstats_to_forge(deck_name: &str, content: &str) -> Result<String> {
+    let mut lines = Vec::new();
+    
+    // Metadata
+    lines.push("[metadata]".to_string());
+    lines.push(format!("Name={}", deck_name));
+    lines.push(String::new());
+    
+    let mut commanders = Vec::new();
+    let mut mainboard = Vec::new();
+    let mut sideboard = Vec::new();
+    let mut in_sideboard = false;
+    
+    for line in content.lines() {
+        let line = line.trim();
+        
+        // Skip empty lines and comments
+        if line.is_empty() || line.starts_with("//") {
+            continue;
+        }
+        
+        // Check for section markers
+        if line.to_lowercase().contains("sideboard") {
+            in_sideboard = true;
+            continue;
+        }
+        
+        // Parse card lines: "1 Card Name" or "1 Card Name [SET]"
+        if let Some(card_line) = parse_deckstats_card_line(line) {
+            // First card is often the commander (quantity 1, creature/planeswalker)
+            // But deckstats doesn't clearly mark commander, so put first line as commander
+            if commanders.is_empty() && !in_sideboard && line.starts_with("1 ") {
+                commanders.push(card_line);
+            } else if in_sideboard {
+                sideboard.push(card_line);
+            } else {
+                mainboard.push(card_line);
+            }
+        }
+    }
+    
+    // Commander section
+    lines.push("[Commander]".to_string());
+    for line in commanders {
+        lines.push(line);
+    }
+    lines.push(String::new());
+    
+    // Main deck section
+    lines.push("[Main]".to_string());
+    for line in mainboard {
+        lines.push(line);
+    }
+    lines.push(String::new());
+    
+    // Sideboard section
+    lines.push("[Sideboard]".to_string());
+    for line in sideboard {
+        lines.push(line);
+    }
+    
+    Ok(lines.join("\n"))
+}
+
+/// Parse a deckstats card line
+fn parse_deckstats_card_line(line: &str) -> Option<String> {
+    // Format: "1 Card Name" or "1 Card Name // Other Face"
+    let parts: Vec<&str> = line.splitn(2, ' ').collect();
+    if parts.len() != 2 {
+        return None;
+    }
+    
+    let quantity: u32 = parts[0].parse().ok()?;
+    let mut card_name = parts[1].to_string();
+    
+    // Take only the front face for double-faced cards
+    if let Some(pos) = card_name.find(" // ") {
+        card_name = card_name[..pos].to_string();
+    }
+    
+    // Remove any set info in brackets [SET]
+    if let Some(pos) = card_name.find(" [") {
+        card_name = card_name[..pos].to_string();
+    }
+    
+    Some(format!("{} {}", quantity, card_name.trim()))
+}
+
+/// Parse a Deckstats URL and extract owner_id and deck_id
+/// URL format: https://deckstats.net/decks/{owner_id}/{deck_id}-{deck_name}
+pub fn parse_deckstats_url(url: &str) -> Option<(String, String)> {
+    let url = url.trim();
+    
+    // Match patterns like https://deckstats.net/decks/141959/3718418-Wayta
+    if url.contains("deckstats.net/decks/") {
+        let parts: Vec<&str> = url.split("/decks/").collect();
+        if parts.len() >= 2 {
+            let path_parts: Vec<&str> = parts[1].split('/').collect();
+            if path_parts.len() >= 2 {
+                let owner_id = path_parts[0].to_string();
+                // deck_id is before the hyphen
+                let deck_part = path_parts[1].split('-').next()?;
+                if owner_id.chars().all(|c| c.is_ascii_digit()) && 
+                   deck_part.chars().all(|c| c.is_ascii_digit()) {
+                    return Some((owner_id, deck_part.to_string()));
+                }
+            }
+        }
+    }
+    
+    None
+}
+
+// ==================== MaMo Support ====================
+
+/// MaMo API base URL for deck export
+const MAMO_API_URL: &str = "https://new-backend-two-eosin.vercel.app";
+
+/// Create a deck from MaMo backend
+/// Fetches the deck in Forge format directly from the MaMo backend
+pub async fn create_deck_from_mamo(deck_id: &str) -> Result<DeckCreationResult> {
+    info!("Creating deck from MaMo: {}", deck_id);
+    
+    // MaMo backend returns plain text Forge format
+    let url = format!("{}/api/deck/export/{}/forge", MAMO_API_URL, deck_id);
+    
+    let body = fetch_with_curl_custom(&url, &[
+        "-H", "User-Agent: MaMo-Connector/1.0",
+        "-H", "Accept: text/plain",
+    ])?;
+    
+    // Check if response looks like an error
+    if body.starts_with("{") && body.contains("error") {
+        return Ok(DeckCreationResult::failed(
+            format!("MaMo API error: {}", body)
+        ));
+    }
+    
+    // Parse deck name from the Forge content: "Name=Author - Deck Name"
+    let deck_name = body.lines()
+        .find(|line| line.starts_with("Name="))
+        .map(|line| line.trim_start_matches("Name=").trim())
+        .unwrap_or("MaMo Deck");
+    
+    // Content is already in Forge format, write directly
+    let deck_path = write_deck_file(deck_name, &body).await
+        .context("Failed to create deck file")?;
+    
+    Ok(DeckCreationResult::success(
+        format!("Successfully created MaMo deck '{}' at {:?}", deck_name, deck_path),
+        deck_path,
+    ))
+}
+
+/// Parse a MaMo URL and extract the deck UUID
+/// Supported URL formats:
+/// - https://ma-mo-frontend.vercel.app/deck/UUID
+/// - https://ma-mo-frontend.vercel.app?deckId=UUID
+/// - https://new-backend-two-eosin.vercel.app/api/deck/export/UUID/forge
+/// - Plain UUID: 2e16bd73-d2a9-4b0d-af8d-77b931d26bef
+pub fn parse_mamo_url(url: &str) -> Option<String> {
+    let url = url.trim();
+    
+    // UUID pattern: 8-4-4-4-12 hex characters
+    let uuid_regex = regex::Regex::new(
+        r"[a-fA-F0-9]{8}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{12}"
+    ).ok()?;
+    
+    // Check if it's a MaMo URL
+    if url.contains("ma-mo-frontend.vercel.app") || 
+       url.contains("new-backend") ||
+       url.contains("localhost:3000") ||
+       url.contains("localhost:3001") {
+        // Extract UUID from URL
+        if let Some(captures) = uuid_regex.find(url) {
+            return Some(captures.as_str().to_string());
+        }
+    }
+    
+    // Check if it's a plain UUID
+    if uuid_regex.is_match(url) && !url.contains("://") {
+        return Some(url.to_string());
+    }
+    
+    None
+}
+
+// ==================== File Operations ====================
 
 /// Write deck content directly to file (content already in forge format from API)
 async fn write_deck_file(deck_name: &str, content: &str) -> Result<PathBuf> {

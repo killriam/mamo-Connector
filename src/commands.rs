@@ -1,6 +1,6 @@
 use log::{error, info, warn};
 use crate::deeplink::Deeplink;
-use crate::deck::{create_deck_from_id, DeckCreationResult, UserDecksImportResult, import_user_decks, list_moxfield_user_decks, MoxfieldDeckEntry};
+use crate::deck::{create_deck_from_id, create_deck_from_moxfield, create_deck_from_mamo, DeckCreationResult, UserDecksImportResult, import_user_decks, list_moxfield_user_decks, MoxfieldDeckEntry};
 
 #[derive(Debug, Clone)]
 pub enum CommandResult {
@@ -40,12 +40,72 @@ pub async fn handle_command(deeplink: &Deeplink) -> CommandResult {
     match deeplink.action.as_str() {
         "create-deck" => handle_create_deck(deeplink).await,
         "createdeck" => handle_create_deck(deeplink).await, // Alternative format
+        "deck" => handle_deck_download(deeplink).await, // New: mamoConnector://deck/DECK_ID
+        "mamo" => handle_mamo_deck_download(deeplink).await, // MaMo backend: mamoConnector://mamo/DECK_UUID
         "import-user-decks" | "importuserdecks" => handle_import_user_decks(deeplink).await,
         "list-user-decks" | "listuserdecks" => handle_list_user_decks(deeplink).await,
         "" => CommandResult::MissingParameters("No action specified in deeplink".to_string()),
         action => {
             warn!("Unknown action received: {}", action);
             CommandResult::UnknownAction(action.to_string())
+        }
+    }
+}
+
+/// Handle mamoConnector://deck/DECK_ID - direct deck download using curl
+async fn handle_deck_download(deeplink: &Deeplink) -> CommandResult {
+    // Get deck ID from path or params
+    let deck_id = deeplink.deck_id.clone()
+        .or_else(|| get_parameter(&deeplink.params, "id"))
+        .or_else(|| get_parameter(&deeplink.params, "deck_id"))
+        .or_else(|| get_parameter(&deeplink.params, "deckId"));
+
+    let deck_id = match deck_id {
+        Some(id) => id,
+        None => {
+            error!("No deck ID provided in deck command");
+            return CommandResult::MissingParameters(
+                "Deck ID is required. Use mamoConnector://deck/DECK_ID".to_string()
+            );
+        }
+    };
+
+    info!("Downloading deck directly via curl: {}", deck_id);
+
+    match create_deck_from_moxfield(&deck_id).await {
+        Ok(result) => CommandResult::DeckCreated(result),
+        Err(err) => {
+            error!("Failed to download deck: {:?}", err);
+            CommandResult::Error(format!("Failed to download deck: {}", err))
+        }
+    }
+}
+
+/// Handle mamoConnector://mamo/DECK_UUID - download deck from MaMo backend
+async fn handle_mamo_deck_download(deeplink: &Deeplink) -> CommandResult {
+    // Get deck UUID from path or params
+    let deck_id = deeplink.deck_id.clone()
+        .or_else(|| get_parameter(&deeplink.params, "id"))
+        .or_else(|| get_parameter(&deeplink.params, "deck_id"))
+        .or_else(|| get_parameter(&deeplink.params, "deckId"));
+
+    let deck_id = match deck_id {
+        Some(id) => id,
+        None => {
+            error!("No deck UUID provided in mamo command");
+            return CommandResult::MissingParameters(
+                "Deck UUID is required. Use mamoConnector://mamo/DECK_UUID".to_string()
+            );
+        }
+    };
+
+    info!("Downloading deck from MaMo backend: {}", deck_id);
+
+    match create_deck_from_mamo(&deck_id).await {
+        Ok(result) => CommandResult::DeckCreated(result),
+        Err(err) => {
+            error!("Failed to download MaMo deck: {:?}", err);
+            CommandResult::Error(format!("Failed to download MaMo deck: {}", err))
         }
     }
 }
