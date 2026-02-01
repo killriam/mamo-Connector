@@ -4,6 +4,8 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
 
+use crate::gamelog::GameLogConfig;
+
 /// Type of saved link for synchronization
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SavedLinkType {
@@ -98,6 +100,9 @@ pub struct Settings {
     /// Auto-sync on startup
     #[serde(default)]
     pub auto_sync_on_startup: bool,
+    /// Game log reader configuration
+    #[serde(default)]
+    pub gamelog_config: GameLogConfig,
 }
 
 impl Settings {

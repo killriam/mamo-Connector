@@ -1,10 +1,12 @@
 use anyhow::Result;
 use eframe::{NativeOptions, egui};
+use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 
 use crate::commands::CommandResult;
 use crate::deck::{create_deck_from_moxfield, MoxfieldDeckEntry, DeckStatus, fetch_user_decks_direct, create_deck_from_archidekt, create_deck_from_deckstats, create_deck_from_mamo, parse_archidekt_url, parse_deckstats_url, parse_mamo_url, sync_moxfield_deck, sync_moxfield_user_decks, sync_archidekt_deck, sync_deckstats_deck, sync_mamo_deck, DeckSyncResult, SyncStatus, get_deck_directory_display};
 use crate::deeplink::Deeplink;
+use crate::gamelog::{GameLogConfig, GameLogProcessResult, ScanSummary, get_default_forge_log_directory, validate_directory, scan_directory, process_new_logs, load_processed_files, save_processed_files};
 use crate::registration::{RegistrationOutcome, RegistrationStatus};
 use crate::settings::{Settings, SavedLink, SavedLinkType};
 
@@ -13,6 +15,7 @@ enum Tab {
     Status,
     Import,
     Sync,
+    GameLogs,
 }
 
 /// Detected URL type for auto-detection
@@ -49,6 +52,29 @@ struct SyncState {
     show_add_dialog: bool,
     add_url_input: String,
     add_name_input: String,
+}
+
+/// State for the game log tab
+#[derive(Clone, Default)]
+struct GameLogState {
+    /// Is a scan currently running
+    is_scanning: bool,
+    /// Is background scanning enabled
+    background_enabled: bool,
+    /// Directory input for editing
+    directory_input: String,
+    /// Is the directory valid
+    directory_valid: bool,
+    /// Number of files in directory
+    file_count: Option<usize>,
+    /// Status message
+    status_message: Option<String>,
+    /// Last scan results
+    scan_results: Vec<GameLogProcessResult>,
+    /// Summary from last scan
+    last_scan_summary: Option<ScanSummary>,
+    /// Processed files set
+    processed_files: HashSet<String>,
 }
 
 #[derive(Clone)]
@@ -112,6 +138,7 @@ struct LauncherApp {
     current_tab: Tab,
     import_state: Arc<Mutex<ImportState>>,
     sync_state: Arc<Mutex<SyncState>>,
+    gamelog_state: Arc<Mutex<GameLogState>>,
     settings: Arc<Mutex<Settings>>,
 }
 
@@ -120,12 +147,25 @@ impl LauncherApp {
         // Load settings
         let settings = Settings::load().unwrap_or_default();
         
+        // Load processed files for game log
+        let processed_files = load_processed_files().unwrap_or_default();
+        
+        // Initialize gamelog state with settings
+        let gamelog_state = GameLogState {
+            directory_input: settings.gamelog_config.watch_directory.clone(),
+            directory_valid: validate_directory(&settings.gamelog_config.watch_directory).unwrap_or(false),
+            background_enabled: settings.gamelog_config.background_scan_enabled,
+            processed_files,
+            ..Default::default()
+        };
+        
         Self {
             state,
             url_input: String::new(),
             current_tab: Tab::Import,
             import_state: Arc::new(Mutex::new(ImportState::default())),
             sync_state: Arc::new(Mutex::new(SyncState::default())),
+            gamelog_state: Arc::new(Mutex::new(gamelog_state)),
             settings: Arc::new(Mutex::new(settings)),
         }
     }
@@ -153,6 +193,9 @@ impl eframe::App for LauncherApp {
                     if ui.selectable_label(self.current_tab == Tab::Sync, "Sync").clicked() {
                         self.current_tab = Tab::Sync;
                     }
+                    if ui.selectable_label(self.current_tab == Tab::GameLogs, "Game Logs").clicked() {
+                        self.current_tab = Tab::GameLogs;
+                    }
                 });
                 ui.separator();
                 
@@ -161,6 +204,7 @@ impl eframe::App for LauncherApp {
                     Tab::Status => self.render_status_tab(ui),
                     Tab::Import => self.render_import_tab(ui, ctx),
                     Tab::Sync => self.render_sync_tab(ui, ctx),
+                    Tab::GameLogs => self.render_gamelog_tab(ui, ctx),
                 }
             });
     }
@@ -1078,5 +1122,328 @@ impl LauncherApp {
             
             ctx_clone.request_repaint();
         });
+    }
+
+    // ==================== Game Log Tab ====================
+
+    fn render_gamelog_tab(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        ui.label(egui::RichText::new("Game Log Reader").strong());
+        ui.add_space(5.0);
+        ui.label("Monitor Forge game logs and upload them to MaMo for analysis.");
+        ui.add_space(10.0);
+        
+        // Get current state
+        let (is_scanning, background_enabled, directory_input, directory_valid, file_count, status_message) = {
+            let state = self.gamelog_state.lock().unwrap();
+            (
+                state.is_scanning,
+                state.background_enabled,
+                state.directory_input.clone(),
+                state.directory_valid,
+                state.file_count,
+                state.status_message.clone(),
+            )
+        };
+        
+        // Directory configuration section
+        ui.group(|ui| {
+            ui.label(egui::RichText::new("📁 Directory Configuration").strong());
+            ui.add_space(5.0);
+            
+            ui.horizontal(|ui| {
+                ui.label("Watch Directory:");
+                let response = ui.add(
+                    egui::TextEdit::singleline(&mut self.gamelog_state.lock().unwrap().directory_input)
+                        .desired_width(400.0)
+                        .hint_text("Path to Forge game logs directory")
+                );
+                
+                if response.changed() {
+                    // Validate directory on change
+                    let new_path = self.gamelog_state.lock().unwrap().directory_input.clone();
+                    let valid = validate_directory(&new_path).unwrap_or(false);
+                    let mut state = self.gamelog_state.lock().unwrap();
+                    state.directory_valid = valid;
+                    state.file_count = None;
+                }
+                
+                if ui.button("Browse...").clicked() {
+                    // Note: Native file dialogs require additional dependencies
+                    // For now, show a message
+                    let mut state = self.gamelog_state.lock().unwrap();
+                    state.status_message = Some("Please enter the path manually or use the default".to_string());
+                }
+            });
+            
+            ui.horizontal(|ui| {
+                if ui.button("Use Default").clicked() {
+                    let default_dir = get_default_forge_log_directory();
+                    let valid = validate_directory(&default_dir).unwrap_or(false);
+                    let mut state = self.gamelog_state.lock().unwrap();
+                    state.directory_input = default_dir;
+                    state.directory_valid = valid;
+                    state.file_count = None;
+                }
+                
+                if ui.button("Save").clicked() {
+                    self.save_gamelog_directory();
+                }
+                
+                // Show validation status
+                if directory_valid {
+                    ui.label(egui::RichText::new("✓ Valid").color(egui::Color32::from_rgb(0, 128, 0)));
+                    if let Some(count) = file_count {
+                        ui.label(format!("({} log files)", count));
+                    }
+                } else if !directory_input.is_empty() {
+                    ui.label(egui::RichText::new("✗ Invalid or inaccessible").color(egui::Color32::from_rgb(176, 0, 32)));
+                }
+            });
+        });
+        
+        ui.add_space(10.0);
+        
+        // Scan controls section
+        ui.group(|ui| {
+            ui.label(egui::RichText::new("🔍 Scan Controls").strong());
+            ui.add_space(5.0);
+            
+            ui.horizontal(|ui| {
+                // Manual scan button
+                if ui.add_enabled(!is_scanning && directory_valid, egui::Button::new("🔄 Scan Now")).clicked() {
+                    self.start_gamelog_scan(ctx);
+                }
+                
+                // Background scanning toggle
+                let mut bg_enabled = background_enabled;
+                if ui.checkbox(&mut bg_enabled, "Enable Background Scanning").changed() {
+                    self.toggle_background_scanning(bg_enabled);
+                }
+                
+                if is_scanning {
+                    ui.spinner();
+                    ui.label("Scanning...");
+                }
+            });
+            
+            if background_enabled {
+                ui.label(egui::RichText::new("Background scanning is active. New logs will be uploaded automatically.").small().weak());
+            }
+        });
+        
+        ui.add_space(10.0);
+        
+        // Status message
+        if let Some(msg) = status_message {
+            let color = if msg.contains("Error") || msg.contains("failed") {
+                egui::Color32::from_rgb(176, 0, 32)
+            } else if msg.contains("Success") || msg.contains("uploaded") {
+                egui::Color32::from_rgb(0, 128, 0)
+            } else {
+                egui::Color32::DARK_GRAY
+            };
+            ui.label(egui::RichText::new(&msg).color(color));
+            ui.add_space(5.0);
+        }
+        
+        // Results section
+        let scan_results: Vec<GameLogProcessResult> = {
+            let state = self.gamelog_state.lock().unwrap();
+            state.scan_results.clone()
+        };
+        
+        if !scan_results.is_empty() {
+            ui.separator();
+            ui.label(egui::RichText::new("📋 Scan Results").strong());
+            ui.add_space(5.0);
+            
+            // Summary
+            let successful = scan_results.iter().filter(|r| r.success).count();
+            let failed = scan_results.len() - successful;
+            
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new(format!("✓ {} uploaded", successful)).color(egui::Color32::from_rgb(0, 128, 0)));
+                if failed > 0 {
+                    ui.label(egui::RichText::new(format!("✗ {} failed", failed)).color(egui::Color32::from_rgb(176, 0, 32)));
+                }
+            });
+            
+            ui.add_space(5.0);
+            
+            // Results list
+            egui::ScrollArea::vertical()
+                .max_height(200.0)
+                .show(ui, |ui| {
+                    for result in &scan_results {
+                        ui.horizontal(|ui| {
+                            let (icon, color) = if result.success {
+                                ("✓", egui::Color32::from_rgb(0, 128, 0))
+                            } else {
+                                ("✗", egui::Color32::from_rgb(176, 0, 32))
+                            };
+                            ui.label(egui::RichText::new(icon).color(color));
+                            ui.label(&result.filename);
+                            if result.success {
+                                ui.label(egui::RichText::new(format!("({} bytes)", result.file_size)).small().weak());
+                            } else {
+                                ui.label(egui::RichText::new(&result.message).small().color(egui::Color32::from_rgb(176, 0, 32)));
+                            }
+                        });
+                    }
+                });
+        }
+        
+        // Processed files info
+        let processed_count = {
+            let state = self.gamelog_state.lock().unwrap();
+            state.processed_files.len()
+        };
+        
+        ui.add_space(10.0);
+        ui.separator();
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new(format!("Total files processed: {}", processed_count)).small().weak());
+            if ui.small_button("Clear History").clicked() {
+                self.clear_processed_history();
+            }
+        });
+    }
+
+    fn save_gamelog_directory(&mut self) {
+        let directory_input = {
+            let state = self.gamelog_state.lock().unwrap();
+            state.directory_input.clone()
+        };
+        
+        // Validate and save
+        let valid = validate_directory(&directory_input).unwrap_or(false);
+        
+        {
+            let mut state = self.gamelog_state.lock().unwrap();
+            state.directory_valid = valid;
+            
+            if valid {
+                // Update file count
+                let config = GameLogConfig {
+                    watch_directory: directory_input.clone(),
+                    ..Default::default()
+                };
+                state.file_count = scan_directory(&config).ok().map(|f| f.len());
+            }
+        }
+        
+        // Save to settings
+        {
+            let mut settings = self.settings.lock().unwrap();
+            settings.gamelog_config.watch_directory = directory_input;
+            let _ = settings.save();
+        }
+        
+        let mut state = self.gamelog_state.lock().unwrap();
+        if valid {
+            state.status_message = Some("Directory saved successfully".to_string());
+        } else {
+            state.status_message = Some("Error: Directory is not valid or accessible".to_string());
+        }
+    }
+
+    fn start_gamelog_scan(&mut self, ctx: &egui::Context) {
+        let gamelog_state = Arc::clone(&self.gamelog_state);
+        let settings = Arc::clone(&self.settings);
+        let ctx_clone = ctx.clone();
+        
+        // Mark as scanning
+        {
+            let mut state = gamelog_state.lock().unwrap();
+            state.is_scanning = true;
+            state.status_message = Some("Scanning for new game logs...".to_string());
+            state.scan_results.clear();
+        }
+        
+        tokio::spawn(async move {
+            let config = {
+                let settings = settings.lock().unwrap();
+                settings.gamelog_config.clone()
+            };
+            
+            let processed_files = {
+                let state = gamelog_state.lock().unwrap();
+                Arc::new(Mutex::new(state.processed_files.clone()))
+            };
+            
+            let result = process_new_logs(&config, &processed_files).await;
+            
+            {
+                let mut state = gamelog_state.lock().unwrap();
+                state.is_scanning = false;
+                
+                match result {
+                    Ok(summary) => {
+                        // Clone results before moving
+                        let results = summary.results.clone();
+                        state.scan_results = results;
+                        
+                        // Update processed files
+                        let new_processed = processed_files.lock().unwrap().clone();
+                        state.processed_files = new_processed.clone();
+                        
+                        // Save processed files to disk
+                        let _ = save_processed_files(&new_processed);
+                        
+                        if summary.new_files == 0 {
+                            state.status_message = Some("No new files to process".to_string());
+                        } else {
+                            state.status_message = Some(format!(
+                                "Scan complete: {} new files, {} uploaded, {} failed",
+                                summary.new_files, summary.successfully_uploaded, summary.failed_uploads
+                            ));
+                        }
+                        
+                        state.last_scan_summary = Some(summary);
+                    }
+                    Err(e) => {
+                        state.status_message = Some(format!("Error: {}", e));
+                    }
+                }
+            }
+            
+            ctx_clone.request_repaint();
+        });
+    }
+
+    fn toggle_background_scanning(&mut self, enabled: bool) {
+        // Update state
+        {
+            let mut state = self.gamelog_state.lock().unwrap();
+            state.background_enabled = enabled;
+        }
+        
+        // Save to settings
+        {
+            let mut settings = self.settings.lock().unwrap();
+            settings.gamelog_config.background_scan_enabled = enabled;
+            let _ = settings.save();
+        }
+        
+        // Note: Actual background scanning would require a separate thread/task
+        // that periodically calls process_new_logs. For now, this just saves the preference.
+        let mut state = self.gamelog_state.lock().unwrap();
+        if enabled {
+            state.status_message = Some("Background scanning enabled. Use 'Scan Now' to manually trigger.".to_string());
+        } else {
+            state.status_message = Some("Background scanning disabled.".to_string());
+        }
+    }
+
+    fn clear_processed_history(&mut self) {
+        {
+            let mut state = self.gamelog_state.lock().unwrap();
+            state.processed_files.clear();
+            state.scan_results.clear();
+            state.status_message = Some("Processed history cleared".to_string());
+        }
+        
+        // Save empty set to disk
+        let _ = save_processed_files(&HashSet::new());
     }
 }
