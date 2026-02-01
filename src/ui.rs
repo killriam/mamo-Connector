@@ -3,14 +3,16 @@ use eframe::{NativeOptions, egui};
 use std::sync::{Arc, Mutex};
 
 use crate::commands::CommandResult;
-use crate::deck::{create_deck_from_moxfield, MoxfieldDeckEntry, DeckStatus, fetch_user_decks_direct, create_deck_from_archidekt, create_deck_from_deckstats, create_deck_from_mamo, parse_archidekt_url, parse_deckstats_url, parse_mamo_url};
+use crate::deck::{create_deck_from_moxfield, MoxfieldDeckEntry, DeckStatus, fetch_user_decks_direct, create_deck_from_archidekt, create_deck_from_deckstats, create_deck_from_mamo, parse_archidekt_url, parse_deckstats_url, parse_mamo_url, sync_moxfield_deck, sync_moxfield_user_decks, sync_archidekt_deck, sync_deckstats_deck, sync_mamo_deck, DeckSyncResult, SyncStatus, get_deck_directory_display};
 use crate::deeplink::Deeplink;
 use crate::registration::{RegistrationOutcome, RegistrationStatus};
+use crate::settings::{Settings, SavedLink, SavedLinkType};
 
 #[derive(Clone, PartialEq, Eq)]
 enum Tab {
     Status,
     Import,
+    Sync,
 }
 
 /// Detected URL type for auto-detection
@@ -32,6 +34,21 @@ struct ImportState {
     // For user decks
     decks: Vec<MoxfieldDeckEntry>,
     selected_decks: Vec<bool>,
+}
+
+/// State for the sync tab
+#[derive(Clone, Default)]
+struct SyncState {
+    is_syncing: bool,
+    sync_results: Vec<DeckSyncResult>,
+    sync_message: Option<String>,
+    // For editing links
+    edit_link_id: Option<String>,
+    edit_link_name: String,
+    // For adding new links
+    show_add_dialog: bool,
+    add_url_input: String,
+    add_name_input: String,
 }
 
 #[derive(Clone)]
@@ -94,15 +111,22 @@ struct LauncherApp {
     url_input: String,
     current_tab: Tab,
     import_state: Arc<Mutex<ImportState>>,
+    sync_state: Arc<Mutex<SyncState>>,
+    settings: Arc<Mutex<Settings>>,
 }
 
 impl LauncherApp {
     fn new(state: AppState) -> Self {
+        // Load settings
+        let settings = Settings::load().unwrap_or_default();
+        
         Self {
             state,
             url_input: String::new(),
             current_tab: Tab::Import,
             import_state: Arc::new(Mutex::new(ImportState::default())),
+            sync_state: Arc::new(Mutex::new(SyncState::default())),
+            settings: Arc::new(Mutex::new(settings)),
         }
     }
 }
@@ -126,6 +150,9 @@ impl eframe::App for LauncherApp {
                     if ui.selectable_label(self.current_tab == Tab::Import, "Import Decks").clicked() {
                         self.current_tab = Tab::Import;
                     }
+                    if ui.selectable_label(self.current_tab == Tab::Sync, "Sync").clicked() {
+                        self.current_tab = Tab::Sync;
+                    }
                 });
                 ui.separator();
                 
@@ -133,6 +160,7 @@ impl eframe::App for LauncherApp {
                 match self.current_tab {
                     Tab::Status => self.render_status_tab(ui),
                     Tab::Import => self.render_import_tab(ui, ctx),
+                    Tab::Sync => self.render_sync_tab(ui, ctx),
                 }
             });
     }
@@ -603,6 +631,450 @@ impl LauncherApp {
                 "Imported {} of {} decks ({} failed)",
                 success_count, total, fail_count
             ));
+            
+            ctx_clone.request_repaint();
+        });
+    }
+
+    // ==================== Sync Tab ====================
+
+    fn render_sync_tab(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        ui.label(egui::RichText::new("Deck Synchronization").strong());
+        ui.add_space(5.0);
+        ui.label(egui::RichText::new(format!("Deck folder: {}", get_deck_directory_display())).weak().small());
+        ui.add_space(10.0);
+        
+        // Get current state
+        let (is_syncing, sync_message, sync_results) = {
+            let state = self.sync_state.lock().unwrap();
+            (state.is_syncing, state.sync_message.clone(), state.sync_results.clone())
+        };
+        
+        let (show_add_dialog, edit_link_id) = {
+            let state = self.sync_state.lock().unwrap();
+            (state.show_add_dialog, state.edit_link_id.clone())
+        };
+        
+        // Main sync button
+        ui.horizontal(|ui| {
+            if ui.add_enabled(!is_syncing, egui::Button::new("🔄 Sync All Decks")).clicked() {
+                self.sync_all_decks(ctx);
+            }
+            
+            if ui.button("➕ Add Link").clicked() {
+                let mut state = self.sync_state.lock().unwrap();
+                state.show_add_dialog = true;
+                state.add_url_input.clear();
+                state.add_name_input.clear();
+            }
+            
+            if is_syncing {
+                ui.spinner();
+                ui.label("Syncing...");
+            }
+        });
+        
+        // Add dialog
+        if show_add_dialog {
+            self.render_add_link_dialog(ui, ctx);
+        }
+        
+        ui.add_space(10.0);
+        ui.separator();
+        
+        // Saved links list
+        ui.label(egui::RichText::new("Saved Links").strong());
+        ui.add_space(5.0);
+        
+        let saved_links: Vec<SavedLink> = {
+            let settings = self.settings.lock().unwrap();
+            settings.saved_links.clone()
+        };
+        
+        if saved_links.is_empty() {
+            ui.label(egui::RichText::new("No saved links yet. Add a deck or user link to enable sync.").weak());
+        } else {
+            let available_height = if !sync_results.is_empty() { 
+                ui.available_height() / 2.0 - 30.0 
+            } else { 
+                ui.available_height() - 100.0 
+            };
+            
+            egui::ScrollArea::vertical()
+                .id_source("saved_links_scroll")
+                .max_height(available_height.max(100.0))
+                .show(ui, |ui: &mut egui::Ui| {
+                    let mut link_to_delete: Option<String> = None;
+                    
+                    for link in &saved_links {
+                        let is_editing = edit_link_id.as_ref() == Some(&link.id);
+                        
+                        ui.horizontal(|ui: &mut egui::Ui| {
+                            // Enable/disable checkbox
+                            let mut enabled = link.enabled;
+                            if ui.checkbox(&mut enabled, "").changed() {
+                                let mut settings = self.settings.lock().unwrap();
+                                settings.update_link(&link.id, link.name.clone(), enabled);
+                                let _ = settings.save();
+                            }
+                            
+                            // Type icon
+                            let type_icon = match link.link_type {
+                                SavedLinkType::MoxfieldDeck => "🃏",
+                                SavedLinkType::MoxfieldUser => "👤",
+                                SavedLinkType::ArchidektDeck => "📚",
+                                SavedLinkType::DeckstatsDeck => "📊",
+                                SavedLinkType::MamoDeck => "🎯",
+                            };
+                            ui.label(type_icon);
+                            
+                            if is_editing {
+                                // Edit mode
+                                let mut edit_name = {
+                                    let state = self.sync_state.lock().unwrap();
+                                    state.edit_link_name.clone()
+                                };
+                                
+                                let response = ui.add(egui::TextEdit::singleline(&mut edit_name).desired_width(200.0));
+                                
+                                if response.changed() {
+                                    let mut state = self.sync_state.lock().unwrap();
+                                    state.edit_link_name = edit_name.clone();
+                                }
+                                
+                                if ui.button("✓").clicked() {
+                                    let mut settings = self.settings.lock().unwrap();
+                                    settings.update_link(&link.id, edit_name, link.enabled);
+                                    let _ = settings.save();
+                                    
+                                    let mut state = self.sync_state.lock().unwrap();
+                                    state.edit_link_id = None;
+                                }
+                                
+                                if ui.button("✗").clicked() {
+                                    let mut state = self.sync_state.lock().unwrap();
+                                    state.edit_link_id = None;
+                                }
+                            } else {
+                                // Display mode
+                                ui.label(&link.name);
+                                ui.label(egui::RichText::new(format!("[{}]", link.link_type.display_name())).weak().small());
+                                
+                                if let Some(last_synced) = &link.last_synced {
+                                    ui.label(egui::RichText::new(format!("Last sync: {}", last_synced)).weak().small());
+                                }
+                                
+                                // Edit button
+                                if ui.small_button("✏").clicked() {
+                                    let mut state = self.sync_state.lock().unwrap();
+                                    state.edit_link_id = Some(link.id.clone());
+                                    state.edit_link_name = link.name.clone();
+                                }
+                                
+                                // Delete button
+                                if ui.small_button("🗑").clicked() {
+                                    link_to_delete = Some(link.id.clone());
+                                }
+                            }
+                        });
+                    }
+                    
+                    // Process delete outside the loop
+                    if let Some(id) = link_to_delete {
+                        let mut settings = self.settings.lock().unwrap();
+                        settings.remove_link(&id);
+                        let _ = settings.save();
+                    }
+                });
+        }
+        
+        // Sync results
+        if !sync_results.is_empty() {
+            ui.add_space(10.0);
+            ui.separator();
+            ui.label(egui::RichText::new("Sync Results").strong());
+            
+            let updated = sync_results.iter().filter(|r| r.status == SyncStatus::Updated).count();
+            let new = sync_results.iter().filter(|r| r.status == SyncStatus::NewDownloaded).count();
+            let up_to_date = sync_results.iter().filter(|r| r.status == SyncStatus::AlreadyUpToDate).count();
+            let failed = sync_results.iter().filter(|r| r.status == SyncStatus::Failed).count();
+            
+            ui.horizontal(|ui| {
+                if updated > 0 {
+                    ui.label(egui::RichText::new(format!("📥 {} updated", updated)).color(egui::Color32::from_rgb(0, 128, 0)));
+                }
+                if new > 0 {
+                    ui.label(egui::RichText::new(format!("🆕 {} new", new)).color(egui::Color32::from_rgb(0, 100, 200)));
+                }
+                if up_to_date > 0 {
+                    ui.label(egui::RichText::new(format!("✓ {} up to date", up_to_date)).color(egui::Color32::GRAY));
+                }
+                if failed > 0 {
+                    ui.label(egui::RichText::new(format!("❌ {} failed", failed)).color(egui::Color32::from_rgb(200, 0, 0)));
+                }
+            });
+            
+            egui::ScrollArea::vertical()
+                .id_source("sync_results_scroll")
+                .max_height(150.0)
+                .show(ui, |ui: &mut egui::Ui| {
+                    for result in &sync_results {
+                        let (icon, color) = match result.status {
+                            SyncStatus::Updated => ("📥", egui::Color32::from_rgb(0, 128, 0)),
+                            SyncStatus::NewDownloaded => ("🆕", egui::Color32::from_rgb(0, 100, 200)),
+                            SyncStatus::AlreadyUpToDate => ("✓", egui::Color32::GRAY),
+                            SyncStatus::Failed => ("❌", egui::Color32::from_rgb(200, 0, 0)),
+                            SyncStatus::Skipped => ("⏭", egui::Color32::from_rgb(150, 150, 0)),
+                        };
+                        ui.label(egui::RichText::new(format!("{} {}", icon, result.message)).color(color).small());
+                    }
+                });
+        }
+        
+        // Show sync message
+        if let Some(msg) = sync_message {
+            ui.add_space(5.0);
+            let color = if msg.contains("Error") || msg.contains("failed") {
+                egui::Color32::from_rgb(176, 0, 32)
+            } else {
+                egui::Color32::from_rgb(0, 128, 0)
+            };
+            ui.label(egui::RichText::new(msg).color(color));
+        }
+    }
+
+    fn render_add_link_dialog(&mut self, ui: &mut egui::Ui, _ctx: &egui::Context) {
+        egui::Frame::default()
+            .fill(egui::Color32::from_rgb(245, 245, 245))
+            .inner_margin(10.0)
+            .rounding(5.0)
+            .stroke(egui::Stroke::new(1.0, egui::Color32::GRAY))
+            .show(ui, |ui| {
+                ui.label(egui::RichText::new("Add New Link").strong());
+                ui.add_space(5.0);
+                
+                // URL input
+                ui.horizontal(|ui| {
+                    ui.label("URL / ID:");
+                    let mut url = {
+                        let state = self.sync_state.lock().unwrap();
+                        state.add_url_input.clone()
+                    };
+                    if ui.add(egui::TextEdit::singleline(&mut url).desired_width(400.0)).changed() {
+                        let mut state = self.sync_state.lock().unwrap();
+                        state.add_url_input = url;
+                    }
+                });
+                
+                // Detect URL type
+                let url_type = {
+                    let state = self.sync_state.lock().unwrap();
+                    self.detect_url_type(&state.add_url_input)
+                };
+                
+                // Show detected type
+                match &url_type {
+                    UrlType::MoxfieldDeck(id) => {
+                        ui.label(egui::RichText::new(format!("✓ Moxfield Deck: {}", id)).color(egui::Color32::from_rgb(0, 128, 0)));
+                    }
+                    UrlType::MoxfieldUser(username) => {
+                        ui.label(egui::RichText::new(format!("✓ Moxfield User: {} (all decks)", username)).color(egui::Color32::from_rgb(0, 128, 0)));
+                    }
+                    UrlType::ArchidektDeck(id) => {
+                        ui.label(egui::RichText::new(format!("✓ Archidekt Deck: {}", id)).color(egui::Color32::from_rgb(0, 128, 0)));
+                    }
+                    UrlType::DeckstatsDeck(owner, deck) => {
+                        ui.label(egui::RichText::new(format!("✓ Deckstats Deck: {}/{}", owner, deck)).color(egui::Color32::from_rgb(0, 128, 0)));
+                    }
+                    UrlType::MamoDeck(uuid) => {
+                        ui.label(egui::RichText::new(format!("✓ MaMo Deck: {}", uuid)).color(egui::Color32::from_rgb(0, 128, 0)));
+                    }
+                    UrlType::Unknown => {
+                        ui.label(egui::RichText::new("⚠ Unknown URL format").color(egui::Color32::from_rgb(200, 100, 0)));
+                    }
+                    UrlType::Empty => {}
+                }
+                
+                // Name input
+                ui.horizontal(|ui| {
+                    ui.label("Name:");
+                    let mut name = {
+                        let state = self.sync_state.lock().unwrap();
+                        state.add_name_input.clone()
+                    };
+                    if ui.add(egui::TextEdit::singleline(&mut name).desired_width(300.0).hint_text("Optional - auto-detected if empty")).changed() {
+                        let mut state = self.sync_state.lock().unwrap();
+                        state.add_name_input = name;
+                    }
+                });
+                
+                ui.add_space(5.0);
+                
+                // Buttons
+                ui.horizontal(|ui| {
+                    let can_add = !matches!(url_type, UrlType::Empty | UrlType::Unknown);
+                    
+                    if ui.add_enabled(can_add, egui::Button::new("Add")).clicked() {
+                        self.add_saved_link(&url_type);
+                    }
+                    
+                    if ui.button("Cancel").clicked() {
+                        let mut state = self.sync_state.lock().unwrap();
+                        state.show_add_dialog = false;
+                    }
+                });
+            });
+    }
+
+    fn add_saved_link(&mut self, url_type: &UrlType) {
+        let (name_input, _url_input) = {
+            let state = self.sync_state.lock().unwrap();
+            (state.add_name_input.clone(), state.add_url_input.clone())
+        };
+        
+        let link = match url_type {
+            UrlType::MoxfieldDeck(id) => {
+                let name = if name_input.is_empty() { 
+                    format!("Moxfield Deck {}", id) 
+                } else { 
+                    name_input 
+                };
+                SavedLink::new(name, SavedLinkType::MoxfieldDeck, id.clone())
+            }
+            UrlType::MoxfieldUser(username) => {
+                let name = if name_input.is_empty() { 
+                    format!("Moxfield User: {}", username) 
+                } else { 
+                    name_input 
+                };
+                SavedLink::new(name, SavedLinkType::MoxfieldUser, username.clone())
+            }
+            UrlType::ArchidektDeck(id) => {
+                let name = if name_input.is_empty() { 
+                    format!("Archidekt Deck {}", id) 
+                } else { 
+                    name_input 
+                };
+                SavedLink::new(name, SavedLinkType::ArchidektDeck, id.clone())
+            }
+            UrlType::DeckstatsDeck(owner, deck) => {
+                let name = if name_input.is_empty() { 
+                    format!("Deckstats Deck {}", deck) 
+                } else { 
+                    name_input 
+                };
+                SavedLink::new_deckstats(name, owner.clone(), deck.clone())
+            }
+            UrlType::MamoDeck(uuid) => {
+                let name = if name_input.is_empty() { 
+                    format!("MaMo Deck {}", &uuid[..8]) 
+                } else { 
+                    name_input 
+                };
+                SavedLink::new(name, SavedLinkType::MamoDeck, uuid.clone())
+            }
+            _ => return,
+        };
+        
+        {
+            let mut settings = self.settings.lock().unwrap();
+            settings.add_link(link);
+            let _ = settings.save();
+        }
+        
+        {
+            let mut state = self.sync_state.lock().unwrap();
+            state.show_add_dialog = false;
+            state.add_url_input.clear();
+            state.add_name_input.clear();
+        }
+    }
+
+    fn sync_all_decks(&mut self, ctx: &egui::Context) {
+        let settings_clone = Arc::clone(&self.settings);
+        let sync_state_clone = Arc::clone(&self.sync_state);
+        let ctx_clone = ctx.clone();
+        
+        // Get enabled links
+        let links: Vec<SavedLink> = {
+            let settings = self.settings.lock().unwrap();
+            settings.get_enabled_links().iter().map(|l| (*l).clone()).collect()
+        };
+        
+        if links.is_empty() {
+            let mut state = self.sync_state.lock().unwrap();
+            state.sync_message = Some("No enabled links to sync".to_string());
+            return;
+        }
+        
+        {
+            let mut state = self.sync_state.lock().unwrap();
+            state.is_syncing = true;
+            state.sync_results.clear();
+            state.sync_message = Some(format!("Syncing {} link(s)...", links.len()));
+        }
+        
+        tokio::spawn(async move {
+            let mut all_results = Vec::new();
+            
+            for link in &links {
+                let results = match link.link_type {
+                    SavedLinkType::MoxfieldDeck => {
+                        match sync_moxfield_deck(&link.url).await {
+                            Ok(result) => vec![result],
+                            Err(e) => vec![DeckSyncResult::failed(link.name.clone(), e.to_string())],
+                        }
+                    }
+                    SavedLinkType::MoxfieldUser => {
+                        match sync_moxfield_user_decks(&link.url).await {
+                            Ok(results) => results,
+                            Err(e) => vec![DeckSyncResult::failed(link.name.clone(), e.to_string())],
+                        }
+                    }
+                    SavedLinkType::ArchidektDeck => {
+                        match sync_archidekt_deck(&link.url).await {
+                            Ok(result) => vec![result],
+                            Err(e) => vec![DeckSyncResult::failed(link.name.clone(), e.to_string())],
+                        }
+                    }
+                    SavedLinkType::DeckstatsDeck => {
+                        let owner_id = link.owner_id.as_deref().unwrap_or("");
+                        match sync_deckstats_deck(owner_id, &link.url).await {
+                            Ok(result) => vec![result],
+                            Err(e) => vec![DeckSyncResult::failed(link.name.clone(), e.to_string())],
+                        }
+                    }
+                    SavedLinkType::MamoDeck => {
+                        match sync_mamo_deck(&link.url).await {
+                            Ok(result) => vec![result],
+                            Err(e) => vec![DeckSyncResult::failed(link.name.clone(), e.to_string())],
+                        }
+                    }
+                };
+                
+                all_results.extend(results);
+                
+                // Mark link as synced
+                {
+                    let mut settings = settings_clone.lock().unwrap();
+                    settings.mark_link_synced(&link.id);
+                    let _ = settings.save();
+                }
+            }
+            
+            let updated = all_results.iter().filter(|r| r.status == SyncStatus::Updated).count();
+            let new = all_results.iter().filter(|r| r.status == SyncStatus::NewDownloaded).count();
+            let failed = all_results.iter().filter(|r| r.status == SyncStatus::Failed).count();
+            
+            {
+                let mut state = sync_state_clone.lock().unwrap();
+                state.is_syncing = false;
+                state.sync_results = all_results;
+                state.sync_message = Some(format!(
+                    "Sync complete: {} updated, {} new, {} failed",
+                    updated, new, failed
+                ));
+            }
             
             ctx_clone.request_repaint();
         });

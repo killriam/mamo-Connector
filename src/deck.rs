@@ -1234,6 +1234,375 @@ fn format_card_line(card: &Card) -> String {
     }
 }
 
+// ==================== Deck Sync Functions ====================
+
+/// Result of a single deck sync operation
+#[derive(Debug, Clone)]
+pub struct DeckSyncResult {
+    pub deck_name: String,
+    pub status: SyncStatus,
+    pub message: String,
+    pub old_file: Option<PathBuf>,
+    pub new_file: Option<PathBuf>,
+}
+
+/// Status of a sync operation
+#[derive(Debug, Clone, PartialEq)]
+pub enum SyncStatus {
+    Updated,       // Deck was updated (old version renamed)
+    AlreadyUpToDate,
+    NewDownloaded, // New deck was downloaded
+    Failed,        // Sync failed
+    Skipped,       // Skipped (disabled or error checking)
+}
+
+impl DeckSyncResult {
+    pub fn updated(deck_name: String, old_file: PathBuf, new_file: PathBuf) -> Self {
+        Self {
+            deck_name: deck_name.clone(),
+            status: SyncStatus::Updated,
+            message: format!("Updated '{}' - old version archived", deck_name),
+            old_file: Some(old_file),
+            new_file: Some(new_file),
+        }
+    }
+
+    pub fn already_up_to_date(deck_name: String) -> Self {
+        Self {
+            deck_name: deck_name.clone(),
+            status: SyncStatus::AlreadyUpToDate,
+            message: format!("'{}' is already up to date", deck_name),
+            old_file: None,
+            new_file: None,
+        }
+    }
+
+    pub fn new_downloaded(deck_name: String, new_file: PathBuf) -> Self {
+        Self {
+            deck_name: deck_name.clone(),
+            status: SyncStatus::NewDownloaded,
+            message: format!("Downloaded new deck '{}'", deck_name),
+            old_file: None,
+            new_file: Some(new_file),
+        }
+    }
+
+    pub fn failed(deck_name: String, error: String) -> Self {
+        Self {
+            deck_name: deck_name.clone(),
+            status: SyncStatus::Failed,
+            message: format!("Failed to sync '{}': {}", deck_name, error),
+            old_file: None,
+            new_file: None,
+        }
+    }
+
+    pub fn skipped(deck_name: String, reason: String) -> Self {
+        Self {
+            deck_name: deck_name.clone(),
+            status: SyncStatus::Skipped,
+            message: format!("Skipped '{}': {}", deck_name, reason),
+            old_file: None,
+            new_file: None,
+        }
+    }
+}
+
+/// Prefix for archived old deck versions
+const PAST_VERSIONS_PREFIX: &str = "PASTVersionS_";
+
+/// Sync a single Moxfield deck - check if newer and update if needed
+pub async fn sync_moxfield_deck(deck_id: &str) -> Result<DeckSyncResult> {
+    info!("Syncing Moxfield deck: {}", deck_id);
+    
+    // Fetch deck info from Moxfield
+    let url = format!("{}/decks/all/{}", MOXFIELD_API_URL, deck_id);
+    let body = fetch_with_curl(&url)?;
+    
+    let deck: MoxfieldFullDeck = serde_json::from_str(&body)
+        .with_context(|| "Failed to parse Moxfield deck response")?;
+    
+    // Build the expected filename
+    let author = deck.created_by_user.as_ref()
+        .map(|u| u.user_name.as_str())
+        .unwrap_or("Unknown");
+    
+    let moxfield_date = deck.last_updated_at_utc.as_ref()
+        .and_then(|dt| dt.split('T').next())
+        .unwrap_or("unknown");
+    
+    let deck_dir = get_deck_directory()?;
+    
+    // Check for existing deck files matching this pattern
+    let (existing_file, existing_date) = find_existing_deck_file(author, &deck.name, &deck_dir)?;
+    
+    if let Some(existing_path) = existing_file {
+        // Compare dates to see if we need to update
+        if let Some(ref local_date) = existing_date {
+            if local_date >= &moxfield_date.to_string() {
+                info!("Deck '{}' is already up to date (local: {}, moxfield: {})", 
+                      deck.name, local_date, moxfield_date);
+                return Ok(DeckSyncResult::already_up_to_date(deck.name));
+            }
+        }
+        
+        // Moxfield is newer - archive old version and download new
+        info!("Deck '{}' needs update (local: {:?}, moxfield: {})", 
+              deck.name, &existing_date, moxfield_date);
+        
+        // Rename old file with PAST_VERSIONS_PREFIX
+        let old_filename = existing_path.file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("unknown.dck");
+        let archived_path = existing_path.parent()
+            .unwrap_or(&deck_dir)
+            .join(format!("{}{}", PAST_VERSIONS_PREFIX, old_filename));
+        
+        fs::rename(&existing_path, &archived_path)
+            .with_context(|| format!("Failed to archive old deck: {:?}", existing_path))?;
+        info!("Archived old version to: {:?}", archived_path);
+        
+        // Download the new version
+        let full_name = format!("{} - {} ({})", author, deck.name, moxfield_date);
+        let forge_content = convert_moxfield_to_forge(&full_name, &body)?;
+        let new_path = write_deck_file(&full_name, &forge_content).await?;
+        
+        Ok(DeckSyncResult::updated(deck.name, archived_path, new_path))
+    } else {
+        // No existing file - download as new
+        info!("Deck '{}' is new, downloading...", deck.name);
+        
+        let full_name = format!("{} - {} ({})", author, deck.name, moxfield_date);
+        let forge_content = convert_moxfield_to_forge(&full_name, &body)?;
+        let new_path = write_deck_file(&full_name, &forge_content).await?;
+        
+        Ok(DeckSyncResult::new_downloaded(deck.name, new_path))
+    }
+}
+
+/// Sync all decks from a Moxfield user
+pub async fn sync_moxfield_user_decks(username: &str) -> Result<Vec<DeckSyncResult>> {
+    info!("Syncing all decks for Moxfield user: {}", username);
+    
+    // Fetch all user decks
+    let decks = fetch_user_decks_direct(username)?;
+    let mut results = Vec::new();
+    
+    for deck in decks {
+        let result = sync_moxfield_deck(&deck.public_id).await
+            .unwrap_or_else(|e| DeckSyncResult::failed(deck.name.clone(), e.to_string()));
+        results.push(result);
+    }
+    
+    Ok(results)
+}
+
+/// Sync an Archidekt deck
+pub async fn sync_archidekt_deck(deck_id: &str) -> Result<DeckSyncResult> {
+    info!("Syncing Archidekt deck: {}", deck_id);
+    
+    let url = format!("https://archidekt.com/api/decks/{}/", deck_id);
+    let body = fetch_with_curl_custom(&url, &[
+        "-H", "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "-H", "Accept: application/json",
+    ])?;
+    
+    let deck: ArchidektDeck = serde_json::from_str(&body)
+        .with_context(|| "Failed to parse Archidekt deck response")?;
+    
+    let author = deck.owner.as_ref()
+        .map(|o| o.username.as_str())
+        .unwrap_or("Unknown");
+    
+    let archidekt_date = deck.updated_at.as_ref()
+        .and_then(|dt| dt.split('T').next())
+        .unwrap_or("unknown");
+    
+    let deck_dir = get_deck_directory()?;
+    let (existing_file, existing_date) = find_existing_deck_file(author, &deck.name, &deck_dir)?;
+    
+    if let Some(existing_path) = existing_file {
+        if let Some(local_date) = existing_date {
+            if local_date >= archidekt_date.to_string() {
+                return Ok(DeckSyncResult::already_up_to_date(deck.name));
+            }
+        }
+        
+        // Archive old and download new
+        let old_filename = existing_path.file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("unknown.dck");
+        let archived_path = existing_path.parent()
+            .unwrap_or(&deck_dir)
+            .join(format!("{}{}", PAST_VERSIONS_PREFIX, old_filename));
+        
+        fs::rename(&existing_path, &archived_path)?;
+        
+        let full_name = format!("{} - {} ({})", author, deck.name, archidekt_date);
+        let forge_content = convert_archidekt_to_forge(&full_name, &deck)?;
+        let new_path = write_deck_file(&full_name, &forge_content).await?;
+        
+        Ok(DeckSyncResult::updated(deck.name, archived_path, new_path))
+    } else {
+        let full_name = format!("{} - {} ({})", author, deck.name, archidekt_date);
+        let forge_content = convert_archidekt_to_forge(&full_name, &deck)?;
+        let new_path = write_deck_file(&full_name, &forge_content).await?;
+        
+        Ok(DeckSyncResult::new_downloaded(deck.name, new_path))
+    }
+}
+
+/// Sync a Deckstats deck
+pub async fn sync_deckstats_deck(owner_id: &str, deck_id: &str) -> Result<DeckSyncResult> {
+    info!("Syncing Deckstats deck: owner={} deck={}", owner_id, deck_id);
+    
+    // Deckstats doesn't provide easy date comparison, so we always re-download
+    let url = format!(
+        "https://deckstats.net/api.php?action=get_deck&id_type=saved&owner_id={}&id={}&response_type=list",
+        owner_id, deck_id
+    );
+    
+    let body = fetch_with_curl_custom(&url, &[
+        "-H", "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+    ])?;
+    
+    let deck_name = body.lines()
+        .find(|l| l.starts_with("//NAME:"))
+        .map(|l| l.trim_start_matches("//NAME:").trim())
+        .unwrap_or("Unknown Deck");
+    
+    let date = chrono::Local::now().format("%Y-%m-%d").to_string();
+    let full_name = format!("Deckstats - {} ({})", deck_name, date);
+    
+    let deck_dir = get_deck_directory()?;
+    let (existing_file, _) = find_existing_deck_file("Deckstats", deck_name, &deck_dir)?;
+    
+    if let Some(existing_path) = existing_file {
+        // Archive old version
+        let old_filename = existing_path.file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("unknown.dck");
+        let archived_path = existing_path.parent()
+            .unwrap_or(&deck_dir)
+            .join(format!("{}{}", PAST_VERSIONS_PREFIX, old_filename));
+        
+        fs::rename(&existing_path, &archived_path)?;
+        
+        let forge_content = convert_deckstats_to_forge(&full_name, &body)?;
+        let new_path = write_deck_file(&full_name, &forge_content).await?;
+        
+        Ok(DeckSyncResult::updated(deck_name.to_string(), archived_path, new_path))
+    } else {
+        let forge_content = convert_deckstats_to_forge(&full_name, &body)?;
+        let new_path = write_deck_file(&full_name, &forge_content).await?;
+        
+        Ok(DeckSyncResult::new_downloaded(deck_name.to_string(), new_path))
+    }
+}
+
+/// Sync a MaMo deck
+pub async fn sync_mamo_deck(deck_id: &str) -> Result<DeckSyncResult> {
+    info!("Syncing MaMo deck: {}", deck_id);
+    
+    let url = format!("{}/api/deck/export/{}/forge", MAMO_API_URL, deck_id);
+    
+    let body = fetch_with_curl_custom(&url, &[
+        "-H", "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "-H", "Accept: text/plain",
+    ])?;
+    
+    if body.starts_with("{") && body.contains("error") {
+        return Err(anyhow::anyhow!("MaMo API returned error: {}", body));
+    }
+    
+    // Parse deck name from content
+    let deck_name = body.lines()
+        .find(|l| l.starts_with("Name="))
+        .map(|l| l.trim_start_matches("Name="))
+        .unwrap_or("Unknown MaMo Deck");
+    
+    // Extract author and deck name from "Author - Deck Name" format
+    let (author, name) = if deck_name.contains(" - ") {
+        let parts: Vec<&str> = deck_name.splitn(2, " - ").collect();
+        (parts.get(0).copied().unwrap_or("Unknown"), parts.get(1).copied().unwrap_or(deck_name))
+    } else {
+        ("MaMo", deck_name)
+    };
+    
+    let deck_dir = get_deck_directory()?;
+    let (existing_file, _) = find_existing_deck_file(author, name, &deck_dir)?;
+    
+    if let Some(existing_path) = existing_file {
+        // Archive old version
+        let old_filename = existing_path.file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("unknown.dck");
+        let archived_path = existing_path.parent()
+            .unwrap_or(&deck_dir)
+            .join(format!("{}{}", PAST_VERSIONS_PREFIX, old_filename));
+        
+        fs::rename(&existing_path, &archived_path)?;
+        
+        let new_path = write_deck_file(deck_name, &body).await?;
+        
+        Ok(DeckSyncResult::updated(name.to_string(), archived_path, new_path))
+    } else {
+        let new_path = write_deck_file(deck_name, &body).await?;
+        
+        Ok(DeckSyncResult::new_downloaded(name.to_string(), new_path))
+    }
+}
+
+/// Find an existing deck file matching the pattern "author - deck_name (date).dck"
+fn find_existing_deck_file(author: &str, deck_name: &str, deck_dir: &PathBuf) -> Result<(Option<PathBuf>, Option<String>)> {
+    if !deck_dir.exists() {
+        return Ok((None, None));
+    }
+    
+    let sanitized_deck_name = sanitize_filename(deck_name);
+    let pattern_start = format!("{} - {}", author, sanitized_deck_name);
+    
+    if let Ok(entries) = fs::read_dir(deck_dir) {
+        for entry in entries.filter_map(|e| e.ok()) {
+            let path = entry.path();
+            let filename = path.file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("");
+            
+            // Skip archived versions
+            if filename.starts_with(PAST_VERSIONS_PREFIX) {
+                continue;
+            }
+            
+            // Check if filename matches our pattern
+            if filename.starts_with(&pattern_start) && filename.ends_with(".dck") {
+                // Extract date from filename: "user - name (YYYY-MM-DD).dck"
+                let date = if let Some(date_start) = filename.rfind('(') {
+                    if let Some(date_end) = filename.rfind(')') {
+                        Some(filename[date_start + 1..date_end].to_string())
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+                
+                return Ok((Some(path), date));
+            }
+        }
+    }
+    
+    Ok((None, None))
+}
+
+/// Get the public deck directory path (for UI display)
+pub fn get_deck_directory_display() -> String {
+    match get_deck_directory() {
+        Ok(path) => path.to_string_lossy().to_string(),
+        Err(_) => "Unknown".to_string(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

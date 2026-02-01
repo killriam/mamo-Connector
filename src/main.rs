@@ -2,6 +2,7 @@ mod commands;
 mod deck;
 mod deeplink;
 mod registration;
+mod settings;
 mod ui;
 
 use anyhow::Result;

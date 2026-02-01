@@ -12,6 +12,7 @@ url = "2"
 regex = "1"
 cfg-if = "1"
 directories = "5"
+dirs = "5"
 log = "0.4"
 env_logger = "0.11"
 eframe = { version = "0.28", default-features = true, features = ["glow", "default_fonts"] }
