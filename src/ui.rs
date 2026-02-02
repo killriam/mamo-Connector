@@ -2,6 +2,7 @@ use anyhow::Result;
 use eframe::{NativeOptions, egui};
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use crate::commands::CommandResult;
 use crate::deck::{create_deck_from_moxfield, MoxfieldDeckEntry, MamoDeckEntry, DeckStatus, fetch_user_decks_direct, create_deck_from_archidekt, create_deck_from_deckstats, create_deck_from_mamo, parse_archidekt_url, parse_deckstats_url, parse_mamo_url, parse_mamo_user_url, fetch_mamo_user_decks, sync_moxfield_deck, sync_moxfield_user_decks, sync_archidekt_deck, sync_deckstats_deck, sync_mamo_deck, DeckSyncResult, SyncStatus, get_deck_directory_display};
@@ -11,6 +12,7 @@ use crate::forge::{get_default_forge_path, validate_forge_path, launch_forge_fro
 use crate::gamelog::{GameLogConfig, GameLogProcessResult, ScanSummary, get_default_forge_log_directory, validate_directory, scan_directory, process_new_logs, load_processed_files, save_processed_files};
 use crate::registration::{RegistrationOutcome, RegistrationStatus};
 use crate::settings::{Settings, SavedLink, SavedLinkType};
+use crate::get_pending_command_path;
 
 #[derive(Clone, PartialEq, Eq)]
 enum Tab {
@@ -163,6 +165,7 @@ struct LauncherApp {
     gamelog_state: Arc<Mutex<GameLogState>>,
     settings_state: Arc<Mutex<SettingsState>>,
     settings: Arc<Mutex<Settings>>,
+    last_pending_check: Instant,
 }
 
 impl LauncherApp {
@@ -205,12 +208,23 @@ impl LauncherApp {
             gamelog_state: Arc::new(Mutex::new(gamelog_state)),
             settings_state: Arc::new(Mutex::new(settings_state)),
             settings: Arc::new(Mutex::new(settings)),
+            last_pending_check: Instant::now(),
         }
     }
 }
 
 impl eframe::App for LauncherApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // Check for pending commands from secondary instances every 500ms
+        let now = Instant::now();
+        if now.duration_since(self.last_pending_check).as_millis() > 500 {
+            self.last_pending_check = now;
+            self.check_pending_commands(ctx);
+        }
+        
+        // Request a repaint in 500ms to keep checking for pending commands
+        ctx.request_repaint_after(std::time::Duration::from_millis(500));
+        
         egui::CentralPanel::default()
             .frame(egui::Frame::default().fill(egui::Color32::WHITE))
             .show(ctx, |ui| {
@@ -253,6 +267,62 @@ impl eframe::App for LauncherApp {
 }
 
 impl LauncherApp {
+    /// Check for pending commands from secondary instances
+    fn check_pending_commands(&mut self, ctx: &egui::Context) {
+        use crate::commands;
+        use crate::deeplink;
+        use log::info;
+        
+        let pending_path = get_pending_command_path();
+        if pending_path.exists() {
+            if let Ok(raw_command) = std::fs::read_to_string(&pending_path) {
+                let raw_command = raw_command.trim();
+                if !raw_command.is_empty() {
+                    info!("Processing pending command: {}", raw_command);
+                    
+                    // Parse the deeplink
+                    if let Some(deeplink) = deeplink::parse_deeplink(&[raw_command.to_string()], "mamoConnector://") {
+                        // Handle the command in a background thread
+                        let settings = self.settings.clone();
+                        let settings_state = self.settings_state.clone();
+                        let ctx_clone = ctx.clone();
+                        
+                        std::thread::spawn(move || {
+                            let runtime = tokio::runtime::Runtime::new().unwrap();
+                            let result = runtime.block_on(commands::handle_command(&deeplink));
+                            
+                            // Handle auth token saved result
+                            if let commands::CommandResult::AuthTokenSaved(ref token) = result {
+                                info!("Auth token saved via pending command: {}", 
+                                    if token.len() > 20 { format!("{}...", &token[..20]) } else { token.clone() });
+                                
+                                // Reload settings from disk to get the updated auth_token
+                                if let Ok(reloaded_settings) = crate::settings::Settings::load() {
+                                    if let Ok(mut settings_guard) = settings.lock() {
+                                        *settings_guard = reloaded_settings;
+                                    }
+                                    
+                                    // Update the settings state UI fields
+                                    if let Ok(mut state_guard) = settings_state.lock() {
+                                        if let Ok(settings_guard) = settings.lock() {
+                                            state_guard.auth_token_input = settings_guard.auth_token.clone().unwrap_or_default();
+                                            state_guard.status_message = Some("✓ Connected to MaMo".to_string());
+                                        }
+                                    }
+                                }
+                            }
+                            
+                            ctx_clone.request_repaint();
+                        });
+                    }
+                    
+                    // Delete the pending command file
+                    let _ = std::fs::remove_file(&pending_path);
+                }
+            }
+        }
+    }
+    
     fn render_status_tab(&self, ui: &mut egui::Ui) {
         ui.label("Registration Status");
         let status_text = match self.state.registration.status {
@@ -335,12 +405,21 @@ impl LauncherApp {
                 CommandResult::AuthTokenSaved(msg) => {
                     ui.label(egui::RichText::new(msg)
                         .color(egui::Color32::from_rgb(0, 128, 0)));
-                    // Also update the settings state to reflect the new token
-                    {
-                        let settings = self.settings.lock().unwrap();
-                        if let Some(ref token) = settings.auth_token {
-                            let mut state = self.settings_state.lock().unwrap();
-                            state.auth_token_input = token.clone();
+                    // Reload settings from disk to get the new token
+                    if let Ok(new_settings) = Settings::load() {
+                        if let Some(ref token) = new_settings.auth_token {
+                            // Update the in-memory settings
+                            {
+                                let mut settings = self.settings.lock().unwrap();
+                                settings.auth_token = Some(token.clone());
+                                settings.gamelog_config.auth_token = Some(token.clone());
+                            }
+                            // Update the settings state UI
+                            {
+                                let mut state = self.settings_state.lock().unwrap();
+                                state.auth_token_input = token.clone();
+                                state.status_message = Some("Connected via deeplink!".to_string());
+                            }
                         }
                     }
                 }
