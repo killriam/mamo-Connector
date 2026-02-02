@@ -126,7 +126,7 @@ fn default_scan_interval() -> u64 {
 }
 
 fn default_api_url() -> String {
-    "https://mamo-backend.vercel.app".to_string()
+    "https://new-backend-two-eosin.vercel.app".to_string()
 }
 
 impl Default for GameLogConfig {
