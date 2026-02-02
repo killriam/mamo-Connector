@@ -142,9 +142,18 @@ impl Default for GameLogConfig {
 /// Get the default Forge game log directory based on OS
 pub fn get_default_forge_log_directory() -> String {
     if cfg!(windows) {
-        // Windows: %USERPROFILE%\AppData\Roaming\Forge\games\
-        if let Some(appdata) = dirs::data_dir() {
-            return appdata.join("Forge").join("games").to_string_lossy().to_string();
+        // Windows: %APPDATA%\Forge\games\ (Roaming AppData)
+        // Use std::env to get APPDATA directly for Windows
+        if let Ok(appdata) = std::env::var("APPDATA") {
+            return std::path::Path::new(&appdata)
+                .join("Forge")
+                .join("games")
+                .to_string_lossy()
+                .to_string();
+        }
+        // Fallback to dirs crate
+        if let Some(config) = dirs::config_dir() {
+            return config.join("Forge").join("games").to_string_lossy().to_string();
         }
     } else if cfg!(target_os = "macos") {
         // macOS: ~/Library/Application Support/Forge/games/
@@ -247,6 +256,9 @@ pub async fn upload_game_log(
 ) -> Result<UploadResponse> {
     let client = reqwest::Client::new();
     
+    // Extract deck identifier from filename or content
+    let deck_identifier = extract_deck_identifier(&log_content.filename, &log_content.content);
+    
     let upload_payload = GameLogUploadPayload {
         filename: log_content.filename.clone(),
         content: log_content.content.clone(),
@@ -254,6 +266,7 @@ pub async fn upload_game_log(
         modified_timestamp: log_content.modified_timestamp,
         user_id: config.user_id.clone(),
         uploaded_at: chrono::Utc::now().to_rfc3339(),
+        deck_identifier,
     };
     
     let url = format!("{}/api/gamelog/upload", config.api_url);
@@ -278,6 +291,81 @@ pub async fn upload_game_log(
     }
 }
 
+/// Extract deck identifier from filename or content
+/// 
+/// Forge game logs often include the deck name in:
+/// 1. The filename itself (e.g., "game-MyDeckName-2026-02-02.txt")
+/// 2. The log content (e.g., "Human's deck: MyDeckName")
+fn extract_deck_identifier(filename: &str, content: &str) -> Option<String> {
+    // Pattern 1: Try to extract from filename
+    // Common formats: "game-{deck_name}-{date}.txt", "{deck_name}_vs_{opponent}.txt"
+    if let Some(deck_name) = extract_deck_from_filename(filename) {
+        return Some(deck_name);
+    }
+    
+    // Pattern 2: Try to extract from log content
+    // Look for lines like "Human's deck: DeckName" or "Player1 deck: DeckName"
+    for line in content.lines() {
+        let line_lower = line.to_lowercase();
+        
+        // Pattern: "X's deck: Y" or "X deck: Y"
+        if line_lower.contains("deck:") || line_lower.contains("'s deck:") {
+            if let Some(deck_part) = line.split(':').nth(1) {
+                let deck_name = deck_part.trim();
+                if !deck_name.is_empty() && deck_name.len() > 2 {
+                    return Some(deck_name.to_string());
+                }
+            }
+        }
+        
+        // Pattern: "Playing X"
+        if line_lower.starts_with("playing ") {
+            let deck_name = line.trim_start_matches("Playing ").trim_start_matches("playing ").trim();
+            if !deck_name.is_empty() && deck_name.len() > 2 {
+                return Some(deck_name.to_string());
+            }
+        }
+    }
+    
+    None
+}
+
+/// Extract deck name from filename
+fn extract_deck_from_filename(filename: &str) -> Option<String> {
+    // Remove extension
+    let name = filename.trim_end_matches(".txt").trim_end_matches(".log");
+    
+    // Pattern: "game-{deck_name}-{date}"
+    if name.starts_with("game-") {
+        let parts: Vec<&str> = name.strip_prefix("game-").unwrap_or(name).split('-').collect();
+        if parts.len() >= 2 {
+            // Join all parts except the last few (which are likely date components)
+            // e.g., "game-My-Deck-Name-2026-02-02" -> "My-Deck-Name"
+            let non_date_parts: Vec<&str> = parts.iter()
+                .take_while(|p| !p.chars().all(|c| c.is_ascii_digit()))
+                .cloned()
+                .collect();
+            if !non_date_parts.is_empty() {
+                return Some(non_date_parts.join("-"));
+            }
+        }
+    }
+    
+    // Pattern: "{deck_name}_vs_{opponent}"
+    if name.contains("_vs_") || name.contains(" vs ") {
+        let deck_name = name.split("_vs_").next()
+            .or_else(|| name.split(" vs ").next())
+            .map(|s| s.trim().to_string());
+        if let Some(ref dn) = deck_name {
+            if !dn.is_empty() && dn.len() > 2 {
+                return deck_name;
+            }
+        }
+    }
+    
+    None
+}
+
 /// Payload for uploading a game log
 #[derive(Debug, Serialize)]
 pub struct GameLogUploadPayload {
@@ -287,6 +375,8 @@ pub struct GameLogUploadPayload {
     pub modified_timestamp: Option<u64>,
     pub user_id: Option<String>,
     pub uploaded_at: String,
+    /// Deck identifier extracted from filename or content
+    pub deck_identifier: Option<String>,
 }
 
 /// Response from upload API

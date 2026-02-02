@@ -1056,11 +1056,14 @@ pub fn parse_mamo_url(url: &str) -> Option<String> {
         r"[a-fA-F0-9]{8}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{12}"
     ).ok()?;
     
-    // Check if it's a MaMo URL
+    // First, check if this is a user URL (to avoid false positive UUID extraction)
+    if parse_mamo_user_url(url).is_some() {
+        return None;
+    }
+    
+    // Check if it's a MaMo URL (production URLs only)
     if url.contains("ma-mo-frontend.vercel.app") || 
-       url.contains("new-backend") ||
-       url.contains("localhost:3000") ||
-       url.contains("localhost:3001") {
+       url.contains("new-backend-two-eosin.vercel.app") {
         // Extract UUID from URL
         if let Some(captures) = uuid_regex.find(url) {
             return Some(captures.as_str().to_string());
@@ -1073,6 +1076,124 @@ pub fn parse_mamo_url(url: &str) -> Option<String> {
     }
     
     None
+}
+
+/// Parse a MaMo URL and extract the username for user profile
+/// Supported URL formats:
+/// - https://ma-mo-frontend.vercel.app/user/USERNAME
+pub fn parse_mamo_user_url(url: &str) -> Option<String> {
+    let url = url.trim();
+    
+    // Check if it's a MaMo URL with /user/ path (production URLs only)
+    if url.contains("ma-mo-frontend.vercel.app") {
+        // Look for /user/USERNAME pattern
+        if let Some(user_part) = url.split("/user/").nth(1) {
+            let username = user_part.split(&['/', '?', '#'][..]).next().unwrap_or(user_part);
+            if !username.is_empty() && !username.contains("-") {
+                return Some(username.to_string());
+            }
+        }
+    }
+    
+    None
+}
+
+/// MaMo deck entry for listing user decks
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MamoDeckEntry {
+    pub deck_id: String,
+    pub deck_name: String,
+    pub user_id: String,
+    pub commander_name: Option<String>,
+    pub commander_partner_name: Option<String>,
+    pub color_identity: Option<String>,
+    pub format: Option<String>,
+    pub updated_at: Option<String>,
+    pub created_at: Option<String>,
+    #[serde(skip)]
+    pub local_status: Option<DeckStatus>,
+}
+
+/// Response from MaMo API when fetching user decks
+#[derive(Debug, Deserialize)]
+pub struct MamoUserDecksResponse {
+    pub decks: Vec<MamoDeckApiEntry>,
+    pub total: Option<usize>,
+}
+
+/// Individual deck entry from MaMo API
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MamoDeckApiEntry {
+    #[serde(alias = "DeckID", alias = "deckid")]
+    pub deck_id: Option<String>,
+    #[serde(alias = "DeckName", alias = "deckname")]
+    pub deck_name: Option<String>,
+    #[serde(alias = "User", alias = "user_id")]
+    pub user_id: Option<String>,
+    #[serde(alias = "CommanderName")]
+    pub commander_name: Option<String>,
+    #[serde(alias = "ColorIdentity", alias = "coloridentity")]
+    pub color_identity: Option<String>,
+    #[serde(alias = "UpdatedAt", alias = "updatedat")]
+    pub updated_at: Option<String>,
+    #[serde(alias = "CreatedAt", alias = "createdat")]
+    pub created_at: Option<String>,
+}
+
+/// Fetch all decks for a MaMo user
+pub async fn fetch_mamo_user_decks(username: &str) -> Result<Vec<MamoDeckEntry>> {
+    info!("Fetching decks for MaMo user: {}", username);
+    
+    let url = format!("{}/api/decks/user/{}", MAMO_API_URL, username);
+    
+    let body = fetch_with_curl_custom(&url, &[
+        "-H", "User-Agent: MaMo-Connector/1.0",
+        "-H", "Accept: application/json",
+    ])?;
+    
+    // Try to parse response
+    let response: MamoUserDecksResponse = serde_json::from_str(&body)
+        .with_context(|| format!("Failed to parse MaMo API response: {}", &body[..body.len().min(200)]))?;
+    
+    // Get deck directory for local status checking
+    let deck_dir = get_deck_directory().ok();
+    
+    // Convert to MamoDeckEntry with local status
+    let decks: Vec<MamoDeckEntry> = response.decks.into_iter().map(|entry| {
+        let deck_name = entry.deck_name.clone().unwrap_or_else(|| "Unnamed Deck".to_string());
+        
+        // Check local status
+        let local_status = if let Some(ref dir) = deck_dir {
+            let sanitized = sanitize_filename(&deck_name);
+            let deck_path = dir.join(format!("{}.dck", sanitized));
+            if deck_path.exists() {
+                // TODO: Compare timestamps if needed
+                Some(DeckStatus::UpToDate)
+            } else {
+                Some(DeckStatus::New)
+            }
+        } else {
+            Some(DeckStatus::New)
+        };
+        
+        MamoDeckEntry {
+            deck_id: entry.deck_id.unwrap_or_default(),
+            deck_name,
+            user_id: entry.user_id.unwrap_or_default(),
+            commander_name: entry.commander_name,
+            commander_partner_name: None,
+            color_identity: entry.color_identity,
+            format: Some("Commander".to_string()), // MaMo is primarily Commander
+            updated_at: entry.updated_at,
+            created_at: entry.created_at,
+            local_status,
+        }
+    }).collect();
+    
+    info!("Found {} decks for MaMo user '{}'", decks.len(), username);
+    Ok(decks)
 }
 
 // ==================== File Operations ====================

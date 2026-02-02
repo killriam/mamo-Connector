@@ -4,7 +4,7 @@ use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 
 use crate::commands::CommandResult;
-use crate::deck::{create_deck_from_moxfield, MoxfieldDeckEntry, DeckStatus, fetch_user_decks_direct, create_deck_from_archidekt, create_deck_from_deckstats, create_deck_from_mamo, parse_archidekt_url, parse_deckstats_url, parse_mamo_url, sync_moxfield_deck, sync_moxfield_user_decks, sync_archidekt_deck, sync_deckstats_deck, sync_mamo_deck, DeckSyncResult, SyncStatus, get_deck_directory_display};
+use crate::deck::{create_deck_from_moxfield, MoxfieldDeckEntry, MamoDeckEntry, DeckStatus, fetch_user_decks_direct, create_deck_from_archidekt, create_deck_from_deckstats, create_deck_from_mamo, parse_archidekt_url, parse_deckstats_url, parse_mamo_url, parse_mamo_user_url, fetch_mamo_user_decks, sync_moxfield_deck, sync_moxfield_user_decks, sync_archidekt_deck, sync_deckstats_deck, sync_mamo_deck, DeckSyncResult, SyncStatus, get_deck_directory_display};
 use crate::deeplink::Deeplink;
 use crate::gamelog::{GameLogConfig, GameLogProcessResult, ScanSummary, get_default_forge_log_directory, validate_directory, scan_directory, process_new_logs, load_processed_files, save_processed_files};
 use crate::registration::{RegistrationOutcome, RegistrationStatus};
@@ -26,6 +26,7 @@ enum UrlType {
     ArchidektDeck(String),        // Deck ID
     DeckstatsDeck(String, String), // Owner ID, Deck ID
     MamoDeck(String),             // MaMo Deck UUID
+    MamoUser(String),             // MaMo Username
     Unknown,
     Empty,
 }
@@ -34,9 +35,12 @@ enum UrlType {
 struct ImportState {
     is_loading: bool,
     result_message: Option<String>,
-    // For user decks
+    // For Moxfield user decks
     decks: Vec<MoxfieldDeckEntry>,
     selected_decks: Vec<bool>,
+    // For MaMo user decks
+    mamo_decks: Vec<MamoDeckEntry>,
+    selected_mamo_decks: Vec<bool>,
 }
 
 /// State for the sync tab
@@ -321,7 +325,12 @@ impl LauncherApp {
             return UrlType::DeckstatsDeck(owner_id, deck_id);
         }
         
-        // MaMo: https://ma-mo-frontend.vercel.app/deckId=UUID or similar
+        // MaMo user: https://ma-mo-frontend.vercel.app/user/USERNAME
+        if let Some(username) = parse_mamo_user_url(url) {
+            return UrlType::MamoUser(username);
+        }
+        
+        // MaMo deck: https://ma-mo-frontend.vercel.app/deckId=UUID or similar
         if let Some(deck_uuid) = parse_mamo_url(url) {
             return UrlType::MamoDeck(deck_uuid);
         }
@@ -406,6 +415,9 @@ impl LauncherApp {
             UrlType::MamoDeck(uuid) => {
                 ui.label(egui::RichText::new(format!("✓ MaMo Deck: {}", uuid)).color(egui::Color32::from_rgb(0, 128, 0)));
             }
+            UrlType::MamoUser(username) => {
+                ui.label(egui::RichText::new(format!("✓ MaMo User: {} → will list all decks", username)).color(egui::Color32::from_rgb(0, 128, 0)));
+            }
             UrlType::Unknown => {
                 ui.label(egui::RichText::new("⚠ Unknown URL format").color(egui::Color32::from_rgb(200, 100, 0)));
             }
@@ -414,8 +426,8 @@ impl LauncherApp {
         
         ui.add_space(10.0);
         
-        // Get current state
-        let (is_loading, result_message, has_decks, decks_info) = {
+        // Get current state for Moxfield decks
+        let (is_loading, result_message, has_moxfield_decks, decks_info) = {
             let state = self.import_state.lock().unwrap();
             (
                 state.is_loading,
@@ -430,13 +442,36 @@ impl LauncherApp {
             )
         };
         
+        // Get MaMo decks state
+        let (has_mamo_decks, mamo_decks_info) = {
+            let state = self.import_state.lock().unwrap();
+            (
+                !state.mamo_decks.is_empty(),
+                state.mamo_decks.iter().enumerate().map(|(i, d)| {
+                    (i, d.deck_id.clone(), d.deck_name.clone(), d.format.clone(),
+                     state.selected_mamo_decks.get(i).copied().unwrap_or(false),
+                     d.local_status.clone(), d.commander_name.clone())
+                }).collect::<Vec<_>>(),
+            )
+        };
+        
+        let has_decks = has_moxfield_decks || has_mamo_decks;
+        
         // Main action button based on URL type
         match &url_type {
             UrlType::MoxfieldUser(username) => {
-                if !has_decks {
+                if !has_moxfield_decks {
                     // Show "Fetch Decks" button
                     if ui.add_enabled(!is_loading, egui::Button::new("Fetch User Decks")).clicked() {
                         self.fetch_user_decks(username.clone(), ctx);
+                    }
+                }
+            }
+            UrlType::MamoUser(username) => {
+                if !has_mamo_decks {
+                    // Show "Fetch MaMo Decks" button
+                    if ui.add_enabled(!is_loading, egui::Button::new("Fetch MaMo User Decks")).clicked() {
+                        self.fetch_mamo_user_decks(username.clone(), ctx);
                     }
                 }
             }
@@ -455,10 +490,83 @@ impl LauncherApp {
             });
         }
         
-        // Show user decks list if available
-        if has_decks {
+        // Show MaMo user decks list if available
+        if has_mamo_decks {
             ui.separator();
             ui.add_space(5.0);
+            ui.label(egui::RichText::new("MaMo User Decks").strong());
+            
+            // Selection controls
+            ui.horizontal(|ui| {
+                if ui.button("Select All").clicked() {
+                    let mut state = self.import_state.lock().unwrap();
+                    for selected in &mut state.selected_mamo_decks {
+                        *selected = true;
+                    }
+                }
+                if ui.button("Select None").clicked() {
+                    let mut state = self.import_state.lock().unwrap();
+                    for selected in &mut state.selected_mamo_decks {
+                        *selected = false;
+                    }
+                }
+                
+                let selected_count = mamo_decks_info.iter().filter(|(_, _, _, _, s, _, _)| *s).count();
+                ui.label(format!("{}/{} selected", selected_count, mamo_decks_info.len()));
+            });
+            
+            ui.add_space(5.0);
+            
+            // MaMo Deck list with scrolling
+            let available_height = (ui.available_height() - 60.0) / 2.0;
+            egui::ScrollArea::vertical()
+                .id_source("mamo_decks_scroll")
+                .max_height(available_height.max(100.0))
+                .show(ui, |ui: &mut egui::Ui| {
+                    for (i, deck_id, name, format, is_selected, local_status, commander) in &mamo_decks_info {
+                        let mut selected = *is_selected;
+                        ui.horizontal(|ui| {
+                            if ui.checkbox(&mut selected, "").changed() {
+                                let mut state = self.import_state.lock().unwrap();
+                                if let Some(s) = state.selected_mamo_decks.get_mut(*i) {
+                                    *s = selected;
+                                }
+                            }
+                            
+                            // Status indicator
+                            let status_text = match local_status {
+                                Some(DeckStatus::New) => egui::RichText::new("●").color(egui::Color32::from_rgb(0, 150, 0)),
+                                Some(DeckStatus::NeedsUpdate) => egui::RichText::new("●").color(egui::Color32::from_rgb(255, 165, 0)),
+                                Some(DeckStatus::UpToDate) => egui::RichText::new("●").color(egui::Color32::from_rgb(100, 100, 100)),
+                                None => egui::RichText::new("●").color(egui::Color32::from_rgb(0, 150, 0)),
+                            };
+                            ui.label(status_text);
+                            
+                            ui.label(name);
+                            if let Some(fmt) = format {
+                                ui.label(egui::RichText::new(format!("[{}]", fmt)).weak());
+                            }
+                            if let Some(cmdr) = commander {
+                                ui.label(egui::RichText::new(format!("({})", cmdr)).weak());
+                            }
+                        });
+                    }
+                });
+            
+            // Import button for MaMo decks
+            let selected_count = mamo_decks_info.iter().filter(|(_, _, _, _, s, _, _)| *s).count();
+            if selected_count > 0 {
+                if ui.add_enabled(!is_loading, egui::Button::new(format!("Import {} MaMo Deck(s)", selected_count))).clicked() {
+                    self.import_selected_mamo_decks(ctx);
+                }
+            }
+        }
+        
+        // Show Moxfield user decks list if available
+        if has_moxfield_decks {
+            ui.separator();
+            ui.add_space(5.0);
+            ui.label(egui::RichText::new("Moxfield User Decks").strong());
             
             // Selection controls
             ui.horizontal(|ui| {
@@ -502,8 +610,9 @@ impl LauncherApp {
             // Deck list with scrolling
             let available_height = ui.available_height() - 60.0;
             egui::ScrollArea::vertical()
+                .id_source("moxfield_decks_scroll")
                 .max_height(available_height.max(100.0))
-                .show(ui, |ui| {
+                .show(ui, |ui: &mut egui::Ui| {
                     for (i, _deck_id, name, format, is_selected, local_status, local_date, moxfield_date) in &decks_info {
                         let mut selected = *is_selected;
                         ui.horizontal(|ui| {
@@ -673,6 +782,93 @@ impl LauncherApp {
             state.is_loading = false;
             state.result_message = Some(format!(
                 "Imported {} of {} decks ({} failed)",
+                success_count, total, fail_count
+            ));
+            
+            ctx_clone.request_repaint();
+        });
+    }
+    
+    /// Fetch decks for a MaMo user
+    fn fetch_mamo_user_decks(&mut self, username: String, ctx: &egui::Context) {
+        let state_clone = Arc::clone(&self.import_state);
+        let ctx_clone = ctx.clone();
+        
+        {
+            let mut state = self.import_state.lock().unwrap();
+            state.is_loading = true;
+            state.result_message = None;
+            state.mamo_decks.clear();
+            state.selected_mamo_decks.clear();
+        }
+        
+        tokio::spawn(async move {
+            let result = fetch_mamo_user_decks(&username).await;
+            
+            let mut state = state_clone.lock().unwrap();
+            state.is_loading = false;
+            
+            match result {
+                Ok(decks) => {
+                    state.selected_mamo_decks = vec![false; decks.len()];
+                    state.result_message = Some(format!("Found {} MaMo decks for {}", decks.len(), username));
+                    state.mamo_decks = decks;
+                }
+                Err(e) => {
+                    state.result_message = Some(format!("Error: Failed to fetch MaMo decks: {}", e));
+                }
+            }
+            
+            ctx_clone.request_repaint();
+        });
+    }
+    
+    /// Import selected MaMo decks
+    fn import_selected_mamo_decks(&mut self, ctx: &egui::Context) {
+        let deck_ids: Vec<String> = {
+            let state = self.import_state.lock().unwrap();
+            state.mamo_decks.iter()
+                .enumerate()
+                .filter(|(i, _)| state.selected_mamo_decks.get(*i).copied().unwrap_or(false))
+                .map(|(_, d)| d.deck_id.clone())
+                .collect()
+        };
+        
+        if deck_ids.is_empty() {
+            return;
+        }
+        
+        let state_clone = Arc::clone(&self.import_state);
+        let ctx_clone = ctx.clone();
+        let total = deck_ids.len();
+        
+        {
+            let mut state = self.import_state.lock().unwrap();
+            state.is_loading = true;
+            state.result_message = Some(format!("Importing {} MaMo decks...", total));
+        }
+        
+        tokio::spawn(async move {
+            let mut success_count = 0;
+            let mut fail_count = 0;
+            
+            for deck_id in &deck_ids {
+                let result = create_deck_from_mamo(deck_id).await;
+                
+                match result {
+                    Ok(deck_result) if deck_result.success => success_count += 1,
+                    Ok(_) => fail_count += 1,
+                    Err(e) => {
+                        log::warn!("Failed to import MaMo deck {}: {}", deck_id, e);
+                        fail_count += 1;
+                    }
+                }
+            }
+            
+            let mut state = state_clone.lock().unwrap();
+            state.is_loading = false;
+            state.result_message = Some(format!(
+                "Imported {} of {} MaMo decks ({} failed)",
                 success_count, total, fail_count
             ));
             
@@ -933,6 +1129,9 @@ impl LauncherApp {
                     UrlType::MamoDeck(uuid) => {
                         ui.label(egui::RichText::new(format!("✓ MaMo Deck: {}", uuid)).color(egui::Color32::from_rgb(0, 128, 0)));
                     }
+                    UrlType::MamoUser(username) => {
+                        ui.label(egui::RichText::new(format!("✓ MaMo User: {} (all decks)", username)).color(egui::Color32::from_rgb(0, 128, 0)));
+                    }
                     UrlType::Unknown => {
                         ui.label(egui::RichText::new("⚠ Unknown URL format").color(egui::Color32::from_rgb(200, 100, 0)));
                     }
@@ -1168,10 +1367,18 @@ impl LauncherApp {
                 }
                 
                 if ui.button("Browse...").clicked() {
-                    // Note: Native file dialogs require additional dependencies
-                    // For now, show a message
-                    let mut state = self.gamelog_state.lock().unwrap();
-                    state.status_message = Some("Please enter the path manually or use the default".to_string());
+                    // Use native file dialog to pick folder
+                    if let Some(folder) = rfd::FileDialog::new()
+                        .set_title("Select Forge Game Log Directory")
+                        .pick_folder()
+                    {
+                        let folder_str = folder.to_string_lossy().to_string();
+                        let valid = validate_directory(&folder_str).unwrap_or(false);
+                        let mut state = self.gamelog_state.lock().unwrap();
+                        state.directory_input = folder_str;
+                        state.directory_valid = valid;
+                        state.file_count = None;
+                    }
                 }
             });
             
