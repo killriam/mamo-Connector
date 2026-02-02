@@ -305,14 +305,18 @@ impl LauncherApp {
                                 
                                 // Reload settings from disk to get the updated auth_token
                                 if let Ok(reloaded_settings) = crate::settings::Settings::load() {
+                                    // Get the auth token before updating settings
+                                    let auth_token = reloaded_settings.auth_token.clone();
+                                    
+                                    // Update the settings
                                     if let Ok(mut settings_guard) = settings.lock() {
                                         *settings_guard = reloaded_settings;
                                     }
                                     
-                                    // Update the settings state UI fields
-                                    if let Ok(mut state_guard) = settings_state.lock() {
-                                        if let Ok(settings_guard) = settings.lock() {
-                                            state_guard.auth_token_input = settings_guard.auth_token.clone().unwrap_or_default();
+                                    // Update the settings state UI fields with the token we captured
+                                    if let Some(token) = auth_token {
+                                        if let Ok(mut state_guard) = settings_state.lock() {
+                                            state_guard.auth_token_input = token;
                                             state_guard.status_message = Some("✓ Connected to MaMo".to_string());
                                         }
                                     }
