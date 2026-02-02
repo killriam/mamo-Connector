@@ -231,7 +231,14 @@ impl eframe::App for LauncherApp {
                 ui.visuals_mut().override_text_color = Some(egui::Color32::BLACK);
                 ui.visuals_mut().panel_fill = egui::Color32::WHITE;
                 
-                ui.heading("Mamo Connector");
+                // Title with version info
+                ui.horizontal(|ui| {
+                    ui.heading("Mamo Connector");
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.small(egui::RichText::new(format!("v{} ({})", env!("CARGO_PKG_VERSION"), env!("GIT_HASH")))
+                            .color(egui::Color32::GRAY));
+                    });
+                });
                 ui.separator();
                 
                 // Tab bar
@@ -433,6 +440,26 @@ impl LauncherApp {
                 }
             }
         }
+        
+        // Build info section at the bottom
+        ui.separator();
+        ui.label(egui::RichText::new("Build Information").strong());
+        ui.horizontal(|ui| {
+            ui.label("Version:");
+            ui.label(egui::RichText::new(env!("CARGO_PKG_VERSION")).monospace());
+        });
+        ui.horizontal(|ui| {
+            ui.label("Git Commit:");
+            ui.label(egui::RichText::new(env!("GIT_HASH")).monospace());
+        });
+        ui.horizontal(|ui| {
+            ui.label("Branch:");
+            ui.label(egui::RichText::new(env!("GIT_BRANCH")).monospace());
+        });
+        ui.horizontal(|ui| {
+            ui.label("Built:");
+            ui.label(egui::RichText::new(env!("BUILD_TIME")).monospace());
+        });
     }
     
     fn detect_url_type(&self, url: &str) -> UrlType {

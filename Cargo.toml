@@ -32,3 +32,6 @@ winapi = { version = "0.3", features = ["winuser", "windef", "fileapi"] }
 core-foundation = "0.9"
 core-foundation-sys = "0.8"
 
+[build-dependencies]
+chrono = "0.4"
+
