@@ -174,6 +174,9 @@ pub fn launch_forge(forge_path: &str, deck_path: Option<&str>) -> Result<ForgeLa
         info!("With deck: {}", deck);
     }
 
+    // Get the directory containing Forge - important for finding dependencies
+    let forge_dir = forge_path_buf.parent().map(|p| p.to_path_buf());
+
     let extension = forge_path_buf.extension()
         .and_then(|e| e.to_str())
         .unwrap_or("")
@@ -181,9 +184,17 @@ pub fn launch_forge(forge_path: &str, deck_path: Option<&str>) -> Result<ForgeLa
 
     let result = match extension.as_str() {
         "jar" => {
-            // Launch JAR file with java
+            // Launch JAR file with java - need to set working directory
             let mut cmd = Command::new("java");
-            cmd.arg("-jar").arg(&forge_path_buf);
+            cmd.arg("-Xmx4096m")
+               .arg("-Dio.netty.tryReflectionSetAccessible=true")
+               .arg("-Dfile.encoding=UTF-8")
+               .arg("-jar")
+               .arg(&forge_path_buf);
+            
+            if let Some(dir) = &forge_dir {
+                cmd.current_dir(dir);
+            }
             
             if let Some(deck) = deck_path {
                 cmd.arg("--deck").arg(deck);
@@ -191,15 +202,40 @@ pub fn launch_forge(forge_path: &str, deck_path: Option<&str>) -> Result<ForgeLa
             
             cmd.spawn()
         }
-        "exe" => {
-            // Launch Windows executable
-            let mut cmd = Command::new(&forge_path_buf);
-            
-            if let Some(deck) = deck_path {
-                cmd.arg("--deck").arg(deck);
+        "exe" | "cmd" | "bat" => {
+            // On Windows, use cmd /c start to properly launch GUI apps
+            // This handles launchers like forge.exe that spawn Java
+            #[cfg(windows)]
+            {
+                let mut cmd = Command::new("cmd");
+                cmd.arg("/c").arg("start").arg("").arg(&forge_path_buf);
+                
+                if let Some(dir) = &forge_dir {
+                    cmd.current_dir(dir);
+                }
+                
+                // Note: passing deck args through 'start' is tricky, 
+                // but for exe launchers it may not support deck args anyway
+                if let Some(deck) = deck_path {
+                    cmd.arg("--deck").arg(deck);
+                }
+                
+                cmd.spawn()
             }
-            
-            cmd.spawn()
+            #[cfg(not(windows))]
+            {
+                let mut cmd = Command::new(&forge_path_buf);
+                
+                if let Some(dir) = &forge_dir {
+                    cmd.current_dir(dir);
+                }
+                
+                if let Some(deck) = deck_path {
+                    cmd.arg("--deck").arg(deck);
+                }
+                
+                cmd.spawn()
+            }
         }
         "app" => {
             // Launch macOS app bundle
@@ -212,9 +248,13 @@ pub fn launch_forge(forge_path: &str, deck_path: Option<&str>) -> Result<ForgeLa
             
             cmd.spawn()
         }
-        "sh" | "bat" => {
-            // Launch shell script
+        "sh" => {
+            // Launch shell script with working directory
             let mut cmd = Command::new(&forge_path_buf);
+            
+            if let Some(dir) = &forge_dir {
+                cmd.current_dir(dir);
+            }
             
             if let Some(deck) = deck_path {
                 cmd.arg("--deck").arg(deck);
@@ -223,8 +263,12 @@ pub fn launch_forge(forge_path: &str, deck_path: Option<&str>) -> Result<ForgeLa
             cmd.spawn()
         }
         _ => {
-            // Try to launch as executable
+            // Try to launch as executable with working directory
             let mut cmd = Command::new(&forge_path_buf);
+            
+            if let Some(dir) = &forge_dir {
+                cmd.current_dir(dir);
+            }
             
             if let Some(deck) = deck_path {
                 cmd.arg("--deck").arg(deck);

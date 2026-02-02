@@ -5,6 +5,7 @@ use std::sync::{Arc, Mutex};
 
 use crate::commands::CommandResult;
 use crate::deck::{create_deck_from_moxfield, MoxfieldDeckEntry, MamoDeckEntry, DeckStatus, fetch_user_decks_direct, create_deck_from_archidekt, create_deck_from_deckstats, create_deck_from_mamo, parse_archidekt_url, parse_deckstats_url, parse_mamo_url, parse_mamo_user_url, fetch_mamo_user_decks, sync_moxfield_deck, sync_moxfield_user_decks, sync_archidekt_deck, sync_deckstats_deck, sync_mamo_deck, DeckSyncResult, SyncStatus, get_deck_directory_display};
+use rfd::FileDialog;
 use crate::deeplink::Deeplink;
 use crate::forge::{get_default_forge_path, validate_forge_path, launch_forge_from_settings};
 use crate::gamelog::{GameLogConfig, GameLogProcessResult, ScanSummary, get_default_forge_log_directory, validate_directory, scan_directory, process_new_logs, load_processed_files, save_processed_files};
@@ -92,6 +93,8 @@ struct SettingsState {
     forge_path_valid: bool,
     /// Auto-launch Forge after deck download
     forge_auto_launch: bool,
+    /// MaMo API authentication token
+    auth_token_input: String,
     /// Status message
     status_message: Option<String>,
 }
@@ -165,7 +168,12 @@ struct LauncherApp {
 impl LauncherApp {
     fn new(state: AppState) -> Self {
         // Load settings
-        let settings = Settings::load().unwrap_or_default();
+        let mut settings = Settings::load().unwrap_or_default();
+        
+        // Sync auth_token to gamelog_config if needed
+        if settings.auth_token.is_some() && settings.gamelog_config.auth_token.is_none() {
+            settings.gamelog_config.auth_token = settings.auth_token.clone();
+        }
         
         // Load processed files for game log
         let processed_files = load_processed_files().unwrap_or_default();
@@ -179,11 +187,12 @@ impl LauncherApp {
             ..Default::default()
         };
         
-        // Initialize settings state with Forge config
+        // Initialize settings state with Forge config and auth token
         let settings_state = SettingsState {
             forge_path_input: settings.forge_path.clone().unwrap_or_default(),
             forge_path_valid: settings.forge_path.as_ref().map(|p| validate_forge_path(p)).unwrap_or(false),
             forge_auto_launch: settings.forge_auto_launch,
+            auth_token_input: settings.auth_token.clone().unwrap_or_default(),
             status_message: None,
         };
         
@@ -321,6 +330,18 @@ impl LauncherApp {
                     }
                     if decks.len() > 5 {
                         ui.small(format!("  ... and {} more", decks.len() - 5));
+                    }
+                }
+                CommandResult::AuthTokenSaved(msg) => {
+                    ui.label(egui::RichText::new(msg)
+                        .color(egui::Color32::from_rgb(0, 128, 0)));
+                    // Also update the settings state to reflect the new token
+                    {
+                        let settings = self.settings.lock().unwrap();
+                        if let Some(ref token) = settings.auth_token {
+                            let mut state = self.settings_state.lock().unwrap();
+                            state.auth_token_input = token.clone();
+                        }
                     }
                 }
                 CommandResult::UnknownAction(action) => {
@@ -1755,9 +1776,9 @@ impl LauncherApp {
             
             ui.add_space(5.0);
             
-            // Auto-detect button
+            // Auto-detect and Browse buttons
             ui.horizontal(|ui| {
-                if ui.button("🔍 Auto-detect Forge").clicked() {
+                if ui.button("🔍 Auto-detect").clicked() {
                     if let Some(path) = get_default_forge_path() {
                         let path_str = path.to_string_lossy().to_string();
                         let mut state = self.settings_state.lock().unwrap();
@@ -1767,6 +1788,26 @@ impl LauncherApp {
                     } else {
                         let mut state = self.settings_state.lock().unwrap();
                         state.status_message = Some("Could not find Forge installation automatically.".to_string());
+                    }
+                }
+                
+                if ui.button("📁 Browse...").clicked() {
+                    let dialog = FileDialog::new()
+                        .add_filter("Forge Executable", &["exe", "jar", "bat"])
+                        .add_filter("All Files", &["*"])
+                        .set_title("Select Forge Executable");
+                    
+                    if let Some(path) = dialog.pick_file() {
+                        let path_str = path.to_string_lossy().to_string();
+                        let is_valid = validate_forge_path(&path_str);
+                        let mut state = self.settings_state.lock().unwrap();
+                        state.forge_path_input = path_str.clone();
+                        state.forge_path_valid = is_valid;
+                        if is_valid {
+                            state.status_message = Some(format!("Selected: {}", path_str));
+                        } else {
+                            state.status_message = Some(format!("Warning: {} may not be a valid Forge executable", path_str));
+                        }
                     }
                 }
                 
@@ -1803,6 +1844,68 @@ impl LauncherApp {
         
         ui.add_space(15.0);
         
+        // Authentication Section
+        ui.group(|ui| {
+            ui.label(egui::RichText::new("🔐 MaMo Authentication").strong());
+            ui.add_space(5.0);
+            
+            // Check if we have a token
+            let has_token = {
+                let state = self.settings_state.lock().unwrap();
+                !state.auth_token_input.is_empty()
+            };
+            
+            if has_token {
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new("✓ Connected to MaMo").color(egui::Color32::from_rgb(0, 128, 0)));
+                    ui.label("- Game log uploads enabled");
+                });
+                ui.add_space(5.0);
+                if ui.button("🔓 Disconnect").clicked() {
+                    {
+                        let mut state = self.settings_state.lock().unwrap();
+                        state.auth_token_input.clear();
+                    }
+                    self.save_auth_token();
+                }
+            } else {
+                ui.label("Not connected. Click 'Connect MaMo Connector' in MaMo settings to enable game log uploads.");
+                ui.add_space(5.0);
+                ui.label(egui::RichText::new("Or manually enter your token:").small().weak());
+            }
+            
+            // Manual token input (collapsed if already connected)
+            if !has_token {
+                ui.add_space(5.0);
+                ui.horizontal(|ui| {
+                    ui.label("Token:");
+                    
+                    let mut token_input = {
+                        let state = self.settings_state.lock().unwrap();
+                        state.auth_token_input.clone()
+                    };
+                    
+                    let response = ui.add(
+                        egui::TextEdit::singleline(&mut token_input)
+                            .desired_width(350.0)
+                            .password(true)
+                            .hint_text("Paste token here")
+                    );
+                    
+                    if response.changed() {
+                        let mut state = self.settings_state.lock().unwrap();
+                        state.auth_token_input = token_input;
+                    }
+                    
+                    if ui.button("💾 Save").clicked() {
+                        self.save_auth_token();
+                    }
+                });
+            }
+        });
+        
+        ui.add_space(15.0);
+        
         // URL Scheme Info
         ui.group(|ui| {
             ui.label(egui::RichText::new("🔗 Deeplink Commands").strong());
@@ -1833,6 +1936,10 @@ impl LauncherApp {
                     
                     ui.label("mamoConnector://launch-forge");
                     ui.label("Launch Forge (no deck)");
+                    ui.end_row();
+                    
+                    ui.label("mamoConnector://auth?token=XXX");
+                    ui.label("Set auth token for gamelog uploads");
                     ui.end_row();
                 });
         });
@@ -1872,5 +1979,33 @@ impl LauncherApp {
         
         let mut state = self.settings_state.lock().unwrap();
         state.status_message = Some("Settings saved successfully!".to_string());
+    }
+
+    fn save_auth_token(&mut self) {
+        let auth_token = {
+            let state = self.settings_state.lock().unwrap();
+            state.auth_token_input.clone()
+        };
+        
+        // Save to settings and gamelog config
+        {
+            let mut settings = self.settings.lock().unwrap();
+            settings.auth_token = if auth_token.is_empty() { None } else { Some(auth_token.clone()) };
+            // Also update gamelog config's auth token
+            settings.gamelog_config.auth_token = settings.auth_token.clone();
+            
+            if let Err(e) = settings.save() {
+                let mut state = self.settings_state.lock().unwrap();
+                state.status_message = Some(format!("Failed to save token: {}", e));
+                return;
+            }
+        }
+        
+        let mut state = self.settings_state.lock().unwrap();
+        if auth_token.is_empty() {
+            state.status_message = Some("Token cleared.".to_string());
+        } else {
+            state.status_message = Some("Token saved successfully!".to_string());
+        }
     }
 }

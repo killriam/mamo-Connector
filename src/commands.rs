@@ -2,6 +2,7 @@ use log::{error, info, warn};
 use crate::deeplink::Deeplink;
 use crate::deck::{create_deck_from_id, create_deck_from_moxfield, create_deck_from_mamo, DeckCreationResult, UserDecksImportResult, import_user_decks, list_moxfield_user_decks, MoxfieldDeckEntry};
 use crate::forge::{launch_forge_from_settings, ForgeLaunchResult};
+use crate::settings::Settings;
 
 #[derive(Debug, Clone)]
 pub enum CommandResult {
@@ -10,6 +11,7 @@ pub enum CommandResult {
     ForgeLaunched(ForgeLaunchResult),
     UserDecksImported(UserDecksImportResult),
     UserDecksList(Vec<MoxfieldDeckEntry>),
+    AuthTokenSaved(String),  // Success message
     UnknownAction(String),
     MissingParameters(String),
     Error(String),
@@ -25,6 +27,7 @@ impl CommandResult {
             CommandResult::ForgeLaunched(result) => result.message.clone(),
             CommandResult::UserDecksImported(result) => result.message.clone(),
             CommandResult::UserDecksList(decks) => format!("Found {} decks", decks.len()),
+            CommandResult::AuthTokenSaved(msg) => msg.clone(),
             CommandResult::UnknownAction(action) => format!("Unknown action: {}", action),
             CommandResult::MissingParameters(msg) => format!("Missing parameters: {}", msg),
             CommandResult::Error(msg) => format!("Error: {}", msg),
@@ -40,6 +43,7 @@ impl CommandResult {
             CommandResult::ForgeLaunched(result) => result.success,
             CommandResult::UserDecksImported(result) => result.success,
             CommandResult::UserDecksList(decks) => !decks.is_empty(),
+            CommandResult::AuthTokenSaved(_) => true,
             _ => false,
         }
     }
@@ -56,6 +60,7 @@ pub async fn handle_command(deeplink: &Deeplink) -> CommandResult {
         "launch-forge" | "launchforge" | "playtest" => handle_launch_forge(deeplink).await, // Launch Forge with deck
         "import-user-decks" | "importuserdecks" => handle_import_user_decks(deeplink).await,
         "list-user-decks" | "listuserdecks" => handle_list_user_decks(deeplink).await,
+        "auth" | "authenticate" | "connect" => handle_auth(deeplink).await, // Auth token: mamoConnector://auth?token=xxx
         "" => CommandResult::MissingParameters("No action specified in deeplink".to_string()),
         action => {
             warn!("Unknown action received: {}", action);
@@ -190,6 +195,50 @@ async fn handle_launch_forge(deeplink: &Deeplink) -> CommandResult {
             CommandResult::Error(format!("Failed to launch Forge: {}", e))
         }
     }
+}
+
+/// Handle mamoConnector://auth?token=PAT_xxx - save authentication token for gamelog uploads
+/// This allows the frontend to securely transfer the user's personal access token
+async fn handle_auth(deeplink: &Deeplink) -> CommandResult {
+    // Get token from query params
+    let token = deeplink.token.clone()
+        .or_else(|| get_parameter(&deeplink.params, "token"))
+        .or_else(|| get_parameter(&deeplink.params, "pat"))
+        .or_else(|| get_parameter(&deeplink.params, "access_token"));
+
+    let token = match token {
+        Some(t) if !t.is_empty() => t,
+        _ => {
+            error!("No token provided in auth command");
+            return CommandResult::MissingParameters(
+                "Token is required. Use mamoConnector://auth?token=YOUR_TOKEN".to_string()
+            );
+        }
+    };
+
+    info!("Received auth token via deeplink (length: {} chars)", token.len());
+
+    // Load settings, update token, and save
+    let mut settings = match Settings::load() {
+        Ok(s) => s,
+        Err(e) => {
+            error!("Failed to load settings: {}", e);
+            return CommandResult::Error(format!("Failed to load settings: {}", e));
+        }
+    };
+
+    // Store the token in both places
+    settings.auth_token = Some(token.clone());
+    settings.gamelog_config.auth_token = Some(token);
+
+    // Save settings
+    if let Err(e) = settings.save() {
+        error!("Failed to save auth token: {}", e);
+        return CommandResult::Error(format!("Failed to save auth token: {}", e));
+    }
+
+    info!("Auth token saved successfully");
+    CommandResult::AuthTokenSaved("Authentication token saved successfully! Game log uploads are now enabled.".to_string())
 }
 
 async fn handle_create_deck(deeplink: &Deeplink) -> CommandResult {

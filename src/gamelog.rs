@@ -112,6 +112,9 @@ pub struct GameLogConfig {
     /// User ID for associating uploads
     #[serde(default)]
     pub user_id: Option<String>,
+    /// Authentication token for API requests (JWT)
+    #[serde(default)]
+    pub auth_token: Option<String>,
 }
 
 fn default_extensions() -> Vec<String> {
@@ -135,6 +138,7 @@ impl Default for GameLogConfig {
             scan_interval_secs: default_scan_interval(),
             api_url: default_api_url(),
             user_id: None,
+            auth_token: None,
         }
     }
 }
@@ -256,6 +260,10 @@ pub async fn upload_game_log(
 ) -> Result<UploadResponse> {
     let client = reqwest::Client::new();
     
+    // Check if we have an auth token
+    let auth_token = config.auth_token.as_ref()
+        .ok_or_else(|| anyhow::anyhow!("No authentication token configured. Please add your MaMo token in Settings."))?;
+    
     // Extract deck identifier from filename or content
     let deck_identifier = extract_deck_identifier(&log_content.filename, &log_content.content);
     
@@ -273,6 +281,7 @@ pub async fn upload_game_log(
     
     let response = client
         .post(&url)
+        .header("Authorization", format!("Bearer {}", auth_token))
         .json(&upload_payload)
         .send()
         .await

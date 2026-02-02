@@ -109,6 +109,9 @@ pub struct Settings {
     /// Game log reader configuration
     #[serde(default)]
     pub gamelog_config: GameLogConfig,
+    /// Authentication token for MaMo API (JWT)
+    #[serde(default)]
+    pub auth_token: Option<String>,
 }
 
 impl Settings {
