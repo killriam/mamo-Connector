@@ -1,6 +1,7 @@
 mod commands;
 mod deck;
 mod deeplink;
+mod forge;
 mod gamelog;
 mod registration;
 mod settings;

@@ -6,6 +6,7 @@ use std::sync::{Arc, Mutex};
 use crate::commands::CommandResult;
 use crate::deck::{create_deck_from_moxfield, MoxfieldDeckEntry, MamoDeckEntry, DeckStatus, fetch_user_decks_direct, create_deck_from_archidekt, create_deck_from_deckstats, create_deck_from_mamo, parse_archidekt_url, parse_deckstats_url, parse_mamo_url, parse_mamo_user_url, fetch_mamo_user_decks, sync_moxfield_deck, sync_moxfield_user_decks, sync_archidekt_deck, sync_deckstats_deck, sync_mamo_deck, DeckSyncResult, SyncStatus, get_deck_directory_display};
 use crate::deeplink::Deeplink;
+use crate::forge::{get_default_forge_path, validate_forge_path, launch_forge_from_settings};
 use crate::gamelog::{GameLogConfig, GameLogProcessResult, ScanSummary, get_default_forge_log_directory, validate_directory, scan_directory, process_new_logs, load_processed_files, save_processed_files};
 use crate::registration::{RegistrationOutcome, RegistrationStatus};
 use crate::settings::{Settings, SavedLink, SavedLinkType};
@@ -16,6 +17,7 @@ enum Tab {
     Import,
     Sync,
     GameLogs,
+    Settings,
 }
 
 /// Detected URL type for auto-detection
@@ -81,6 +83,19 @@ struct GameLogState {
     processed_files: HashSet<String>,
 }
 
+/// State for the settings tab (includes Forge configuration)
+#[derive(Clone, Default)]
+struct SettingsState {
+    /// Forge executable path input
+    forge_path_input: String,
+    /// Is the Forge path valid
+    forge_path_valid: bool,
+    /// Auto-launch Forge after deck download
+    forge_auto_launch: bool,
+    /// Status message
+    status_message: Option<String>,
+}
+
 #[derive(Clone)]
 struct AppState {
     registration: RegistrationOutcome,
@@ -143,6 +158,7 @@ struct LauncherApp {
     import_state: Arc<Mutex<ImportState>>,
     sync_state: Arc<Mutex<SyncState>>,
     gamelog_state: Arc<Mutex<GameLogState>>,
+    settings_state: Arc<Mutex<SettingsState>>,
     settings: Arc<Mutex<Settings>>,
 }
 
@@ -163,6 +179,14 @@ impl LauncherApp {
             ..Default::default()
         };
         
+        // Initialize settings state with Forge config
+        let settings_state = SettingsState {
+            forge_path_input: settings.forge_path.clone().unwrap_or_default(),
+            forge_path_valid: settings.forge_path.as_ref().map(|p| validate_forge_path(p)).unwrap_or(false),
+            forge_auto_launch: settings.forge_auto_launch,
+            status_message: None,
+        };
+        
         Self {
             state,
             url_input: String::new(),
@@ -170,6 +194,7 @@ impl LauncherApp {
             import_state: Arc::new(Mutex::new(ImportState::default())),
             sync_state: Arc::new(Mutex::new(SyncState::default())),
             gamelog_state: Arc::new(Mutex::new(gamelog_state)),
+            settings_state: Arc::new(Mutex::new(settings_state)),
             settings: Arc::new(Mutex::new(settings)),
         }
     }
@@ -200,6 +225,9 @@ impl eframe::App for LauncherApp {
                     if ui.selectable_label(self.current_tab == Tab::GameLogs, "Game Logs").clicked() {
                         self.current_tab = Tab::GameLogs;
                     }
+                    if ui.selectable_label(self.current_tab == Tab::Settings, "⚙ Settings").clicked() {
+                        self.current_tab = Tab::Settings;
+                    }
                 });
                 ui.separator();
                 
@@ -209,6 +237,7 @@ impl eframe::App for LauncherApp {
                     Tab::Import => self.render_import_tab(ui, ctx),
                     Tab::Sync => self.render_sync_tab(ui, ctx),
                     Tab::GameLogs => self.render_gamelog_tab(ui, ctx),
+                    Tab::Settings => self.render_settings_tab(ui, ctx),
                 }
             });
     }
@@ -256,6 +285,24 @@ impl LauncherApp {
                 CommandResult::DeckCreated(deck_result) => {
                     ui.label(egui::RichText::new(&deck_result.message)
                         .color(egui::Color32::from_rgb(0, 128, 0)));
+                }
+                CommandResult::DeckCreatedAndLaunched(deck_result, forge_result) => {
+                    ui.label(egui::RichText::new(&deck_result.message)
+                        .color(egui::Color32::from_rgb(0, 128, 0)));
+                    ui.label(egui::RichText::new(&forge_result.message)
+                        .color(if forge_result.success {
+                            egui::Color32::from_rgb(0, 128, 0)
+                        } else {
+                            egui::Color32::from_rgb(176, 0, 32)
+                        }));
+                }
+                CommandResult::ForgeLaunched(forge_result) => {
+                    ui.label(egui::RichText::new(&forge_result.message)
+                        .color(if forge_result.success {
+                            egui::Color32::from_rgb(0, 128, 0)
+                        } else {
+                            egui::Color32::from_rgb(176, 0, 32)
+                        }));
                 }
                 CommandResult::Error(err) => {
                     ui.label(egui::RichText::new(err)
@@ -1652,5 +1699,178 @@ impl LauncherApp {
         
         // Save empty set to disk
         let _ = save_processed_files(&HashSet::new());
+    }
+
+    // ==================== Settings Tab ====================
+
+    fn render_settings_tab(&mut self, ui: &mut egui::Ui, _ctx: &egui::Context) {
+        ui.label(egui::RichText::new("⚙ Settings").strong());
+        ui.add_space(10.0);
+        
+        // Get current state
+        let (forge_path_input, forge_path_valid, forge_auto_launch, status_message) = {
+            let state = self.settings_state.lock().unwrap();
+            (
+                state.forge_path_input.clone(),
+                state.forge_path_valid,
+                state.forge_auto_launch,
+                state.status_message.clone(),
+            )
+        };
+        
+        // Forge Configuration Section
+        ui.group(|ui| {
+            ui.label(egui::RichText::new("🎮 Forge Integration").strong());
+            ui.add_space(5.0);
+            
+            ui.label("Configure Forge MTG for playtesting decks directly from MaMo.");
+            ui.add_space(10.0);
+            
+            // Forge path input
+            ui.horizontal(|ui| {
+                ui.label("Forge Executable:");
+                
+                let mut path_input = forge_path_input.clone();
+                let response = ui.add(
+                    egui::TextEdit::singleline(&mut path_input)
+                        .desired_width(400.0)
+                        .hint_text("Path to forge.exe, forge.jar, or Forge.app")
+                );
+                
+                if response.changed() {
+                    let mut state = self.settings_state.lock().unwrap();
+                    state.forge_path_input = path_input.clone();
+                    state.forge_path_valid = validate_forge_path(&path_input);
+                }
+                
+                // Status indicator
+                if !forge_path_input.is_empty() {
+                    if forge_path_valid {
+                        ui.label(egui::RichText::new("✓").color(egui::Color32::from_rgb(0, 128, 0)));
+                    } else {
+                        ui.label(egui::RichText::new("✗").color(egui::Color32::from_rgb(176, 0, 32)));
+                    }
+                }
+            });
+            
+            ui.add_space(5.0);
+            
+            // Auto-detect button
+            ui.horizontal(|ui| {
+                if ui.button("🔍 Auto-detect Forge").clicked() {
+                    if let Some(path) = get_default_forge_path() {
+                        let path_str = path.to_string_lossy().to_string();
+                        let mut state = self.settings_state.lock().unwrap();
+                        state.forge_path_input = path_str.clone();
+                        state.forge_path_valid = true;
+                        state.status_message = Some(format!("Found Forge at: {}", path_str));
+                    } else {
+                        let mut state = self.settings_state.lock().unwrap();
+                        state.status_message = Some("Could not find Forge installation automatically.".to_string());
+                    }
+                }
+                
+                if ui.button("💾 Save").clicked() {
+                    self.save_forge_settings();
+                }
+            });
+            
+            ui.add_space(5.0);
+            
+            // Auto-launch checkbox
+            let mut auto_launch = forge_auto_launch;
+            if ui.checkbox(&mut auto_launch, "Auto-launch Forge after downloading deck").changed() {
+                let mut state = self.settings_state.lock().unwrap();
+                state.forge_auto_launch = auto_launch;
+            }
+            
+            ui.add_space(5.0);
+            
+            // Test launch button
+            if ui.add_enabled(forge_path_valid, egui::Button::new("🚀 Test Launch Forge")).clicked() {
+                match launch_forge_from_settings(None) {
+                    Ok(result) => {
+                        let mut state = self.settings_state.lock().unwrap();
+                        state.status_message = Some(result.message);
+                    }
+                    Err(e) => {
+                        let mut state = self.settings_state.lock().unwrap();
+                        state.status_message = Some(format!("Launch failed: {}", e));
+                    }
+                }
+            }
+        });
+        
+        ui.add_space(15.0);
+        
+        // URL Scheme Info
+        ui.group(|ui| {
+            ui.label(egui::RichText::new("🔗 Deeplink Commands").strong());
+            ui.add_space(5.0);
+            
+            ui.label("MaMo Connector responds to the following deeplink commands:");
+            ui.add_space(5.0);
+            
+            egui::Grid::new("deeplink_commands")
+                .num_columns(2)
+                .spacing([20.0, 4.0])
+                .show(ui, |ui| {
+                    ui.label(egui::RichText::new("Command").strong());
+                    ui.label(egui::RichText::new("Description").strong());
+                    ui.end_row();
+                    
+                    ui.label("mamoConnector://playtest/DECK_UUID");
+                    ui.label("Download deck & launch Forge");
+                    ui.end_row();
+                    
+                    ui.label("mamoConnector://mamo/DECK_UUID");
+                    ui.label("Download deck from MaMo");
+                    ui.end_row();
+                    
+                    ui.label("mamoConnector://deck/MOXFIELD_ID");
+                    ui.label("Download deck from Moxfield");
+                    ui.end_row();
+                    
+                    ui.label("mamoConnector://launch-forge");
+                    ui.label("Launch Forge (no deck)");
+                    ui.end_row();
+                });
+        });
+        
+        // Status message
+        if let Some(msg) = status_message {
+            ui.add_space(10.0);
+            let color = if msg.contains("failed") || msg.contains("Could not") || msg.contains("Error") {
+                egui::Color32::from_rgb(176, 0, 32)
+            } else if msg.contains("Found") || msg.contains("Saved") || msg.contains("success") {
+                egui::Color32::from_rgb(0, 128, 0)
+            } else {
+                egui::Color32::from_rgb(100, 100, 100)
+            };
+            ui.label(egui::RichText::new(msg).color(color));
+        }
+    }
+
+    fn save_forge_settings(&mut self) {
+        let (forge_path, auto_launch) = {
+            let state = self.settings_state.lock().unwrap();
+            (state.forge_path_input.clone(), state.forge_auto_launch)
+        };
+        
+        // Save to settings
+        {
+            let mut settings = self.settings.lock().unwrap();
+            settings.forge_path = if forge_path.is_empty() { None } else { Some(forge_path.clone()) };
+            settings.forge_auto_launch = auto_launch;
+            
+            if let Err(e) = settings.save() {
+                let mut state = self.settings_state.lock().unwrap();
+                state.status_message = Some(format!("Failed to save settings: {}", e));
+                return;
+            }
+        }
+        
+        let mut state = self.settings_state.lock().unwrap();
+        state.status_message = Some("Settings saved successfully!".to_string());
     }
 }

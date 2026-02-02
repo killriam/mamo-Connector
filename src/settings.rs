@@ -97,6 +97,12 @@ pub struct Settings {
     /// List of saved links for synchronization
     #[serde(default)]
     pub saved_links: Vec<SavedLink>,
+    /// Path to Forge executable
+    #[serde(default)]
+    pub forge_path: Option<String>,
+    /// Whether to auto-launch Forge after downloading deck
+    #[serde(default = "default_true")]
+    pub forge_auto_launch: bool,
     /// Auto-sync on startup
     #[serde(default)]
     pub auto_sync_on_startup: bool,

@@ -1,10 +1,13 @@
 use log::{error, info, warn};
 use crate::deeplink::Deeplink;
 use crate::deck::{create_deck_from_id, create_deck_from_moxfield, create_deck_from_mamo, DeckCreationResult, UserDecksImportResult, import_user_decks, list_moxfield_user_decks, MoxfieldDeckEntry};
+use crate::forge::{launch_forge_from_settings, ForgeLaunchResult};
 
 #[derive(Debug, Clone)]
 pub enum CommandResult {
     DeckCreated(DeckCreationResult),
+    DeckCreatedAndLaunched(DeckCreationResult, ForgeLaunchResult),
+    ForgeLaunched(ForgeLaunchResult),
     UserDecksImported(UserDecksImportResult),
     UserDecksList(Vec<MoxfieldDeckEntry>),
     UnknownAction(String),
@@ -16,6 +19,10 @@ impl CommandResult {
     pub fn get_message(&self) -> String {
         match self {
             CommandResult::DeckCreated(result) => result.message.clone(),
+            CommandResult::DeckCreatedAndLaunched(deck_result, forge_result) => {
+                format!("{} | {}", deck_result.message, forge_result.message)
+            }
+            CommandResult::ForgeLaunched(result) => result.message.clone(),
             CommandResult::UserDecksImported(result) => result.message.clone(),
             CommandResult::UserDecksList(decks) => format!("Found {} decks", decks.len()),
             CommandResult::UnknownAction(action) => format!("Unknown action: {}", action),
@@ -27,6 +34,10 @@ impl CommandResult {
     pub fn is_success(&self) -> bool {
         match self {
             CommandResult::DeckCreated(result) => result.success,
+            CommandResult::DeckCreatedAndLaunched(deck_result, forge_result) => {
+                deck_result.success && forge_result.success
+            }
+            CommandResult::ForgeLaunched(result) => result.success,
             CommandResult::UserDecksImported(result) => result.success,
             CommandResult::UserDecksList(decks) => !decks.is_empty(),
             _ => false,
@@ -42,6 +53,7 @@ pub async fn handle_command(deeplink: &Deeplink) -> CommandResult {
         "createdeck" => handle_create_deck(deeplink).await, // Alternative format
         "deck" => handle_deck_download(deeplink).await, // New: mamoConnector://deck/DECK_ID
         "mamo" => handle_mamo_deck_download(deeplink).await, // MaMo backend: mamoConnector://mamo/DECK_UUID
+        "launch-forge" | "launchforge" | "playtest" => handle_launch_forge(deeplink).await, // Launch Forge with deck
         "import-user-decks" | "importuserdecks" => handle_import_user_decks(deeplink).await,
         "list-user-decks" | "listuserdecks" => handle_list_user_decks(deeplink).await,
         "" => CommandResult::MissingParameters("No action specified in deeplink".to_string()),
@@ -106,6 +118,76 @@ async fn handle_mamo_deck_download(deeplink: &Deeplink) -> CommandResult {
         Err(err) => {
             error!("Failed to download MaMo deck: {:?}", err);
             CommandResult::Error(format!("Failed to download MaMo deck: {}", err))
+        }
+    }
+}
+
+/// Handle mamoConnector://launch-forge?deckId=UUID or mamoConnector://playtest/UUID
+/// Downloads deck from MaMo and launches Forge with it
+async fn handle_launch_forge(deeplink: &Deeplink) -> CommandResult {
+    // Get deck UUID from path or params
+    let deck_id = deeplink.deck_id.clone()
+        .or_else(|| get_parameter(&deeplink.params, "id"))
+        .or_else(|| get_parameter(&deeplink.params, "deck_id"))
+        .or_else(|| get_parameter(&deeplink.params, "deckId"));
+
+    // Check if we should skip download (deck already exists locally)
+    let skip_download = get_parameter(&deeplink.params, "skip_download")
+        .map(|s| s == "true" || s == "1")
+        .unwrap_or(false);
+
+    // Get optional deck path for pre-existing deck
+    let existing_deck_path = get_parameter(&deeplink.params, "deck_path");
+
+    info!("Launch Forge command - deck_id: {:?}, skip_download: {}", deck_id, skip_download);
+
+    // If we have a deck ID and shouldn't skip download, download it first
+    let deck_path: Option<String> = if let Some(ref id) = deck_id {
+        if skip_download {
+            existing_deck_path
+        } else {
+            // Download the deck from MaMo
+            info!("Downloading deck from MaMo before launching Forge: {}", id);
+            match create_deck_from_mamo(id).await {
+                Ok(result) => {
+                    if result.success {
+                        info!("Deck downloaded successfully: {:?}", result.deck_path);
+                        // Convert PathBuf to string for launch_forge_from_settings
+                        let deck_path_str = result.deck_path.as_ref()
+                            .map(|p| p.to_string_lossy().to_string());
+                        let forge_result = launch_forge_from_settings(deck_path_str.as_deref());
+                        match forge_result {
+                            Ok(forge_res) => {
+                                return CommandResult::DeckCreatedAndLaunched(result, forge_res);
+                            }
+                            Err(e) => {
+                                return CommandResult::Error(format!(
+                                    "Deck downloaded but Forge launch failed: {}", e
+                                ));
+                            }
+                        }
+                    } else {
+                        return CommandResult::Error(format!(
+                            "Failed to download deck: {}", result.message
+                        ));
+                    }
+                }
+                Err(e) => {
+                    error!("Failed to download deck for Forge: {}", e);
+                    return CommandResult::Error(format!("Failed to download deck: {}", e));
+                }
+            }
+        }
+    } else {
+        existing_deck_path
+    };
+
+    // Launch Forge (without deck download, or deck already exists)
+    match launch_forge_from_settings(deck_path.as_deref()) {
+        Ok(result) => CommandResult::ForgeLaunched(result),
+        Err(e) => {
+            error!("Failed to launch Forge: {}", e);
+            CommandResult::Error(format!("Failed to launch Forge: {}", e))
         }
     }
 }
