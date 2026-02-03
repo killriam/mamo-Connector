@@ -9,7 +9,7 @@ use crate::deck::{create_deck_from_moxfield, MoxfieldDeckEntry, MamoDeckEntry, D
 use rfd::FileDialog;
 use crate::deeplink::Deeplink;
 use crate::forge::{get_default_forge_path, validate_forge_path, launch_forge_from_settings};
-use crate::gamelog::{GameLogConfig, GameLogProcessResult, ScanSummary, get_default_forge_log_directory, validate_directory, scan_directory, process_new_logs, load_processed_files, save_processed_files};
+use crate::gamelog::{GameLogConfig, GameLogProcessResult, ScanSummary, get_default_forge_log_directory, validate_directory, scan_directory, process_new_logs, load_processed_files, save_processed_files, DeckMappings, UserDeck, fetch_my_decks, suggest_deck_matches};
 use crate::registration::{RegistrationOutcome, RegistrationStatus};
 use crate::settings::{Settings, SavedLink, SavedLinkType};
 use crate::get_pending_command_path;
@@ -84,6 +84,18 @@ struct GameLogState {
     last_scan_summary: Option<ScanSummary>,
     /// Processed files set
     processed_files: HashSet<String>,
+    /// User's decks from backend (for deck mapping)
+    user_decks: Vec<crate::gamelog::UserDeck>,
+    /// Is currently fetching decks
+    is_fetching_decks: bool,
+    /// Deck mappings (deck name from log -> MaMo deck ID)
+    deck_mappings: crate::gamelog::DeckMappings,
+    /// Show deck mapping dialog
+    show_deck_mapping_dialog: bool,
+    /// Currently selected deck name for mapping
+    mapping_deck_name: Option<String>,
+    /// Search filter for deck list
+    deck_search_filter: String,
 }
 
 /// State for the settings tab (includes Forge configuration)
@@ -181,12 +193,16 @@ impl LauncherApp {
         // Load processed files for game log
         let processed_files = load_processed_files().unwrap_or_default();
         
+        // Load deck mappings
+        let deck_mappings = DeckMappings::load().unwrap_or_default();
+        
         // Initialize gamelog state with settings
         let gamelog_state = GameLogState {
             directory_input: settings.gamelog_config.watch_directory.clone(),
             directory_valid: validate_directory(&settings.gamelog_config.watch_directory).unwrap_or(false),
             background_enabled: settings.gamelog_config.background_scan_enabled,
             processed_files,
+            deck_mappings,
             ..Default::default()
         };
         
@@ -1618,6 +1634,11 @@ impl LauncherApp {
         
         ui.add_space(10.0);
         
+        // Deck Mapping section
+        self.render_deck_mapping_section(ui, ctx);
+        
+        ui.add_space(10.0);
+        
         // Status message
         if let Some(msg) = status_message {
             let color = if msg.contains("Error") || msg.contains("failed") {
@@ -1830,6 +1851,224 @@ impl LauncherApp {
         
         // Save empty set to disk
         let _ = save_processed_files(&HashSet::new());
+    }
+
+    // ==================== Deck Mapping ====================
+
+    fn render_deck_mapping_section(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        let (user_decks, is_fetching, deck_mappings, deck_search_filter) = {
+            let state = self.gamelog_state.lock().unwrap();
+            (
+                state.user_decks.clone(),
+                state.is_fetching_decks,
+                state.deck_mappings.clone(),
+                state.deck_search_filter.clone(),
+            )
+        };
+        
+        ui.group(|ui| {
+            ui.label(egui::RichText::new("🎯 Deck Mapping").strong());
+            ui.add_space(5.0);
+            ui.label(egui::RichText::new("Map deck names from game logs to your MaMo decks.").small().weak());
+            ui.add_space(5.0);
+            
+            ui.horizontal(|ui| {
+                if ui.add_enabled(!is_fetching, egui::Button::new("🔄 Fetch My Decks")).clicked() {
+                    self.fetch_my_mamo_decks(ctx);
+                }
+                
+                if is_fetching {
+                    ui.spinner();
+                    ui.label("Fetching...");
+                } else {
+                    ui.label(format!("{} decks loaded", user_decks.len()));
+                }
+            });
+            
+            // Show current mappings
+            if !deck_mappings.mappings.is_empty() {
+                ui.add_space(5.0);
+                ui.label(egui::RichText::new("Current Mappings:").small());
+                
+                egui::ScrollArea::vertical()
+                    .max_height(100.0)
+                    .show(ui, |ui| {
+                        let mappings_to_remove: Vec<String> = {
+                            let mut to_remove = Vec::new();
+                            for (log_name, deck_id) in &deck_mappings.mappings {
+                                ui.horizontal(|ui| {
+                                    // Find deck name for this ID
+                                    let deck_name = user_decks.iter()
+                                        .find(|d| &d.deck_id == deck_id)
+                                        .map(|d| d.deck_name.as_str())
+                                        .unwrap_or("(Unknown deck)");
+                                    
+                                    ui.label(format!("\"{}\"", log_name));
+                                    ui.label("→");
+                                    ui.label(egui::RichText::new(deck_name).color(egui::Color32::from_rgb(0, 128, 0)));
+                                    
+                                    if ui.small_button("✕").clicked() {
+                                        to_remove.push(log_name.clone());
+                                    }
+                                });
+                            }
+                            to_remove
+                        };
+                        
+                        // Remove mappings outside the borrow
+                        if !mappings_to_remove.is_empty() {
+                            let mut state = self.gamelog_state.lock().unwrap();
+                            for name in mappings_to_remove {
+                                state.deck_mappings.remove_mapping(&name);
+                            }
+                            let _ = state.deck_mappings.save();
+                        }
+                    });
+            }
+            
+            // Add new mapping section
+            if !user_decks.is_empty() {
+                ui.add_space(5.0);
+                ui.separator();
+                ui.label(egui::RichText::new("Add New Mapping:").small());
+                
+                ui.horizontal(|ui| {
+                    ui.label("Deck name in logs:");
+                    let mut mapping_name = {
+                        let state = self.gamelog_state.lock().unwrap();
+                        state.mapping_deck_name.clone().unwrap_or_default()
+                    };
+                    if ui.text_edit_singleline(&mut mapping_name).changed() {
+                        let mut state = self.gamelog_state.lock().unwrap();
+                        state.mapping_deck_name = if mapping_name.is_empty() { None } else { Some(mapping_name) };
+                    }
+                });
+                
+                // Show suggested matches if we have a deck name
+                let mapping_deck_name = {
+                    let state = self.gamelog_state.lock().unwrap();
+                    state.mapping_deck_name.clone()
+                };
+                
+                if let Some(ref name) = mapping_deck_name {
+                    if !name.is_empty() {
+                        let suggestions = suggest_deck_matches(name, &user_decks, 5);
+                        
+                        if !suggestions.is_empty() {
+                            ui.label(egui::RichText::new("Suggested matches:").small().weak());
+                            
+                            for suggestion in suggestions {
+                                let score_pct = (suggestion.score * 100.0) as u32;
+                                let label = format!("{} ({}%)", suggestion.deck.deck_name, score_pct);
+                                
+                                if ui.button(&label).clicked() {
+                                    // Save the mapping
+                                    {
+                                        let mut state = self.gamelog_state.lock().unwrap();
+                                        state.deck_mappings.set_mapping(name, &suggestion.deck.deck_id);
+                                        let _ = state.deck_mappings.save();
+                                        state.mapping_deck_name = None;
+                                        state.status_message = Some(format!(
+                                            "Mapped \"{}\" → \"{}\"", 
+                                            name, 
+                                            suggestion.deck.deck_name
+                                        ));
+                                    }
+                                }
+                            }
+                        }
+                        
+                        // Also show full deck list with search
+                        ui.add_space(5.0);
+                        ui.horizontal(|ui| {
+                            ui.label("Search:");
+                            let mut filter = deck_search_filter.clone();
+                            if ui.text_edit_singleline(&mut filter).changed() {
+                                let mut state = self.gamelog_state.lock().unwrap();
+                                state.deck_search_filter = filter;
+                            }
+                        });
+                        
+                        let filter_lower = deck_search_filter.to_lowercase();
+                        let filtered_decks: Vec<_> = user_decks.iter()
+                            .filter(|d| {
+                                filter_lower.is_empty() || 
+                                d.deck_name.to_lowercase().contains(&filter_lower) ||
+                                d.commander_name.as_ref().map(|c| c.to_lowercase().contains(&filter_lower)).unwrap_or(false)
+                            })
+                            .take(10)
+                            .collect();
+                        
+                        if !filtered_decks.is_empty() {
+                            egui::ScrollArea::vertical()
+                                .max_height(150.0)
+                                .show(ui, |ui| {
+                                    for deck in filtered_decks {
+                                        let deck_label = if let Some(ref cmd) = deck.commander_name {
+                                            format!("{} ({})", deck.deck_name, cmd)
+                                        } else {
+                                            deck.deck_name.clone()
+                                        };
+                                        
+                                        if ui.button(&deck_label).clicked() {
+                                            // Save the mapping
+                                            {
+                                                let mut state = self.gamelog_state.lock().unwrap();
+                                                state.deck_mappings.set_mapping(name, &deck.deck_id);
+                                                let _ = state.deck_mappings.save();
+                                                state.mapping_deck_name = None;
+                                                state.status_message = Some(format!(
+                                                    "Mapped \"{}\" → \"{}\"", 
+                                                    name, 
+                                                    deck.deck_name
+                                                ));
+                                            }
+                                        }
+                                    }
+                                });
+                        }
+                    }
+                }
+            }
+        });
+    }
+
+    fn fetch_my_mamo_decks(&mut self, ctx: &egui::Context) {
+        let gamelog_state = Arc::clone(&self.gamelog_state);
+        let settings = Arc::clone(&self.settings);
+        let ctx_clone = ctx.clone();
+        
+        // Mark as fetching
+        {
+            let mut state = gamelog_state.lock().unwrap();
+            state.is_fetching_decks = true;
+        }
+        
+        tokio::spawn(async move {
+            let config = {
+                let settings = settings.lock().unwrap();
+                settings.gamelog_config.clone()
+            };
+            
+            let result = fetch_my_decks(&config).await;
+            
+            {
+                let mut state = gamelog_state.lock().unwrap();
+                state.is_fetching_decks = false;
+                
+                match result {
+                    Ok(decks) => {
+                        state.user_decks = decks;
+                        state.status_message = Some(format!("Loaded {} decks from MaMo", state.user_decks.len()));
+                    }
+                    Err(e) => {
+                        state.status_message = Some(format!("Failed to fetch decks: {}", e));
+                    }
+                }
+            }
+            
+            ctx_clone.request_repaint();
+        });
     }
 
     // ==================== Settings Tab ====================

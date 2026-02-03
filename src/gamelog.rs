@@ -553,6 +553,196 @@ fn get_processed_files_path() -> Result<PathBuf> {
     Ok(config_dir.join("processed_gamelogs.json"))
 }
 
+// ==================== DECK MAPPING ====================
+
+/// A deck from the MaMo backend
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UserDeck {
+    pub deck_id: String,
+    pub deck_name: String,
+    pub user_id: String,
+    pub color_identity: Option<String>,
+    pub commander_name: Option<String>,
+    pub commander_partner_name: Option<String>,
+    pub updated_at: Option<String>,
+    pub created_at: Option<String>,
+}
+
+/// Response from the mydecks endpoint
+#[derive(Debug, Deserialize)]
+pub struct MyDecksResponse {
+    pub decks: Vec<UserDeck>,
+    pub total: usize,
+}
+
+/// Mapping from deck name (as appears in game logs) to MaMo deck ID
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct DeckMappings {
+    /// Maps deck name from gamelog -> MaMo deck ID
+    pub mappings: std::collections::HashMap<String, String>,
+    /// When mappings were last updated
+    pub updated_at: Option<String>,
+}
+
+impl DeckMappings {
+    /// Load mappings from disk
+    pub fn load() -> Result<Self> {
+        let path = get_deck_mappings_path()?;
+        if !path.exists() {
+            return Ok(Self::default());
+        }
+        let content = fs::read_to_string(&path)
+            .context("Failed to read deck mappings file")?;
+        let mappings: DeckMappings = serde_json::from_str(&content)
+            .context("Failed to parse deck mappings")?;
+        Ok(mappings)
+    }
+
+    /// Save mappings to disk
+    pub fn save(&self) -> Result<()> {
+        let path = get_deck_mappings_path()?;
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let content = serde_json::to_string_pretty(self)?;
+        fs::write(&path, content)?;
+        Ok(())
+    }
+
+    /// Add or update a mapping
+    pub fn set_mapping(&mut self, log_deck_name: &str, mamo_deck_id: &str) {
+        self.mappings.insert(log_deck_name.to_string(), mamo_deck_id.to_string());
+        self.updated_at = Some(chrono::Local::now().to_rfc3339());
+    }
+
+    /// Get the MaMo deck ID for a log deck name
+    pub fn get_mapping(&self, log_deck_name: &str) -> Option<&String> {
+        self.mappings.get(log_deck_name)
+    }
+
+    /// Remove a mapping
+    pub fn remove_mapping(&mut self, log_deck_name: &str) {
+        self.mappings.remove(log_deck_name);
+        self.updated_at = Some(chrono::Local::now().to_rfc3339());
+    }
+}
+
+/// Get path to deck mappings file
+fn get_deck_mappings_path() -> Result<PathBuf> {
+    let config_dir = if cfg!(windows) {
+        dirs::data_dir()
+            .context("Could not find data directory")?
+            .join("MaMoConnector")
+    } else {
+        dirs::config_dir()
+            .context("Could not find config directory")?
+            .join("mamo-connector")
+    };
+    
+    Ok(config_dir.join("deck_mappings.json"))
+}
+
+/// Fetch user's decks from the backend using PAT authentication
+pub async fn fetch_my_decks(config: &GameLogConfig) -> Result<Vec<UserDeck>> {
+    let auth_token = config.auth_token.as_ref()
+        .ok_or_else(|| anyhow::anyhow!("No authentication token configured"))?;
+
+    let client = reqwest::Client::new();
+    let url = format!("{}/api/gamelog/mydecks", config.api_url);
+
+    log::info!("Fetching user decks from: {}", url);
+
+    let response = client
+        .get(&url)
+        .header("Authorization", format!("Bearer {}", auth_token))
+        .send()
+        .await
+        .context("Failed to fetch decks")?;
+
+    if !response.status().is_success() {
+        let status = response.status();
+        let error_text = response.text().await.unwrap_or_else(|_| "Unknown error".to_string());
+        return Err(anyhow::anyhow!("Failed to fetch decks: {} - {}", status, error_text));
+    }
+
+    let data: MyDecksResponse = response.json().await
+        .context("Failed to parse decks response")?;
+
+    log::info!("Fetched {} decks from backend", data.total);
+    Ok(data.decks)
+}
+
+/// Calculate similarity score between two deck names (0.0 - 1.0)
+pub fn deck_name_similarity(name1: &str, name2: &str) -> f64 {
+    let n1 = name1.to_lowercase();
+    let n2 = name2.to_lowercase();
+    
+    // Exact match
+    if n1 == n2 {
+        return 1.0;
+    }
+    
+    // Contains match
+    if n1.contains(&n2) || n2.contains(&n1) {
+        return 0.8;
+    }
+    
+    // Word overlap
+    let words1: HashSet<&str> = n1.split_whitespace().collect();
+    let words2: HashSet<&str> = n2.split_whitespace().collect();
+    
+    if words1.is_empty() || words2.is_empty() {
+        return 0.0;
+    }
+    
+    let intersection = words1.intersection(&words2).count();
+    let union = words1.union(&words2).count();
+    
+    if union == 0 {
+        return 0.0;
+    }
+    
+    // Jaccard similarity
+    intersection as f64 / union as f64
+}
+
+/// A suggested deck match with confidence score
+#[derive(Debug, Clone)]
+pub struct DeckSuggestion {
+    pub deck: UserDeck,
+    pub score: f64,
+}
+
+/// Find matching deck suggestions for a deck name from a gamelog
+pub fn suggest_deck_matches(log_deck_name: &str, user_decks: &[UserDeck], limit: usize) -> Vec<DeckSuggestion> {
+    let mut suggestions: Vec<DeckSuggestion> = user_decks.iter()
+        .map(|deck| {
+            let mut score = deck_name_similarity(log_deck_name, &deck.deck_name);
+            
+            // Boost score if commander name matches
+            if let Some(ref commander) = deck.commander_name {
+                let cmd_similarity = deck_name_similarity(log_deck_name, commander);
+                if cmd_similarity > score {
+                    score = cmd_similarity;
+                }
+            }
+            
+            DeckSuggestion {
+                deck: deck.clone(),
+                score,
+            }
+        })
+        .filter(|s| s.score > 0.1) // Only include meaningful matches
+        .collect();
+    
+    // Sort by score descending
+    suggestions.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+    
+    // Return top N
+    suggestions.into_iter().take(limit).collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
