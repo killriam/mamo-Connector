@@ -1993,8 +1993,8 @@ impl LauncherApp {
                         let filtered_decks: Vec<_> = user_decks.iter()
                             .filter(|d| {
                                 filter_lower.is_empty() || 
-                                d.deck_name.to_lowercase().contains(&filter_lower) ||
-                                d.commander_name.as_ref().map(|c| c.to_lowercase().contains(&filter_lower)).unwrap_or(false)
+                                d.deck_name.to_lowercase().contains(&filter_lower)
+                                // Note: We only have commander IDs, not names, so we can only filter by deck name
                             })
                             .take(10)
                             .collect();
@@ -2004,11 +2004,8 @@ impl LauncherApp {
                                 .max_height(150.0)
                                 .show(ui, |ui| {
                                     for deck in filtered_decks {
-                                        let deck_label = if let Some(ref cmd) = deck.commander_name {
-                                            format!("{} ({})", deck.deck_name, cmd)
-                                        } else {
-                                            deck.deck_name.clone()
-                                        };
+                                        // Display deck name (commander names would require additional lookup)
+                                        let deck_label = deck.deck_name.clone();
                                         
                                         if ui.button(&deck_label).clicked() {
                                             // Save the mapping

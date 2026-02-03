@@ -563,8 +563,8 @@ pub struct UserDeck {
     pub deck_name: String,
     pub user_id: String,
     pub color_identity: Option<String>,
-    pub commander_name: Option<String>,
-    pub commander_partner_name: Option<String>,
+    pub commander_id: Option<String>,
+    pub commander_partner_id: Option<String>,
     pub updated_at: Option<String>,
     pub created_at: Option<String>,
 }
@@ -718,15 +718,10 @@ pub struct DeckSuggestion {
 pub fn suggest_deck_matches(log_deck_name: &str, user_decks: &[UserDeck], limit: usize) -> Vec<DeckSuggestion> {
     let mut suggestions: Vec<DeckSuggestion> = user_decks.iter()
         .map(|deck| {
-            let mut score = deck_name_similarity(log_deck_name, &deck.deck_name);
+            let score = deck_name_similarity(log_deck_name, &deck.deck_name);
             
-            // Boost score if commander name matches
-            if let Some(ref commander) = deck.commander_name {
-                let cmd_similarity = deck_name_similarity(log_deck_name, commander);
-                if cmd_similarity > score {
-                    score = cmd_similarity;
-                }
-            }
+            // Note: We only have commander IDs, not names, so we can only match on deck name
+            // In the future, we could look up commander names from a local card database
             
             DeckSuggestion {
                 deck: deck.clone(),
