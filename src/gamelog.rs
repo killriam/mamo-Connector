@@ -12,6 +12,7 @@
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use sha2::{Sha256, Digest};
 use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -36,10 +37,12 @@ pub struct GameLogProcessResult {
     pub processed_at: String,
     /// Server-side ID if upload succeeded
     pub server_id: Option<String>,
+    /// Deck identifier extracted from the file
+    pub deck_identifier: Option<String>,
 }
 
 impl GameLogProcessResult {
-    pub fn success(filename: String, file_size: u64, server_id: Option<String>) -> Self {
+    pub fn success(filename: String, file_size: u64, server_id: Option<String>, deck_identifier: Option<String>) -> Self {
         Self {
             filename,
             success: true,
@@ -47,6 +50,7 @@ impl GameLogProcessResult {
             file_size,
             processed_at: chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
             server_id,
+            deck_identifier,
         }
     }
 
@@ -58,6 +62,7 @@ impl GameLogProcessResult {
             file_size: 0,
             processed_at: chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
             server_id: None,
+            deck_identifier: None,
         }
     }
 }
@@ -146,34 +151,36 @@ impl Default for GameLogConfig {
 /// Get the default Forge game log directory based on OS
 pub fn get_default_forge_log_directory() -> String {
     if cfg!(windows) {
-        // Windows: %APPDATA%\Forge\games\ (Roaming AppData)
+        // Windows: %APPDATA%\Forge\games\gamelogs (Roaming AppData)
         // Use std::env to get APPDATA directly for Windows
         if let Ok(appdata) = std::env::var("APPDATA") {
             return std::path::Path::new(&appdata)
                 .join("Forge")
                 .join("games")
+                .join("gamelogs")
                 .to_string_lossy()
                 .to_string();
         }
         // Fallback to dirs crate
         if let Some(config) = dirs::config_dir() {
-            return config.join("Forge").join("games").to_string_lossy().to_string();
+            return config.join("Forge").join("games").join("gamelogs").to_string_lossy().to_string();
         }
     } else if cfg!(target_os = "macos") {
-        // macOS: ~/Library/Application Support/Forge/games/
+        // macOS: ~/Library/Application Support/Forge/games/gamelogs
         if let Some(home) = dirs::home_dir() {
             return home
                 .join("Library")
                 .join("Application Support")
                 .join("Forge")
                 .join("games")
+                .join("gamelogs")
                 .to_string_lossy()
                 .to_string();
         }
     } else {
-        // Linux: ~/.forge/games/
+        // Linux: ~/.forge/games/gamelogs
         if let Some(home) = dirs::home_dir() {
-            return home.join(".forge").join("games").to_string_lossy().to_string();
+            return home.join(".forge").join("games").join("gamelogs").to_string_lossy().to_string();
         }
     }
     
@@ -267,6 +274,11 @@ pub async fn upload_game_log(
     // Extract deck identifier from filename or content
     let deck_identifier = extract_deck_identifier(&log_content.filename, &log_content.content);
     
+    // Calculate SHA256 checksum of the content
+    let mut hasher = Sha256::new();
+    hasher.update(log_content.content.as_bytes());
+    let checksum = format!("{:x}", hasher.finalize());
+    
     let upload_payload = GameLogUploadPayload {
         filename: log_content.filename.clone(),
         content: log_content.content.clone(),
@@ -274,6 +286,7 @@ pub async fn upload_game_log(
         modified_timestamp: log_content.modified_timestamp,
         user_id: config.user_id.clone(),
         uploaded_at: chrono::Utc::now().to_rfc3339(),
+        checksum,
         deck_identifier,
     };
     
@@ -384,6 +397,8 @@ pub struct GameLogUploadPayload {
     pub modified_timestamp: Option<u64>,
     pub user_id: Option<String>,
     pub uploaded_at: String,
+    /// SHA256 checksum of the content
+    pub checksum: String,
     /// Deck identifier extracted from filename or content
     pub deck_identifier: Option<String>,
 }
@@ -396,16 +411,72 @@ pub struct UploadResponse {
     pub gamelog_id: Option<String>,
 }
 
+/// Filter options for processing game logs
+#[derive(Debug, Clone, Default)]
+pub struct GameLogFilterOptions {
+    /// Only process logs from the last N days (0 = no filter)
+    pub days_filter: u32,
+    /// Only process logs matching these deck names (empty = all decks)
+    pub deck_filter: HashSet<String>,
+}
+
+impl GameLogFilterOptions {
+    /// Check if a file passes the days filter based on its modification time
+    pub fn passes_days_filter(&self, modified: Option<std::time::SystemTime>) -> bool {
+        if self.days_filter == 0 {
+            return true;
+        }
+        
+        if let Some(mod_time) = modified {
+            let now = std::time::SystemTime::now();
+            let days_ago = std::time::Duration::from_secs(self.days_filter as u64 * 24 * 60 * 60);
+            if let Some(cutoff) = now.checked_sub(days_ago) {
+                return mod_time >= cutoff;
+            }
+        }
+        true // If we can't determine modification time, include it
+    }
+    
+    /// Check if a deck name passes the deck filter
+    pub fn passes_deck_filter(&self, deck_name: Option<&str>) -> bool {
+        if self.deck_filter.is_empty() {
+            return true;
+        }
+        
+        if let Some(name) = deck_name {
+            // Check for exact match or partial match (case-insensitive)
+            let name_lower = name.to_lowercase();
+            self.deck_filter.iter().any(|f| {
+                let filter_lower = f.to_lowercase();
+                name_lower.contains(&filter_lower) || filter_lower.contains(&name_lower)
+            })
+        } else {
+            false // No deck name detected, doesn't pass deck filter
+        }
+    }
+}
+
 /// Process new game logs from the configured directory
 pub async fn process_new_logs(
     config: &GameLogConfig,
     processed_files: &Arc<Mutex<HashSet<String>>>,
+) -> Result<ScanSummary> {
+    process_new_logs_with_filter(config, processed_files, &GameLogFilterOptions::default()).await
+}
+
+/// Process new game logs from the configured directory with filter options
+pub async fn process_new_logs_with_filter(
+    config: &GameLogConfig,
+    processed_files: &Arc<Mutex<HashSet<String>>>,
+    filter: &GameLogFilterOptions,
 ) -> Result<ScanSummary> {
     let mut summary = ScanSummary::default();
     
     // Scan directory for files
     let files = scan_directory(config)?;
     summary.total_files_found = files.len();
+    
+    let mut skipped_by_filter = 0usize;
     
     for file_path in files {
         let filename = file_path
@@ -422,9 +493,14 @@ pub async fn process_new_logs(
             }
         }
         
-        summary.new_files += 1;
+        // Check days filter based on file modification time
+        let modified_time = file_path.metadata().ok().and_then(|m| m.modified().ok());
+        if !filter.passes_days_filter(modified_time) {
+            skipped_by_filter += 1;
+            continue;
+        }
         
-        // Read the file
+        // Read the file to extract deck identifier for deck filter
         let log_content = match read_game_log(&file_path) {
             Ok(content) => content,
             Err(e) => {
@@ -437,6 +513,17 @@ pub async fn process_new_logs(
             }
         };
         
+        // Extract deck identifier before checking filter
+        let deck_identifier = extract_deck_identifier(&log_content.filename, &log_content.content);
+        
+        // Check deck filter
+        if !filter.passes_deck_filter(deck_identifier.as_deref()) {
+            skipped_by_filter += 1;
+            continue;
+        }
+        
+        summary.new_files += 1;
+        
         // Upload to backend
         match upload_game_log(config, &log_content).await {
             Ok(response) => {
@@ -446,6 +533,7 @@ pub async fn process_new_logs(
                         filename.clone(),
                         log_content.file_size,
                         response.gamelog_id,
+                        deck_identifier,
                     ));
                     
                     // Mark as processed
@@ -562,7 +650,7 @@ pub struct UserDeck {
     pub deck_id: String,
     pub deck_name: String,
     pub user_id: String,
-    pub color_identity: Option<String>,
+    pub color_identity: Option<Vec<String>>,  // Array of color letters like ["B", "G", "U"]
     pub commander_id: Option<String>,
     pub commander_partner_id: Option<String>,
     pub updated_at: Option<String>,
@@ -641,6 +729,64 @@ fn get_deck_mappings_path() -> Result<PathBuf> {
     };
     
     Ok(config_dir.join("deck_mappings.json"))
+}
+
+/// Cached user decks with timestamp
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CachedUserDecks {
+    pub decks: Vec<UserDeck>,
+    pub cached_at: String,
+}
+
+impl CachedUserDecks {
+    /// Create a new cache with current timestamp
+    pub fn new(decks: Vec<UserDeck>) -> Self {
+        Self {
+            decks,
+            cached_at: chrono::Local::now().to_rfc3339(),
+        }
+    }
+}
+
+/// Get path to cached decks file
+fn get_cached_decks_path() -> Result<PathBuf> {
+    let config_dir = if cfg!(windows) {
+        dirs::data_dir()
+            .context("Could not find data directory")?
+            .join("MaMoConnector")
+    } else {
+        dirs::config_dir()
+            .context("Could not find config directory")?
+            .join("mamo-connector")
+    };
+    
+    Ok(config_dir.join("cached_decks.json"))
+}
+
+/// Load cached user decks from disk
+pub fn load_cached_decks() -> Result<CachedUserDecks> {
+    let path = get_cached_decks_path()?;
+    if !path.exists() {
+        return Err(anyhow::anyhow!("No cached decks found"));
+    }
+    let content = fs::read_to_string(&path)
+        .context("Failed to read cached decks file")?;
+    let cached: CachedUserDecks = serde_json::from_str(&content)
+        .context("Failed to parse cached decks")?;
+    Ok(cached)
+}
+
+/// Save user decks to disk cache
+pub fn save_cached_decks(decks: &[UserDeck]) -> Result<()> {
+    let path = get_cached_decks_path()?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let cached = CachedUserDecks::new(decks.to_vec());
+    let content = serde_json::to_string_pretty(&cached)?;
+    fs::write(&path, content)?;
+    log::info!("Saved {} decks to cache", decks.len());
+    Ok(())
 }
 
 /// Fetch user's decks from the backend using PAT authentication
@@ -769,11 +915,13 @@ mod tests {
             "test.log".to_string(),
             1024,
             Some("id123".to_string()),
+            Some("MyDeck".to_string()),
         );
         assert!(success.success);
         assert_eq!(success.filename, "test.log");
         assert_eq!(success.file_size, 1024);
         assert_eq!(success.server_id, Some("id123".to_string()));
+        assert_eq!(success.deck_identifier, Some("MyDeck".to_string()));
 
         let failed = GameLogProcessResult::failed(
             "test.log".to_string(),

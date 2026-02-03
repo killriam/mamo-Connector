@@ -9,7 +9,7 @@ use crate::deck::{create_deck_from_moxfield, MoxfieldDeckEntry, MamoDeckEntry, D
 use rfd::FileDialog;
 use crate::deeplink::Deeplink;
 use crate::forge::{get_default_forge_path, validate_forge_path, launch_forge_from_settings};
-use crate::gamelog::{GameLogConfig, GameLogProcessResult, ScanSummary, get_default_forge_log_directory, validate_directory, scan_directory, process_new_logs, load_processed_files, save_processed_files, DeckMappings, UserDeck, fetch_my_decks, suggest_deck_matches};
+use crate::gamelog::{GameLogConfig, GameLogProcessResult, ScanSummary, get_default_forge_log_directory, validate_directory, scan_directory, process_new_logs, load_processed_files, save_processed_files, DeckMappings, UserDeck, fetch_my_decks, suggest_deck_matches, load_cached_decks, save_cached_decks, process_new_logs_with_filter, GameLogFilterOptions};
 use crate::registration::{RegistrationOutcome, RegistrationStatus};
 use crate::settings::{Settings, SavedLink, SavedLinkType};
 use crate::get_pending_command_path;
@@ -96,6 +96,14 @@ struct GameLogState {
     mapping_deck_name: Option<String>,
     /// Search filter for deck list
     deck_search_filter: String,
+    /// Days filter - only upload logs from last N days (0 = no filter)
+    days_filter: u32,
+    /// Days filter input string for editing
+    days_filter_input: String,
+    /// Selected deck names to filter by (empty = all decks)
+    selected_deck_filters: HashSet<String>,
+    /// Show deck filter dropdown
+    show_deck_filter_dropdown: bool,
 }
 
 /// State for the settings tab (includes Forge configuration)
@@ -196,6 +204,11 @@ impl LauncherApp {
         // Load deck mappings
         let deck_mappings = DeckMappings::load().unwrap_or_default();
         
+        // Load cached user decks
+        let cached_decks = load_cached_decks()
+            .map(|c| c.decks)
+            .unwrap_or_default();
+        
         // Initialize gamelog state with settings
         let gamelog_state = GameLogState {
             directory_input: settings.gamelog_config.watch_directory.clone(),
@@ -203,6 +216,7 @@ impl LauncherApp {
             background_enabled: settings.gamelog_config.background_scan_enabled,
             processed_files,
             deck_mappings,
+            user_decks: cached_decks,
             ..Default::default()
         };
         
@@ -1604,6 +1618,105 @@ impl LauncherApp {
         
         ui.add_space(10.0);
         
+        // Filter options section
+        ui.group(|ui| {
+            ui.label(egui::RichText::new("🔧 Filter Options").strong());
+            ui.add_space(5.0);
+            
+            // Days filter
+            ui.horizontal(|ui| {
+                ui.label("Only upload logs from last");
+                let mut days_input = {
+                    let state = self.gamelog_state.lock().unwrap();
+                    state.days_filter_input.clone()
+                };
+                let response = ui.add(
+                    egui::TextEdit::singleline(&mut days_input)
+                        .desired_width(50.0)
+                        .hint_text("0")
+                );
+                if response.changed() {
+                    let mut state = self.gamelog_state.lock().unwrap();
+                    state.days_filter_input = days_input.clone();
+                    // Parse and update days filter
+                    state.days_filter = days_input.parse().unwrap_or(0);
+                }
+                ui.label("days (0 = all)");
+            });
+            
+            ui.add_space(5.0);
+            
+            // Deck filter dropdown
+            let (user_decks, selected_deck_filters, show_dropdown) = {
+                let state = self.gamelog_state.lock().unwrap();
+                (state.user_decks.clone(), state.selected_deck_filters.clone(), state.show_deck_filter_dropdown)
+            };
+            
+            ui.horizontal(|ui| {
+                ui.label("Filter by decks:");
+                
+                let button_text = if selected_deck_filters.is_empty() {
+                    "All Decks ▼".to_string()
+                } else {
+                    format!("{} deck(s) selected ▼", selected_deck_filters.len())
+                };
+                
+                if ui.button(&button_text).clicked() {
+                    let mut state = self.gamelog_state.lock().unwrap();
+                    state.show_deck_filter_dropdown = !state.show_deck_filter_dropdown;
+                }
+                
+                if !selected_deck_filters.is_empty() {
+                    if ui.button("Clear").clicked() {
+                        let mut state = self.gamelog_state.lock().unwrap();
+                        state.selected_deck_filters.clear();
+                    }
+                }
+            });
+            
+            // Deck filter dropdown content
+            if show_dropdown && !user_decks.is_empty() {
+                ui.indent("deck_filter_dropdown", |ui| {
+                    egui::ScrollArea::vertical()
+                        .max_height(150.0)
+                        .show(ui, |ui| {
+                            for deck in &user_decks {
+                                let mut selected = selected_deck_filters.contains(&deck.deck_name);
+                                if ui.checkbox(&mut selected, &deck.deck_name).changed() {
+                                    let mut state = self.gamelog_state.lock().unwrap();
+                                    if selected {
+                                        state.selected_deck_filters.insert(deck.deck_name.clone());
+                                    } else {
+                                        state.selected_deck_filters.remove(&deck.deck_name);
+                                    }
+                                }
+                            }
+                        });
+                });
+            } else if show_dropdown && user_decks.is_empty() {
+                ui.label(egui::RichText::new("No decks loaded. Click 'Refresh Decks' below.").small().weak());
+            }
+            
+            // Show current filter summary
+            let days_filter = {
+                let state = self.gamelog_state.lock().unwrap();
+                state.days_filter
+            };
+            if days_filter > 0 || !selected_deck_filters.is_empty() {
+                ui.add_space(3.0);
+                let mut filter_parts = Vec::new();
+                if days_filter > 0 {
+                    filter_parts.push(format!("Last {} days", days_filter));
+                }
+                if !selected_deck_filters.is_empty() {
+                    filter_parts.push(format!("{} decks", selected_deck_filters.len()));
+                }
+                ui.label(egui::RichText::new(format!("Active filters: {}", filter_parts.join(", "))).small().color(egui::Color32::from_rgb(0, 100, 200)));
+            }
+        });
+        
+        ui.add_space(10.0);
+        
         // Scan controls section
         ui.group(|ui| {
             ui.label(egui::RichText::new("🔍 Scan Controls").strong());
@@ -1691,6 +1804,10 @@ impl LauncherApp {
                             ui.label(&result.filename);
                             if result.success {
                                 ui.label(egui::RichText::new(format!("({} bytes)", result.file_size)).small().weak());
+                                // Show detected deck if available
+                                if let Some(ref deck) = result.deck_identifier {
+                                    ui.label(egui::RichText::new(format!("→ {}", deck)).small().color(egui::Color32::from_rgb(100, 149, 237)));
+                                }
                             } else {
                                 ui.label(egui::RichText::new(&result.message).small().color(egui::Color32::from_rgb(176, 0, 32)));
                             }
@@ -1758,6 +1875,15 @@ impl LauncherApp {
         let settings = Arc::clone(&self.settings);
         let ctx_clone = ctx.clone();
         
+        // Get filter options
+        let filter_options = {
+            let state = gamelog_state.lock().unwrap();
+            GameLogFilterOptions {
+                days_filter: state.days_filter,
+                deck_filter: state.selected_deck_filters.clone(),
+            }
+        };
+        
         // Mark as scanning
         {
             let mut state = gamelog_state.lock().unwrap();
@@ -1777,7 +1903,7 @@ impl LauncherApp {
                 Arc::new(Mutex::new(state.processed_files.clone()))
             };
             
-            let result = process_new_logs(&config, &processed_files).await;
+            let result = process_new_logs_with_filter(&config, &processed_files, &filter_options).await;
             
             {
                 let mut state = gamelog_state.lock().unwrap();
@@ -1884,6 +2010,24 @@ impl LauncherApp {
                     ui.label(format!("{} decks loaded", user_decks.len()));
                 }
             });
+            
+            // Show all loaded decks in a collapsible section
+            if !user_decks.is_empty() {
+                egui::CollapsingHeader::new("📋 My Decks")
+                    .default_open(false)
+                    .show(ui, |ui| {
+                        egui::ScrollArea::vertical()
+                            .max_height(150.0)
+                            .show(ui, |ui| {
+                                for deck in &user_decks {
+                                    let colors = deck.color_identity.as_ref()
+                                        .map(|c| c.join(""))
+                                        .unwrap_or_else(|| "C".to_string());
+                                    ui.label(format!("• {} [{}]", deck.deck_name, colors));
+                                }
+                            });
+                    });
+            }
             
             // Show current mappings
             if !deck_mappings.mappings.is_empty() {
@@ -2055,6 +2199,10 @@ impl LauncherApp {
                 
                 match result {
                     Ok(decks) => {
+                        // Save to cache
+                        if let Err(e) = save_cached_decks(&decks) {
+                            log::warn!("Failed to cache decks: {}", e);
+                        }
                         state.user_decks = decks;
                         state.status_message = Some(format!("Loaded {} decks from MaMo", state.user_decks.len()));
                     }
