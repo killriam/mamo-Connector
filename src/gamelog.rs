@@ -5,10 +5,16 @@
 //! 
 //! # Architecture
 //! 
-//! 1. **File Watcher**: Monitors a directory for new `.txt` or `.log` files
-//! 2. **File Parser**: Reads and validates game log content
-//! 3. **API Upload**: Sends parsed logs to backend as blob storage
+//! 1. **File Watcher**: Monitors a directory for new `.json` game log files
+//! 2. **File Parser**: Reads and validates JSON game log content (MTG Replay Notation)
+//! 3. **API Upload**: Sends parsed logs to backend as structured data
 //! 4. **Status Tracking**: Tracks which files have been processed
+//!
+//! # File Format
+//!
+//! Only JSON files are supported. Game logs follow the MTG Replay & Learning Notation
+//! format (see MTG-REPLAY-NOTATION.md), a machine-readable JSON format containing
+//! game metadata, card index, event logs (L1), and learning views (L2).
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -123,7 +129,7 @@ pub struct GameLogConfig {
 }
 
 fn default_extensions() -> Vec<String> {
-    vec!["txt".to_string(), "log".to_string()]
+    vec!["json".to_string()]
 }
 
 fn default_scan_interval() -> u64 {
@@ -226,6 +232,78 @@ pub fn scan_directory(config: &GameLogConfig) -> Result<Vec<PathBuf>> {
     Ok(files)
 }
 
+/// Preview info for a file before upload
+#[derive(Debug, Clone, Default)]
+pub struct FilePreviewInfo {
+    pub filename: String,
+    pub file_size: u64,
+    pub detected_deck: Option<String>,
+    pub modified_date: Option<String>,
+}
+
+/// Preview scan - shows what files would be uploaded with detected deck names
+pub fn preview_scan(
+    config: &GameLogConfig,
+    processed_files: &HashSet<String>,
+    filter: &GameLogFilterOptions,
+) -> Result<Vec<FilePreviewInfo>> {
+    let files = scan_directory(config)?;
+    let mut preview_results = Vec::new();
+    
+    for file_path in files {
+        let filename = file_path
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_default();
+        
+        // Skip already processed
+        if processed_files.contains(&filename) {
+            continue;
+        }
+        
+        // Check days filter
+        let metadata = file_path.metadata().ok();
+        let modified_time = metadata.as_ref().and_then(|m| m.modified().ok());
+        if !filter.passes_days_filter(modified_time) {
+            continue;
+        }
+        
+        // Read file to extract deck identifier
+        let content = match fs::read_to_string(&file_path) {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+        
+        let detected_deck = extract_deck_identifier(&filename, &content);
+        
+        // Check deck filter
+        if !filter.passes_deck_filter(detected_deck.as_deref()) {
+            continue;
+        }
+        
+        // Format modified date
+        let modified_date = modified_time
+            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+            .map(|d| {
+                let secs = d.as_secs() as i64;
+                chrono::DateTime::from_timestamp(secs, 0)
+                    .map(|dt| dt.format("%Y-%m-%d %H:%M").to_string())
+                    .unwrap_or_default()
+            });
+        
+        let file_size = metadata.map(|m| m.len()).unwrap_or(0);
+        
+        preview_results.push(FilePreviewInfo {
+            filename,
+            file_size,
+            detected_deck,
+            modified_date,
+        });
+    }
+    
+    Ok(preview_results)
+}
+
 /// Read and parse a game log file
 pub fn read_game_log(path: &Path) -> Result<GameLogContent> {
     let content = fs::read_to_string(path)
@@ -313,40 +391,119 @@ pub async fn upload_game_log(
     }
 }
 
-/// Extract deck identifier from filename or content
+/// Extract deck identifier from filename or JSON content
 /// 
-/// Forge game logs often include the deck name in:
-/// 1. The filename itself (e.g., "game-MyDeckName-2026-02-02.txt")
-/// 2. The log content (e.g., "Human's deck: MyDeckName")
+/// Parses JSON game logs following the MTG Replay & Learning Notation format.
+/// Looks for deck information in:
+/// - `meta.players.P1.deck_hash` or `meta.players.P1.name` (MTG Replay Notation)
+/// - `deckName`, `deck_name`, `deck.name` fields
+/// - `players[].deck` or `players[].deckName` arrays
+/// - Filename patterns (e.g., "game-MyDeckName-2026-02-02.json")
 fn extract_deck_identifier(filename: &str, content: &str) -> Option<String> {
-    // Pattern 1: Try to extract from filename
-    // Common formats: "game-{deck_name}-{date}.txt", "{deck_name}_vs_{opponent}.txt"
+    // Pattern 1: Parse JSON content (primary method)
+    if let Ok(json_value) = serde_json::from_str::<serde_json::Value>(content) {
+        if let Some(deck_name) = extract_deck_from_json(&json_value) {
+            return Some(deck_name);
+        }
+    }
+    
+    // Pattern 2: Fall back to filename extraction
     if let Some(deck_name) = extract_deck_from_filename(filename) {
         return Some(deck_name);
     }
     
-    // Pattern 2: Try to extract from log content
-    // Look for lines like "Human's deck: DeckName" or "Player1 deck: DeckName"
-    for line in content.lines() {
-        let line_lower = line.to_lowercase();
-        
-        // Pattern: "X's deck: Y" or "X deck: Y"
-        if line_lower.contains("deck:") || line_lower.contains("'s deck:") {
-            if let Some(deck_part) = line.split(':').nth(1) {
-                let deck_name = deck_part.trim();
-                if !deck_name.is_empty() && deck_name.len() > 2 {
-                    return Some(deck_name.to_string());
+    None
+}
+
+/// Extract deck name from JSON game log content
+///
+/// Supports the MTG Replay & Learning Notation format:
+/// ```json
+/// { "meta": { "players": { "P1": { "name": "Alice", "deck_hash": "abc123" } } } }
+/// ```
+/// Also handles other common JSON game log structures.
+fn extract_deck_from_json(value: &serde_json::Value) -> Option<String> {
+    // MTG Replay Notation: meta.players.P1 (player map with deck_hash/name)
+    if let Some(meta) = value.get("meta") {
+        if let Some(players) = meta.get("players").and_then(|v| v.as_object()) {
+            // Find P1 (human player) first, then fall back to any player
+            let player_keys = ["P1", "P2"];
+            for key in &player_keys {
+                if let Some(player) = players.get(*key) {
+                    // deck_hash is used in MTG Replay Notation
+                    if let Some(deck_hash) = player.get("deck_hash").and_then(|v| v.as_str()) {
+                        if !deck_hash.is_empty() {
+                            return Some(deck_hash.to_string());
+                        }
+                    }
+                    // Also try deck_name or name as deck identifier
+                    for field in &["deck_name", "deckName", "deck"] {
+                        if let Some(name) = player.get(field).and_then(|v| v.as_str()) {
+                            if !name.is_empty() {
+                                return Some(name.to_string());
+                            }
+                        }
+                    }
                 }
             }
         }
-        
-        // Pattern: "Playing X"
-        if line_lower.starts_with("playing ") {
-            let deck_name = line.trim_start_matches("Playing ").trim_start_matches("playing ").trim();
-            if !deck_name.is_empty() && deck_name.len() > 2 {
-                return Some(deck_name.to_string());
+        // Also check meta-level deck fields
+        for field in &["deck_name", "deckName", "deck"] {
+            if let Some(name) = meta.get(field).and_then(|v| v.as_str()) {
+                if !name.is_empty() {
+                    return Some(name.to_string());
+                }
             }
         }
+    }
+    
+    // Direct top-level fields
+    let field_names = ["deckName", "deck_name", "deck", "playerDeck", "player_deck"];
+    for field in &field_names {
+        if let Some(name) = value.get(field).and_then(|v| v.as_str()) {
+            if !name.is_empty() {
+                return Some(name.to_string());
+            }
+        }
+        // Nested object: { "deck": { "name": "..." } }
+        if let Some(obj) = value.get(field).and_then(|v| v.as_object()) {
+            if let Some(name) = obj.get("name").and_then(|v| v.as_str()) {
+                if !name.is_empty() {
+                    return Some(name.to_string());
+                }
+            }
+        }
+    }
+    
+    // Players array: { "players": [{ "deck": "...", "deckName": "..." }] }
+    if let Some(players) = value.get("players").and_then(|v| v.as_array()) {
+        for player in players {
+            let is_human = player.get("isHuman").and_then(|v| v.as_bool()).unwrap_or(false)
+                || player.get("type").and_then(|v| v.as_str()) == Some("human");
+            
+            for field in &field_names {
+                if let Some(name) = player.get(field).and_then(|v| v.as_str()) {
+                    if !name.is_empty() && is_human {
+                        return Some(name.to_string());
+                    }
+                }
+            }
+        }
+        // Fall back to first player's deck
+        if let Some(first_player) = players.first() {
+            for field in &field_names {
+                if let Some(name) = first_player.get(field).and_then(|v| v.as_str()) {
+                    if !name.is_empty() {
+                        return Some(name.to_string());
+                    }
+                }
+            }
+        }
+    }
+    
+    // Nested game object
+    if let Some(game) = value.get("game").or_else(|| value.get("gameData")) {
+        return extract_deck_from_json(game);
     }
     
     None
@@ -354,8 +511,8 @@ fn extract_deck_identifier(filename: &str, content: &str) -> Option<String> {
 
 /// Extract deck name from filename
 fn extract_deck_from_filename(filename: &str) -> Option<String> {
-    // Remove extension
-    let name = filename.trim_end_matches(".txt").trim_end_matches(".log");
+    // Remove .json extension
+    let name = filename.trim_end_matches(".json");
     
     // Pattern: "game-{deck_name}-{date}"
     if name.starts_with("game-") {
@@ -892,7 +1049,7 @@ mod tests {
     fn test_default_config() {
         let config = GameLogConfig::default();
         assert!(!config.watch_directory.is_empty() || cfg!(target_os = "linux"));
-        assert_eq!(config.file_extensions, vec!["txt", "log"]);
+        assert_eq!(config.file_extensions, vec!["json"]);
         assert!(!config.background_scan_enabled);
         assert_eq!(config.scan_interval_secs, 30);
     }
@@ -912,19 +1069,19 @@ mod tests {
     #[test]
     fn test_game_log_process_result() {
         let success = GameLogProcessResult::success(
-            "test.log".to_string(),
+            "test.json".to_string(),
             1024,
             Some("id123".to_string()),
             Some("MyDeck".to_string()),
         );
         assert!(success.success);
-        assert_eq!(success.filename, "test.log");
+        assert_eq!(success.filename, "test.json");
         assert_eq!(success.file_size, 1024);
         assert_eq!(success.server_id, Some("id123".to_string()));
         assert_eq!(success.deck_identifier, Some("MyDeck".to_string()));
 
         let failed = GameLogProcessResult::failed(
-            "test.log".to_string(),
+            "test.json".to_string(),
             "Error message".to_string(),
         );
         assert!(!failed.success);

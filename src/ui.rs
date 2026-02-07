@@ -9,7 +9,7 @@ use crate::deck::{create_deck_from_moxfield, MoxfieldDeckEntry, MamoDeckEntry, D
 use rfd::FileDialog;
 use crate::deeplink::Deeplink;
 use crate::forge::{get_default_forge_path, validate_forge_path, launch_forge_from_settings};
-use crate::gamelog::{GameLogConfig, GameLogProcessResult, ScanSummary, get_default_forge_log_directory, validate_directory, scan_directory, process_new_logs, load_processed_files, save_processed_files, DeckMappings, UserDeck, fetch_my_decks, suggest_deck_matches, load_cached_decks, save_cached_decks, process_new_logs_with_filter, GameLogFilterOptions};
+use crate::gamelog::{GameLogConfig, GameLogProcessResult, ScanSummary, get_default_forge_log_directory, validate_directory, scan_directory, process_new_logs, load_processed_files, save_processed_files, DeckMappings, UserDeck, fetch_my_decks, suggest_deck_matches, load_cached_decks, save_cached_decks, process_new_logs_with_filter, GameLogFilterOptions, preview_scan, FilePreviewInfo};
 use crate::registration::{RegistrationOutcome, RegistrationStatus};
 use crate::settings::{Settings, SavedLink, SavedLinkType};
 use crate::get_pending_command_path;
@@ -104,6 +104,10 @@ struct GameLogState {
     selected_deck_filters: HashSet<String>,
     /// Show deck filter dropdown
     show_deck_filter_dropdown: bool,
+    /// Preview scan results (files to be uploaded with detected decks)
+    preview_results: Vec<FilePreviewInfo>,
+    /// Is preview scan running
+    is_previewing: bool,
 }
 
 /// State for the settings tab (includes Forge configuration)
@@ -1718,13 +1722,23 @@ impl LauncherApp {
         ui.add_space(10.0);
         
         // Scan controls section
+        let (is_previewing, preview_results) = {
+            let state = self.gamelog_state.lock().unwrap();
+            (state.is_previewing, state.preview_results.clone())
+        };
+        
         ui.group(|ui| {
             ui.label(egui::RichText::new("🔍 Scan Controls").strong());
             ui.add_space(5.0);
             
             ui.horizontal(|ui| {
+                // Preview button - shows what would be uploaded
+                if ui.add_enabled(!is_scanning && !is_previewing && directory_valid, egui::Button::new("👁 Preview")).clicked() {
+                    self.preview_gamelog_scan();
+                }
+                
                 // Manual scan button
-                if ui.add_enabled(!is_scanning && directory_valid, egui::Button::new("🔄 Scan Now")).clicked() {
+                if ui.add_enabled(!is_scanning && directory_valid, egui::Button::new("🔄 Upload")).clicked() {
                     self.start_gamelog_scan(ctx);
                 }
                 
@@ -1736,6 +1750,10 @@ impl LauncherApp {
                 
                 if is_scanning {
                     ui.spinner();
+                    ui.label("Uploading...");
+                }
+                if is_previewing {
+                    ui.spinner();
                     ui.label("Scanning...");
                 }
             });
@@ -1744,6 +1762,58 @@ impl LauncherApp {
                 ui.label(egui::RichText::new("Background scanning is active. New logs will be uploaded automatically.").small().weak());
             }
         });
+        
+        // Preview results section
+        if !preview_results.is_empty() {
+            ui.add_space(10.0);
+            ui.group(|ui| {
+                ui.label(egui::RichText::new(format!("📋 Preview: {} files to upload", preview_results.len())).strong());
+                ui.add_space(5.0);
+                
+                // Count by deck
+                let mut deck_counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+                for p in &preview_results {
+                    let deck = p.detected_deck.clone().unwrap_or_else(|| "Unknown".to_string());
+                    *deck_counts.entry(deck).or_insert(0) += 1;
+                }
+                
+                // Show deck summary
+                ui.label(egui::RichText::new("Decks detected:").small());
+                for (deck, count) in &deck_counts {
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new(format!("  • {} ({})", deck, count)).small().color(egui::Color32::from_rgb(100, 149, 237)));
+                    });
+                }
+                
+                ui.add_space(5.0);
+                
+                // File list
+                egui::ScrollArea::vertical()
+                    .max_height(200.0)
+                    .show(ui, |ui| {
+                        for preview in &preview_results {
+                            ui.horizontal(|ui| {
+                                ui.label(egui::RichText::new("○").color(egui::Color32::GRAY));
+                                ui.label(&preview.filename);
+                                ui.label(egui::RichText::new(format!("({} bytes)", preview.file_size)).small().weak());
+                                if let Some(ref deck) = preview.detected_deck {
+                                    ui.label(egui::RichText::new(format!("→ {}", deck)).small().color(egui::Color32::from_rgb(100, 149, 237)));
+                                } else {
+                                    ui.label(egui::RichText::new("→ ?").small().color(egui::Color32::GRAY));
+                                }
+                            });
+                        }
+                    });
+                
+                ui.add_space(5.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Clear Preview").clicked() {
+                        let mut state = self.gamelog_state.lock().unwrap();
+                        state.preview_results.clear();
+                    }
+                });
+            });
+        }
         
         ui.add_space(10.0);
         
@@ -1867,6 +1937,61 @@ impl LauncherApp {
             state.status_message = Some("Directory saved successfully".to_string());
         } else {
             state.status_message = Some("Error: Directory is not valid or accessible".to_string());
+        }
+    }
+
+    fn preview_gamelog_scan(&mut self) {
+        let gamelog_state = Arc::clone(&self.gamelog_state);
+        let settings = Arc::clone(&self.settings);
+        
+        // Get filter options
+        let filter_options = {
+            let state = gamelog_state.lock().unwrap();
+            GameLogFilterOptions {
+                days_filter: state.days_filter,
+                deck_filter: state.selected_deck_filters.clone(),
+            }
+        };
+        
+        // Mark as previewing
+        {
+            let mut state = gamelog_state.lock().unwrap();
+            state.is_previewing = true;
+            state.preview_results.clear();
+        }
+        
+        // Run preview synchronously (it's fast, just reads files)
+        let config = {
+            let settings = settings.lock().unwrap();
+            settings.gamelog_config.clone()
+        };
+        
+        let processed_files = {
+            let state = gamelog_state.lock().unwrap();
+            state.processed_files.clone()
+        };
+        
+        let result = preview_scan(&config, &processed_files, &filter_options);
+        
+        {
+            let mut state = gamelog_state.lock().unwrap();
+            state.is_previewing = false;
+            
+            match result {
+                Ok(previews) => {
+                    let count = previews.len();
+                    state.preview_results = previews.into_iter().map(|p| FilePreviewInfo {
+                        filename: p.filename,
+                        file_size: p.file_size,
+                        detected_deck: p.detected_deck,
+                        modified_date: p.modified_date,
+                    }).collect();
+                    state.status_message = Some(format!("Preview: {} files ready to upload", count));
+                }
+                Err(e) => {
+                    state.status_message = Some(format!("Preview error: {}", e));
+                }
+            }
         }
     }
 

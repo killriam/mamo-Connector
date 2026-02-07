@@ -122,9 +122,20 @@ impl Settings {
         if path.exists() {
             let content = fs::read_to_string(&path)
                 .with_context(|| format!("Failed to read settings from {:?}", path))?;
-            let settings: Settings = serde_json::from_str(&content)
+            let mut settings: Settings = serde_json::from_str(&content)
                 .with_context(|| "Failed to parse settings JSON")?;
             info!("Loaded settings with {} saved links", settings.saved_links.len());
+            
+            // Migrate: ensure file_extensions uses JSON-only format
+            // Old settings may have ["txt", "log"] from before the JSON-only change
+            let has_json = settings.gamelog_config.file_extensions.iter().any(|e| e == "json");
+            if !has_json {
+                info!("Migrating gamelog file_extensions to JSON-only format");
+                settings.gamelog_config.file_extensions = vec!["json".to_string()];
+                // Persist the migration
+                let _ = settings.save();
+            }
+            
             Ok(settings)
         } else {
             info!("No settings file found, using defaults");
