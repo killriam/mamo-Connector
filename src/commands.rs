@@ -64,6 +64,7 @@ impl CommandResult {
     }
 }
 
+#[allow(dead_code)]
 pub async fn handle_command(deeplink: &Deeplink) -> CommandResult {
     handle_command_with_logger(deeplink, None).await
 }

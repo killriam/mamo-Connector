@@ -274,6 +274,8 @@ struct LauncherApp {
     activity_log: Arc<Mutex<ActivityLogState>>,
     settings: Arc<Mutex<Settings>>,
     last_pending_check: Instant,
+    /// Whether we have a pending initial deeplink to process (set once, consumed on first update)
+    pending_initial_deeplink: Option<Deeplink>,
 }
 
 impl LauncherApp {
@@ -321,17 +323,11 @@ impl LauncherApp {
         let mut activity_log = ActivityLogState::new();
         activity_log.log_info("MaMo Connector started");
         
-        // Log the deeplink and its result if present
+        // Store deeplink for deferred processing with progress logging
         let started_with_deeplink = state.deeplink.is_some();
-        if let Some(ref dl) = state.deeplink {
-            activity_log.log_info(format!("Received command: {}", dl.raw));
-            activity_log.log_info(format!("Processing action: {}", dl.action));
-            if let Some(ref deck_id) = dl.deck_id {
-                activity_log.log_info(format!("Deck ID: {}", deck_id));
-            }
-        }
+        let pending_initial_deeplink = state.deeplink.clone();
         
-        // Log the command result if present
+        // Log the command result if already present (pre-processed, e.g. auth)
         if let Some(ref result) = state.command_result {
             match result {
                 CommandResult::DeckCreated(deck_result) => {
@@ -395,12 +391,18 @@ impl LauncherApp {
             activity_log: Arc::new(Mutex::new(activity_log)),
             settings: Arc::new(Mutex::new(settings)),
             last_pending_check: Instant::now(),
+            pending_initial_deeplink,
         }
     }
 }
 
 impl eframe::App for LauncherApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // Process initial deeplink on first frame (with progress logging)
+        if let Some(deeplink) = self.pending_initial_deeplink.take() {
+            self.process_deeplink_with_progress(deeplink, ctx);
+        }
+        
         // Check for pending commands from secondary instances every 500ms
         let now = Instant::now();
         if now.duration_since(self.last_pending_check).as_millis() > 500 {
@@ -464,6 +466,121 @@ impl eframe::App for LauncherApp {
 }
 
 impl LauncherApp {
+    /// Process a deeplink with real-time progress logging to the Activity tab
+    fn process_deeplink_with_progress(&mut self, deeplink: Deeplink, ctx: &egui::Context) {
+        use crate::commands::{self, SharedLogCollector};
+        use log::info;
+        
+        info!("Processing deeplink with progress: {}", deeplink.raw);
+        
+        // Log the incoming command
+        if let Ok(mut log) = self.activity_log.lock() {
+            log.log_info(format!("Received command: {}", deeplink.raw));
+            log.log_info(format!("Processing action: {}", deeplink.action));
+            if let Some(ref deck_id) = deeplink.deck_id {
+                log.log_info(format!("Deck ID: {}", deck_id));
+            }
+        }
+        
+        // Create a log collector for real-time progress updates
+        let log_collector: SharedLogCollector = Arc::new(Mutex::new(Vec::new()));
+        
+        // Handle the command in a background thread
+        let settings = self.settings.clone();
+        let settings_state = self.settings_state.clone();
+        let activity_log = self.activity_log.clone();
+        let log_collector_clone = log_collector.clone();
+        let ctx_clone = ctx.clone();
+        
+        std::thread::spawn(move || {
+            let runtime = tokio::runtime::Runtime::new().unwrap();
+            let result = runtime.block_on(commands::handle_command_with_logger(&deeplink, Some(log_collector_clone.clone())));
+            
+            // Transfer collected logs to activity log
+            if let Ok(collected_logs) = log_collector_clone.lock() {
+                if let Ok(mut log) = activity_log.lock() {
+                    for msg in collected_logs.iter() {
+                        log.log_info(msg.as_str());
+                    }
+                }
+            }
+            
+            // Log the final result
+            if let Ok(mut log) = activity_log.lock() {
+                match &result {
+                    commands::CommandResult::DeckCreated(deck_result) => {
+                        if deck_result.success {
+                            log.log_success(&deck_result.message);
+                        } else {
+                            log.log_error(&deck_result.message);
+                        }
+                    }
+                    commands::CommandResult::DeckCreatedAndLaunched(deck_result, forge_result) => {
+                        if deck_result.success {
+                            log.log_success(&deck_result.message);
+                        } else {
+                            log.log_error(&deck_result.message);
+                        }
+                        if forge_result.success {
+                            log.log_success(&forge_result.message);
+                        } else {
+                            log.log_error(&forge_result.message);
+                        }
+                    }
+                    commands::CommandResult::ForgeLaunched(forge_result) => {
+                        if forge_result.success {
+                            log.log_success(&forge_result.message);
+                        } else {
+                            log.log_error(&forge_result.message);
+                        }
+                    }
+                    commands::CommandResult::AuthTokenSaved(msg) => {
+                        log.log_success(msg);
+                    }
+                    commands::CommandResult::Error(err) => {
+                        log.log_error(err);
+                    }
+                    commands::CommandResult::UnknownAction(action) => {
+                        log.log_error(format!("Unknown action: {}", action));
+                    }
+                    commands::CommandResult::MissingParameters(msg) => {
+                        log.log_error(format!("Missing parameters: {}", msg));
+                    }
+                    commands::CommandResult::UserDecksImported(result) => {
+                        log.log_info(&result.message);
+                    }
+                    commands::CommandResult::UserDecksList(decks) => {
+                        log.log_info(format!("Found {} decks", decks.len()));
+                    }
+                }
+            }
+            
+            // Handle auth token saved result
+            if let commands::CommandResult::AuthTokenSaved(ref token) = result {
+                info!("Auth token saved via initial deeplink: {}", 
+                    if token.len() > 20 { format!("{}...", &token[..20]) } else { token.clone() });
+                
+                // Reload settings from disk to get the updated auth_token
+                if let Ok(reloaded_settings) = crate::settings::Settings::load() {
+                    let auth_token = reloaded_settings.auth_token.clone();
+                    
+                    if let Ok(mut settings_guard) = settings.lock() {
+                        *settings_guard = reloaded_settings;
+                    }
+                    
+                    if let Some(token) = auth_token {
+                        if let Ok(mut state_guard) = settings_state.lock() {
+                            state_guard.auth_token_input = token;
+                            state_guard.status_message = Some("✓ Connected to MaMo".to_string());
+                        }
+                    }
+                }
+            }
+            
+            ctx_clone.request_repaint();
+        });
+    }
+    
     /// Check for pending commands from secondary instances
     fn check_pending_commands(&mut self, ctx: &egui::Context) {
         use crate::commands::{self, SharedLogCollector};

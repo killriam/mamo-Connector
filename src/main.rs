@@ -123,12 +123,9 @@ async fn run() -> Result<()> {
         }
     };
 
-    // Handle command if deeplink is present
-    let command_result = if let Some(ref dl) = deeplink {
-        Some(commands::handle_command(dl).await)
-    } else {
-        None
-    };
+    // Don't process the command here - let the UI handle it with progress logging
+    // The UI will switch to Activity tab and show real-time progress
+    let command_result: Option<commands::CommandResult> = None;
 
     info!("Launching UI with {} arguments", args.len());
 
