@@ -473,6 +473,9 @@ impl LauncherApp {
         
         info!("Processing deeplink with progress: {}", deeplink.raw);
         
+        // Switch to Activity tab to show progress
+        self.current_tab = Tab::Activity;
+        
         // Log the incoming command
         if let Ok(mut log) = self.activity_log.lock() {
             log.log_info(format!("Received command: {}", deeplink.raw));

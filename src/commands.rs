@@ -282,7 +282,7 @@ async fn handle_launch_forge_with_logger(deeplink: &Deeplink, log_collector: Opt
                         let deck_path_str = result.deck_path.as_ref()
                             .map(|p| p.to_string_lossy().to_string());
                         
-                        log("Launching Forge...");
+                        log("Launching Forge with deck...");
                         let forge_result = launch_forge_from_settings(deck_path_str.as_deref());
                         match forge_result {
                             Ok(forge_res) => {
@@ -301,15 +301,41 @@ async fn handle_launch_forge_with_logger(deeplink: &Deeplink, log_collector: Opt
                             }
                         }
                     } else {
+                        // Deck download failed, but still launch Forge without deck
                         log(&format!("Deck download failed: {}", result.message));
-                        return CommandResult::Error(format!(
-                            "Failed to download deck: {}", result.message
-                        ));
+                        log("Launching Forge without deck...");
+                        match launch_forge_from_settings(None) {
+                            Ok(forge_res) => {
+                                if forge_res.success {
+                                    log("Forge launched (without deck due to download error)");
+                                }
+                                return CommandResult::DeckCreatedAndLaunched(result, forge_res);
+                            }
+                            Err(e) => {
+                                log(&format!("Forge launch also failed: {}", e));
+                                return CommandResult::Error(format!(
+                                    "Deck download failed and Forge launch failed: {}", e
+                                ));
+                            }
+                        }
                     }
                 }
                 Err(e) => {
+                    // Error during deck download, but still try to launch Forge
                     log(&format!("Error downloading deck: {}", e));
-                    return CommandResult::Error(format!("Failed to download deck: {}", e));
+                    log("Launching Forge without deck...");
+                    match launch_forge_from_settings(None) {
+                        Ok(forge_res) => {
+                            if forge_res.success {
+                                log("Forge launched (without deck due to error)");
+                            }
+                            return CommandResult::ForgeLaunched(forge_res);
+                        }
+                        Err(forge_err) => {
+                            log(&format!("Forge launch also failed: {}", forge_err));
+                            return CommandResult::Error(format!("Failed to download deck: {}. Forge launch also failed: {}", e, forge_err));
+                        }
+                    }
                 }
             }
         }

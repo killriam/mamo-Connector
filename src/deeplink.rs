@@ -14,9 +14,10 @@ pub struct Deeplink {
 }
 
 pub fn parse_deeplink(args: &[String], scheme_prefix: &str) -> Option<Deeplink> {
+    let scheme_prefix_lower = scheme_prefix.to_lowercase();
     let raw = args
         .iter()
-        .find(|arg| arg.starts_with(scheme_prefix))?
+        .find(|arg| arg.to_lowercase().starts_with(&scheme_prefix_lower))?
         .clone();
     parse_deeplink_url(&raw)
 }

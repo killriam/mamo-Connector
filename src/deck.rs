@@ -1040,11 +1040,31 @@ pub async fn create_deck_from_mamo_with_progress(
         "-H", "Accept: text/plain",
     ])?;
     
-    // Check if response looks like an error
+    // Check if response looks like an error (JSON or plain text error message)
     if body.starts_with("{") && body.contains("error") {
-        log("API returned an error");
+        log("API returned a JSON error");
         return Ok(DeckCreationResult::failed(
             format!("MaMo API error: {}", body)
+        ));
+    }
+    
+    // Check for plain text error messages
+    let body_lower = body.to_lowercase();
+    if body_lower.starts_with("failed") || body_lower.starts_with("error") 
+        || body_lower.contains("not found") || body_lower.contains("failed to export") {
+        log(&format!("API returned an error message: {}", body.trim()));
+        return Ok(DeckCreationResult::failed(
+            format!("MaMo API error: {}", body.trim())
+        ));
+    }
+    
+    // Validate that the response looks like a valid Forge deck file
+    // It should contain [metadata] section or deck sections like [Main], [Commander]
+    if !body.contains("[metadata]") && !body.contains("[Main]") && !body.contains("[Commander]") && !body.contains("Name=") {
+        log("Response doesn't look like a valid Forge deck file");
+        return Ok(DeckCreationResult::failed(
+            format!("Invalid deck format received from API: {}", 
+                    if body.len() > 100 { format!("{}...", &body[..100]) } else { body.clone() })
         ));
     }
     

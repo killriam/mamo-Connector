@@ -204,22 +204,27 @@ pub fn launch_forge(forge_path: &str, deck_path: Option<&str>) -> Result<ForgeLa
             cmd.spawn()
         }
         "exe" | "cmd" | "bat" => {
-            // On Windows, use cmd /c start to properly launch GUI apps
-            // This handles launchers like forge.exe that spawn Java
+            // On Windows, directly launch the executable from its directory
+            // The forge.exe launcher needs to run from its directory to find the JAR
+            // Note: Forge doesn't support command-line deck loading, 
+            // but the deck is saved to the Forge decks directory for manual opening
             #[cfg(windows)]
             {
-                let mut cmd = Command::new("cmd");
-                cmd.arg("/c").arg("start").arg("").arg(&forge_path_buf);
+                use std::os::windows::process::CommandExt;
+                const DETACHED_PROCESS: u32 = 0x00000008;
                 
+                let mut cmd = Command::new(&forge_path_buf);
+                
+                // Critical: Set working directory to forge's directory
                 if let Some(dir) = &forge_dir {
                     cmd.current_dir(dir);
                 }
                 
-                // Note: passing deck args through 'start' is tricky, 
-                // but for exe launchers it may not support deck args anyway
-                if let Some(deck) = deck_path {
-                    cmd.arg("--deck").arg(deck);
-                }
+                // Use DETACHED_PROCESS so forge runs independently
+                cmd.creation_flags(DETACHED_PROCESS);
+                
+                // Note: Forge doesn't support --deck command line argument
+                // Deck is available in Forge's deck folder after download
                 
                 cmd.spawn()
             }
