@@ -127,7 +127,7 @@ async fn run() -> Result<()> {
     // The UI will switch to Activity tab and show real-time progress
     let command_result: Option<commands::CommandResult> = None;
 
-    info!("Launching UI with {} arguments", args.len());
+    info!("Launching UI with {} arguments, deeplink: {:?}", args.len(), deeplink.as_ref().map(|d| &d.raw));
 
     ui::launch(registration, args, deeplink, command_result)?;
 

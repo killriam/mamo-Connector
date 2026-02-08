@@ -480,30 +480,56 @@ impl LauncherApp {
             if let Some(ref deck_id) = deeplink.deck_id {
                 log.log_info(format!("Deck ID: {}", deck_id));
             }
+            log.log_info("Starting command execution...");
         }
         
-        // Create a log collector for real-time progress updates
-        let log_collector: SharedLogCollector = Arc::new(Mutex::new(Vec::new()));
+        // Request immediate repaint to show the initial logs
+        ctx.request_repaint();
         
         // Handle the command in a background thread
         let settings = self.settings.clone();
         let settings_state = self.settings_state.clone();
         let activity_log = self.activity_log.clone();
-        let log_collector_clone = log_collector.clone();
+        let activity_log_for_polling = self.activity_log.clone();
         let ctx_clone = ctx.clone();
+        let ctx_for_polling = ctx.clone();
+        
+        // Create a log collector for the command handler
+        let log_collector: SharedLogCollector = Arc::new(Mutex::new(Vec::new()));
+        let log_collector_for_command = log_collector.clone();
         
         std::thread::spawn(move || {
             let runtime = tokio::runtime::Runtime::new().unwrap();
-            let result = runtime.block_on(commands::handle_command_with_logger(&deeplink, Some(log_collector_clone.clone())));
             
-            // Transfer collected logs to activity log
-            if let Ok(collected_logs) = log_collector_clone.lock() {
-                if let Ok(mut log) = activity_log.lock() {
-                    for msg in collected_logs.iter() {
-                        log.log_info(msg.as_str());
+            let result = runtime.block_on(async {
+                // Spawn a polling task to transfer logs to activity_log in real-time
+                let collector_for_polling = log_collector.clone();
+                let poll_handle = tokio::spawn(async move {
+                    let mut last_len = 0;
+                    loop {
+                        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+                        if let Ok(logs) = collector_for_polling.lock() {
+                            let current_len = logs.len();
+                            if current_len > last_len {
+                                if let Ok(mut activity) = activity_log_for_polling.lock() {
+                                    for i in last_len..current_len {
+                                        activity.log_info(&logs[i]);
+                                    }
+                                }
+                                ctx_for_polling.request_repaint();
+                                last_len = current_len;
+                            }
+                        }
                     }
-                }
-            }
+                });
+                
+                let result = commands::handle_command_with_logger(&deeplink, Some(log_collector_for_command)).await;
+                
+                // Stop the polling task
+                poll_handle.abort();
+                
+                result
+            });
             
             // Log the final result
             if let Ok(mut log) = activity_log.lock() {
@@ -610,6 +636,7 @@ impl LauncherApp {
                             if let Some(ref deck_id) = deeplink.deck_id {
                                 log.log_info(format!("Deck ID: {}", deck_id));
                             }
+                            log.log_info("Starting command execution...");
                         }
                         
                         // Create a log collector for real-time progress updates
@@ -619,21 +646,43 @@ impl LauncherApp {
                         let settings = self.settings.clone();
                         let settings_state = self.settings_state.clone();
                         let activity_log = self.activity_log.clone();
-                        let log_collector_clone = log_collector.clone();
+                        let activity_log_for_polling = self.activity_log.clone();
+                        let log_collector_for_command = log_collector.clone();
                         let ctx_clone = ctx.clone();
+                        let ctx_for_polling = ctx.clone();
                         
                         std::thread::spawn(move || {
                             let runtime = tokio::runtime::Runtime::new().unwrap();
-                            let result = runtime.block_on(commands::handle_command_with_logger(&deeplink, Some(log_collector_clone.clone())));
                             
-                            // Transfer collected logs to activity log
-                            if let Ok(collected_logs) = log_collector_clone.lock() {
-                                if let Ok(mut log) = activity_log.lock() {
-                                    for msg in collected_logs.iter() {
-                                        log.log_info(msg.as_str());
+                            let result = runtime.block_on(async {
+                                // Spawn a polling task to transfer logs to activity_log in real-time
+                                let collector_for_polling = log_collector.clone();
+                                let poll_handle = tokio::spawn(async move {
+                                    let mut last_len = 0;
+                                    loop {
+                                        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+                                        if let Ok(logs) = collector_for_polling.lock() {
+                                            let current_len = logs.len();
+                                            if current_len > last_len {
+                                                if let Ok(mut activity) = activity_log_for_polling.lock() {
+                                                    for i in last_len..current_len {
+                                                        activity.log_info(&logs[i]);
+                                                    }
+                                                }
+                                                ctx_for_polling.request_repaint();
+                                                last_len = current_len;
+                                            }
+                                        }
                                     }
-                                }
-                            }
+                                });
+                                
+                                let result = commands::handle_command_with_logger(&deeplink, Some(log_collector_for_command)).await;
+                                
+                                // Stop the polling task
+                                poll_handle.abort();
+                                
+                                result
+                            });
                             
                             // Log the final result
                             if let Ok(mut log) = activity_log.lock() {
