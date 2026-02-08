@@ -2,6 +2,7 @@ use log::warn;
 use url::Url;
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct Deeplink {
     pub raw: String,
     pub action: String,
@@ -49,13 +50,13 @@ pub fn parse_deeplink_url(raw: &str) -> Option<Deeplink> {
                 params.push((key.to_string(), value));
             }
             
-            // Also check path for deck ID (e.g., mamoConnector://deck/DECK_ID)
+            // Also check path for deck ID (e.g., mamoConnector://deck/DECK_ID or mamoConnector://playtest/UUID)
             let path = url.path();
             if !path.is_empty() && path != "/" {
                 let path_parts: Vec<&str> = path.trim_start_matches('/').split('/').collect();
                 if !path_parts.is_empty() && !path_parts[0].is_empty() {
-                    // If action is "deck", "mamo", or "user", the path is the ID/username
-                    if (action == "deck" || action == "mamo") && deck_id.is_none() {
+                    // If action is "deck", "mamo", "playtest", "launch-forge", or "launchforge", the path is the deck ID
+                    if (action == "deck" || action == "mamo" || action == "playtest" || action == "launch-forge" || action == "launchforge") && deck_id.is_none() {
                         deck_id = Some(path_parts[0].to_string());
                     } else if action == "user" && username.is_none() {
                         username = Some(path_parts[0].to_string());
@@ -239,5 +240,34 @@ mod tests {
         
         assert_eq!(result.action, "import-user-decks");
         assert!(result.username.is_none());
+    }
+
+    // ==================== Playtest / Launch Forge Tests ====================
+
+    #[test]
+    fn test_parse_playtest_with_deck_id_in_path() {
+        let url = "mamoConnector://playtest/b15ace87-3153-45c9-afc9-5c8a2163384d";
+        let result = parse_deeplink_url(url).unwrap();
+        
+        assert_eq!(result.action, "playtest");
+        assert_eq!(result.deck_id, Some("b15ace87-3153-45c9-afc9-5c8a2163384d".to_string()));
+    }
+
+    #[test]
+    fn test_parse_launch_forge_with_deck_id_in_path() {
+        let url = "mamoConnector://launch-forge/abc-123-def";
+        let result = parse_deeplink_url(url).unwrap();
+        
+        assert_eq!(result.action, "launch-forge");
+        assert_eq!(result.deck_id, Some("abc-123-def".to_string()));
+    }
+
+    #[test]
+    fn test_parse_launchforge_with_deck_id_in_path() {
+        let url = "mamoConnector://launchforge/xyz789";
+        let result = parse_deeplink_url(url).unwrap();
+        
+        assert_eq!(result.action, "launchforge");
+        assert_eq!(result.deck_id, Some("xyz789".to_string()));
     }
 }

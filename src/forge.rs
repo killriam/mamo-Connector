@@ -1,5 +1,5 @@
-use anyhow::{Context, Result};
-use log::{error, info, warn};
+use anyhow::Result;
+use log::{error, info};
 use std::path::PathBuf;
 use std::process::Command;
 
@@ -7,6 +7,7 @@ use crate::settings::Settings;
 
 /// Result of a Forge launch operation
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct ForgeLaunchResult {
     pub success: bool,
     pub message: String,
@@ -319,6 +320,7 @@ pub fn launch_forge_from_settings(deck_path: Option<&str>) -> Result<ForgeLaunch
 }
 
 /// Get the Forge deck directory (where decks should be saved)
+#[allow(dead_code)]
 pub fn get_forge_deck_directory() -> Option<PathBuf> {
     let settings = Settings::load().ok()?;
     

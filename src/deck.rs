@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use log::{info, warn};
 use serde::{Deserialize, Serialize};
+use sha2::{Sha256, Digest};
 use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
@@ -60,6 +61,7 @@ pub struct MoxfieldDeckEntry {
 /// Response from Moxfield API when fetching user decks
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[allow(dead_code)]
 pub struct MoxfieldUserDecksResponse {
     pub page_number: u32,
     pub page_size: u32,
@@ -70,6 +72,7 @@ pub struct MoxfieldUserDecksResponse {
 
 /// Result of importing multiple decks from a user profile
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct UserDecksImportResult {
     pub success: bool,
     pub message: String,
@@ -130,6 +133,7 @@ pub struct DeckData {
 /// Request body for deck export API
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
+#[allow(dead_code)]
 struct DeckExportRequest {
     deck_id: String,
     format: String,
@@ -220,6 +224,7 @@ const MOXFIELD_API_URL: &str = "https://api2.moxfield.com/v2";
 /// Moxfield full deck response structure
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[allow(dead_code)]
 struct MoxfieldFullDeck {
     name: String,
     #[serde(default)]
@@ -627,6 +632,7 @@ pub async fn list_moxfield_user_decks(username: &str, api_base_url: &str) -> Res
 }
 
 /// Import selected decks from a list of deck IDs
+#[allow(dead_code)]
 pub async fn import_selected_decks(
     deck_ids: &[String], 
     api_base_url: &str,
@@ -1006,13 +1012,28 @@ pub fn parse_deckstats_url(url: &str) -> Option<(String, String)> {
 /// MaMo API base URL for deck export
 const MAMO_API_URL: &str = "https://new-backend-two-eosin.vercel.app";
 
-/// Create a deck from MaMo backend
+/// Progress callback type for deck operations
+pub type ProgressCallback = Box<dyn Fn(&str) + Send + Sync>;
+
+/// Create a deck from MaMo backend with progress logging
 /// Fetches the deck in Forge format directly from the MaMo backend
-pub async fn create_deck_from_mamo(deck_id: &str) -> Result<DeckCreationResult> {
-    info!("Creating deck from MaMo: {}", deck_id);
+/// Checks if deck already exists by hash to avoid duplicate downloads
+pub async fn create_deck_from_mamo_with_progress(
+    deck_id: &str,
+    on_progress: Option<&ProgressCallback>,
+) -> Result<DeckCreationResult> {
+    let log = |msg: &str| {
+        info!("{}", msg);
+        if let Some(cb) = on_progress {
+            cb(msg);
+        }
+    };
+    
+    log(&format!("Starting deck download for ID: {}", deck_id));
     
     // MaMo backend returns plain text Forge format
     let url = format!("{}/api/deck/export/{}/forge", MAMO_API_URL, deck_id);
+    log("Fetching deck from MaMo API...");
     
     let body = fetch_with_curl_custom(&url, &[
         "-H", "User-Agent: MaMo-Connector/1.0",
@@ -1021,25 +1042,60 @@ pub async fn create_deck_from_mamo(deck_id: &str) -> Result<DeckCreationResult> 
     
     // Check if response looks like an error
     if body.starts_with("{") && body.contains("error") {
+        log("API returned an error");
         return Ok(DeckCreationResult::failed(
             format!("MaMo API error: {}", body)
         ));
     }
     
+    log("Deck data received, parsing...");
+    
     // Parse deck name from the Forge content: "Name=Author - Deck Name"
     let deck_name = body.lines()
-        .find(|line| line.starts_with("Name="))
-        .map(|line| line.trim_start_matches("Name=").trim())
+        .find(|line| line.starts_with("Name=") || line.starts_with("Name ="))
+        .map(|line| {
+            line.trim_start_matches("Name")
+                .trim_start_matches(" ")
+                .trim_start_matches("=")
+                .trim()
+        })
         .unwrap_or("MaMo Deck");
     
+    log(&format!("Deck name: {}", deck_name));
+    
+    // Calculate deck hash to check if deck already exists
+    log("Calculating deck hash...");
+    let new_deck_hash = calculate_deck_hash(&body);
+    log(&format!("Deck hash: {}", new_deck_hash));
+    
+    // Check if a deck with this hash already exists locally
+    log("Checking for existing deck...");
+    if let Some(existing_path) = find_deck_by_hash(&new_deck_hash) {
+        log(&format!("Deck already exists at: {:?}", existing_path));
+        return Ok(DeckCreationResult::success(
+            format!("Deck '{}' already exists locally (no download needed)", deck_name),
+            existing_path,
+        ));
+    }
+    
+    log("Writing deck file...");
     // Content is already in Forge format, write directly
     let deck_path = write_deck_file(deck_name, &body).await
         .context("Failed to create deck file")?;
+    
+    log(&format!("Deck saved to: {:?}", deck_path));
     
     Ok(DeckCreationResult::success(
         format!("Successfully created MaMo deck '{}' at {:?}", deck_name, deck_path),
         deck_path,
     ))
+}
+
+/// Create a deck from MaMo backend
+/// Fetches the deck in Forge format directly from the MaMo backend
+/// Checks if deck already exists by hash to avoid duplicate downloads
+pub async fn create_deck_from_mamo(deck_id: &str) -> Result<DeckCreationResult> {
+    create_deck_from_mamo_with_progress(deck_id, None).await
 }
 
 /// Parse a MaMo URL and extract the deck UUID
@@ -1117,6 +1173,7 @@ pub struct MamoDeckEntry {
 
 /// Response from MaMo API when fetching user decks
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 pub struct MamoUserDecksResponse {
     pub decks: Vec<MamoDeckApiEntry>,
     pub total: Option<usize>,
@@ -1194,6 +1251,126 @@ pub async fn fetch_mamo_user_decks(username: &str) -> Result<Vec<MamoDeckEntry>>
     
     info!("Found {} decks for MaMo user '{}'", decks.len(), username);
     Ok(decks)
+}
+
+// ==================== Deck Hash Calculation ====================
+
+/// Calculate a deck hash from Forge deck content
+/// Algorithm (per MTG Replay Notation spec v1.1.0):
+/// 1. Extract cards from Main and Commander sections only (Sideboard excluded)
+/// 2. Collect all cards as "CardName:Quantity" pairs
+/// 3. Sort alphabetically
+/// 4. Concatenate into canonical string
+/// 5. Calculate SHA-256 hash
+/// 6. Return first 16 hex characters (64 bits)
+pub fn calculate_deck_hash(forge_content: &str) -> String {
+    let mut cards: Vec<(String, u32)> = Vec::new();
+    let mut current_section = "";
+    
+    for line in forge_content.lines() {
+        let line = line.trim();
+        
+        // Track section headers
+        if line.starts_with('[') && line.ends_with(']') {
+            current_section = line.trim_start_matches('[').trim_end_matches(']');
+            continue;
+        }
+        
+        // Skip non-card lines
+        if line.is_empty() || line.starts_with("Name") || line.contains('=') {
+            continue;
+        }
+        
+        // Only include Main and Commander sections (case-insensitive)
+        let section_lower = current_section.to_lowercase();
+        if section_lower != "main" && section_lower != "commander" {
+            continue;
+        }
+        
+        // Parse card line: "1 Card Name" or "1 Card Name|SET"
+        if let Some((qty, name)) = parse_card_line(line) {
+            // Check if card already exists in list
+            if let Some(existing) = cards.iter_mut().find(|(n, _)| n == &name) {
+                existing.1 += qty;
+            } else {
+                cards.push((name, qty));
+            }
+        }
+    }
+    
+    // Sort alphabetically by card name
+    cards.sort_by(|a, b| a.0.cmp(&b.0));
+    
+    // Create canonical string: "CardName:Qty,CardName:Qty,..."
+    let canonical: String = cards.iter()
+        .map(|(name, qty)| format!("{}:{}", name, qty))
+        .collect::<Vec<_>>()
+        .join(",");
+    
+    // Calculate SHA-256 hash
+    let mut hasher = Sha256::new();
+    hasher.update(canonical.as_bytes());
+    let result = hasher.finalize();
+    
+    // Return first 16 hex characters
+    format!("{:x}", result).chars().take(16).collect()
+}
+
+/// Parse a card line from Forge format: "1 Card Name" or "1 Card Name|SET"
+fn parse_card_line(line: &str) -> Option<(u32, String)> {
+    let line = line.trim();
+    if line.is_empty() {
+        return None;
+    }
+    
+    // Split on first space to get quantity
+    let parts: Vec<&str> = line.splitn(2, ' ').collect();
+    if parts.len() < 2 {
+        return None;
+    }
+    
+    let qty: u32 = parts[0].parse().ok()?;
+    let mut card_name = parts[1].to_string();
+    
+    // Remove set code if present: "Card Name|SET" -> "Card Name"
+    if let Some(pipe_idx) = card_name.find('|') {
+        card_name = card_name[..pipe_idx].to_string();
+    }
+    
+    // Clean up the card name
+    let card_name = card_name.trim().to_string();
+    if card_name.is_empty() {
+        return None;
+    }
+    
+    Some((qty, card_name))
+}
+
+/// Find an existing deck file by its hash
+/// Scans all .dck files in the deck directory and compares hashes
+fn find_deck_by_hash(target_hash: &str) -> Option<PathBuf> {
+    let deck_dir = get_deck_directory().ok()?;
+    
+    if !deck_dir.exists() {
+        return None;
+    }
+    
+    // Scan all .dck files
+    let entries = fs::read_dir(&deck_dir).ok()?;
+    
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().map(|e| e == "dck").unwrap_or(false) {
+            if let Ok(content) = fs::read_to_string(&path) {
+                let file_hash = calculate_deck_hash(&content);
+                if file_hash == target_hash {
+                    return Some(path);
+                }
+            }
+        }
+    }
+    
+    None
 }
 
 // ==================== File Operations ====================
@@ -1359,6 +1536,7 @@ fn format_card_line(card: &Card) -> String {
 
 /// Result of a single deck sync operation
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct DeckSyncResult {
     pub deck_name: String,
     pub status: SyncStatus,
@@ -1369,6 +1547,7 @@ pub struct DeckSyncResult {
 
 /// Status of a sync operation
 #[derive(Debug, Clone, PartialEq)]
+#[allow(dead_code)]
 pub enum SyncStatus {
     Updated,       // Deck was updated (old version renamed)
     AlreadyUpToDate,
@@ -1377,6 +1556,7 @@ pub enum SyncStatus {
     Skipped,       // Skipped (disabled or error checking)
 }
 
+#[allow(dead_code)]
 impl DeckSyncResult {
     pub fn updated(deck_name: String, old_file: PathBuf, new_file: PathBuf) -> Self {
         Self {
@@ -1727,6 +1907,107 @@ pub fn get_deck_directory_display() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ==================== Deck Hash Calculation Tests ====================
+    
+    #[test]
+    fn test_calculate_deck_hash_simple() {
+        let content = r#"[metadata]
+Name = Test Deck
+[Main]
+4 Lightning Bolt
+4 Mountain
+[Commander]
+1 Zurgo Helmsmasher
+[Sideboard]
+2 Pyroblast
+"#;
+        let hash = calculate_deck_hash(content);
+        assert_eq!(hash.len(), 16);
+        // Hash should be consistent
+        assert_eq!(calculate_deck_hash(content), hash);
+    }
+    
+    #[test]
+    fn test_calculate_deck_hash_excludes_sideboard() {
+        // Same main/commander, different sideboard = same hash
+        let content1 = r#"[Main]
+4 Lightning Bolt
+[Commander]
+1 Zurgo
+[Sideboard]
+2 Pyroblast
+"#;
+        let content2 = r#"[Main]
+4 Lightning Bolt
+[Commander]
+1 Zurgo
+[Sideboard]
+4 Blue Elemental Blast
+"#;
+        assert_eq!(calculate_deck_hash(content1), calculate_deck_hash(content2));
+    }
+    
+    #[test]
+    fn test_calculate_deck_hash_different_cards_different_hash() {
+        let content1 = r#"[Main]
+4 Lightning Bolt
+"#;
+        let content2 = r#"[Main]
+4 Shock
+"#;
+        assert_ne!(calculate_deck_hash(content1), calculate_deck_hash(content2));
+    }
+    
+    #[test]
+    fn test_calculate_deck_hash_order_independent() {
+        // Cards in different order should produce same hash (sorted alphabetically)
+        let content1 = r#"[Main]
+4 Lightning Bolt
+4 Mountain
+"#;
+        let content2 = r#"[Main]
+4 Mountain
+4 Lightning Bolt
+"#;
+        assert_eq!(calculate_deck_hash(content1), calculate_deck_hash(content2));
+    }
+    
+    #[test]
+    fn test_calculate_deck_hash_strips_set_code() {
+        // Set codes should be stripped, same card = same hash
+        let content1 = r#"[Main]
+4 Lightning Bolt|M20
+"#;
+        let content2 = r#"[Main]
+4 Lightning Bolt|M21
+"#;
+        assert_eq!(calculate_deck_hash(content1), calculate_deck_hash(content2));
+    }
+    
+    #[test]
+    fn test_parse_card_line_simple() {
+        let result = parse_card_line("4 Lightning Bolt");
+        assert_eq!(result, Some((4, "Lightning Bolt".to_string())));
+    }
+    
+    #[test]
+    fn test_parse_card_line_with_set() {
+        let result = parse_card_line("1 Zurgo Helmsmasher|KTK");
+        assert_eq!(result, Some((1, "Zurgo Helmsmasher".to_string())));
+    }
+    
+    #[test]
+    fn test_parse_card_line_with_set_and_number() {
+        let result = parse_card_line("2 Mountain|M20|123");
+        assert_eq!(result, Some((2, "Mountain".to_string())));
+    }
+    
+    #[test]
+    fn test_parse_card_line_empty() {
+        assert_eq!(parse_card_line(""), None);
+        assert_eq!(parse_card_line("   "), None);
+    }
 
     // ==================== Filename Sanitization Tests ====================
     
@@ -2475,8 +2756,9 @@ Name=Example Commander Deck
     #[ignore]
     async fn test_integration_list_moxfield_user_decks() {
         let username = "IceMagma";
+        let api_base_url = "https://mamo-magic.vercel.app";
         
-        let result = list_moxfield_user_decks(username).await;
+        let result = list_moxfield_user_decks(username, api_base_url).await;
         
         match result {
             Ok(decks) => {

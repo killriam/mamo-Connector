@@ -8,12 +8,14 @@ pub struct RegistrationOutcome {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)]
 pub enum RegistrationStatus {
     Registered,
     Failed,
     Skipped,
 }
 
+#[allow(dead_code)]
 impl RegistrationOutcome {
     pub fn registered(message: impl Into<String>) -> Self {
         Self {

@@ -1,4 +1,5 @@
 use anyhow::Result;
+use chrono::Local;
 use eframe::{NativeOptions, egui};
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
@@ -9,7 +10,7 @@ use crate::deck::{create_deck_from_moxfield, MoxfieldDeckEntry, MamoDeckEntry, D
 use rfd::FileDialog;
 use crate::deeplink::Deeplink;
 use crate::forge::{get_default_forge_path, validate_forge_path, launch_forge_from_settings};
-use crate::gamelog::{GameLogConfig, GameLogProcessResult, ScanSummary, get_default_forge_log_directory, validate_directory, scan_directory, process_new_logs, load_processed_files, save_processed_files, DeckMappings, UserDeck, fetch_my_decks, suggest_deck_matches, load_cached_decks, save_cached_decks, process_new_logs_with_filter, GameLogFilterOptions, preview_scan, FilePreviewInfo};
+use crate::gamelog::{GameLogConfig, GameLogProcessResult, ScanSummary, get_default_forge_log_directory, validate_directory, scan_directory, load_processed_files, save_processed_files, DeckMappings, fetch_my_decks, suggest_deck_matches, load_cached_decks, save_cached_decks, process_new_logs_with_filter, GameLogFilterOptions, preview_scan, FilePreviewInfo};
 use crate::registration::{RegistrationOutcome, RegistrationStatus};
 use crate::settings::{Settings, SavedLink, SavedLinkType};
 use crate::get_pending_command_path;
@@ -17,6 +18,7 @@ use crate::get_pending_command_path;
 #[derive(Clone, PartialEq, Eq)]
 enum Tab {
     Status,
+    Activity,
     Import,
     Sync,
     GameLogs,
@@ -65,6 +67,7 @@ struct SyncState {
 
 /// State for the game log tab
 #[derive(Clone, Default)]
+#[allow(dead_code)]
 struct GameLogState {
     /// Is a scan currently running
     is_scanning: bool,
@@ -125,7 +128,87 @@ struct SettingsState {
     status_message: Option<String>,
 }
 
+/// A single log entry for the activity log
 #[derive(Clone)]
+struct ActivityLogEntry {
+    timestamp: String,
+    message: String,
+    is_error: bool,
+    is_success: bool,
+}
+
+impl ActivityLogEntry {
+    fn info(message: impl Into<String>) -> Self {
+        Self {
+            timestamp: Local::now().format("%H:%M:%S").to_string(),
+            message: message.into(),
+            is_error: false,
+            is_success: false,
+        }
+    }
+    
+    fn success(message: impl Into<String>) -> Self {
+        Self {
+            timestamp: Local::now().format("%H:%M:%S").to_string(),
+            message: message.into(),
+            is_error: false,
+            is_success: true,
+        }
+    }
+    
+    fn error(message: impl Into<String>) -> Self {
+        Self {
+            timestamp: Local::now().format("%H:%M:%S").to_string(),
+            message: message.into(),
+            is_error: true,
+            is_success: false,
+        }
+    }
+}
+
+/// State for the activity log panel
+#[derive(Clone, Default)]
+struct ActivityLogState {
+    /// Log entries (newest first)
+    entries: Vec<ActivityLogEntry>,
+    /// Maximum number of entries to keep
+    max_entries: usize,
+}
+
+impl ActivityLogState {
+    fn new() -> Self {
+        Self {
+            entries: Vec::new(),
+            max_entries: 100,
+        }
+    }
+    
+    fn log(&mut self, entry: ActivityLogEntry) {
+        self.entries.insert(0, entry);
+        if self.entries.len() > self.max_entries {
+            self.entries.truncate(self.max_entries);
+        }
+    }
+    
+    fn log_info(&mut self, message: impl Into<String>) {
+        self.log(ActivityLogEntry::info(message));
+    }
+    
+    fn log_success(&mut self, message: impl Into<String>) {
+        self.log(ActivityLogEntry::success(message));
+    }
+    
+    fn log_error(&mut self, message: impl Into<String>) {
+        self.log(ActivityLogEntry::error(message));
+    }
+    
+    fn clear(&mut self) {
+        self.entries.clear();
+    }
+}
+
+#[derive(Clone)]
+#[allow(dead_code)]
 struct AppState {
     registration: RegistrationOutcome,
     args: Vec<String>,
@@ -188,6 +271,7 @@ struct LauncherApp {
     sync_state: Arc<Mutex<SyncState>>,
     gamelog_state: Arc<Mutex<GameLogState>>,
     settings_state: Arc<Mutex<SettingsState>>,
+    activity_log: Arc<Mutex<ActivityLogState>>,
     settings: Arc<Mutex<Settings>>,
     last_pending_check: Instant,
 }
@@ -233,14 +317,82 @@ impl LauncherApp {
             status_message: None,
         };
         
+        // Initialize activity log with startup entry
+        let mut activity_log = ActivityLogState::new();
+        activity_log.log_info("MaMo Connector started");
+        
+        // Log the deeplink and its result if present
+        let started_with_deeplink = state.deeplink.is_some();
+        if let Some(ref dl) = state.deeplink {
+            activity_log.log_info(format!("Received command: {}", dl.raw));
+            activity_log.log_info(format!("Processing action: {}", dl.action));
+            if let Some(ref deck_id) = dl.deck_id {
+                activity_log.log_info(format!("Deck ID: {}", deck_id));
+            }
+        }
+        
+        // Log the command result if present
+        if let Some(ref result) = state.command_result {
+            match result {
+                CommandResult::DeckCreated(deck_result) => {
+                    if deck_result.success {
+                        activity_log.log_success(&deck_result.message);
+                    } else {
+                        activity_log.log_error(&deck_result.message);
+                    }
+                }
+                CommandResult::DeckCreatedAndLaunched(deck_result, forge_result) => {
+                    if deck_result.success {
+                        activity_log.log_success(&deck_result.message);
+                    } else {
+                        activity_log.log_error(&deck_result.message);
+                    }
+                    if forge_result.success {
+                        activity_log.log_success(&forge_result.message);
+                    } else {
+                        activity_log.log_error(&forge_result.message);
+                    }
+                }
+                CommandResult::ForgeLaunched(forge_result) => {
+                    if forge_result.success {
+                        activity_log.log_success(&forge_result.message);
+                    } else {
+                        activity_log.log_error(&forge_result.message);
+                    }
+                }
+                CommandResult::AuthTokenSaved(msg) => {
+                    activity_log.log_success(msg);
+                }
+                CommandResult::Error(err) => {
+                    activity_log.log_error(err);
+                }
+                CommandResult::UnknownAction(action) => {
+                    activity_log.log_error(format!("Unknown action: {}", action));
+                }
+                CommandResult::MissingParameters(msg) => {
+                    activity_log.log_error(format!("Missing parameters: {}", msg));
+                }
+                CommandResult::UserDecksImported(result) => {
+                    activity_log.log_info(&result.message);
+                }
+                CommandResult::UserDecksList(decks) => {
+                    activity_log.log_info(format!("Found {} decks", decks.len()));
+                }
+            }
+        }
+        
+        // Switch to Activity tab if started with a deeplink
+        let initial_tab = if started_with_deeplink { Tab::Activity } else { Tab::Import };
+        
         Self {
             state,
             url_input: String::new(),
-            current_tab: Tab::Import,
+            current_tab: initial_tab,
             import_state: Arc::new(Mutex::new(ImportState::default())),
             sync_state: Arc::new(Mutex::new(SyncState::default())),
             gamelog_state: Arc::new(Mutex::new(gamelog_state)),
             settings_state: Arc::new(Mutex::new(settings_state)),
+            activity_log: Arc::new(Mutex::new(activity_log)),
             settings: Arc::new(Mutex::new(settings)),
             last_pending_check: Instant::now(),
         }
@@ -289,6 +441,9 @@ impl eframe::App for LauncherApp {
                     if ui.selectable_label(self.current_tab == Tab::GameLogs, "Game Logs").clicked() {
                         self.current_tab = Tab::GameLogs;
                     }
+                    if ui.selectable_label(self.current_tab == Tab::Activity, "📋 Activity").clicked() {
+                        self.current_tab = Tab::Activity;
+                    }
                     if ui.selectable_label(self.current_tab == Tab::Settings, "⚙ Settings").clicked() {
                         self.current_tab = Tab::Settings;
                     }
@@ -298,6 +453,7 @@ impl eframe::App for LauncherApp {
                 // Tab content
                 match self.current_tab {
                     Tab::Status => self.render_status_tab(ui),
+                    Tab::Activity => self.render_activity_tab(ui),
                     Tab::Import => self.render_import_tab(ui, ctx),
                     Tab::Sync => self.render_sync_tab(ui, ctx),
                     Tab::GameLogs => self.render_gamelog_tab(ui, ctx),
@@ -310,7 +466,7 @@ impl eframe::App for LauncherApp {
 impl LauncherApp {
     /// Check for pending commands from secondary instances
     fn check_pending_commands(&mut self, ctx: &egui::Context) {
-        use crate::commands;
+        use crate::commands::{self, SharedLogCollector};
         use crate::deeplink;
         use log::info;
         
@@ -321,16 +477,96 @@ impl LauncherApp {
                 if !raw_command.is_empty() {
                     info!("Processing pending command: {}", raw_command);
                     
+                    // Switch to Activity tab to show progress
+                    self.current_tab = Tab::Activity;
+                    
+                    // Log the incoming command
+                    if let Ok(mut log) = self.activity_log.lock() {
+                        log.log_info(format!("Received command: {}", raw_command));
+                    }
+                    
                     // Parse the deeplink
                     if let Some(deeplink) = deeplink::parse_deeplink(&[raw_command.to_string()], "mamoConnector://") {
+                        // Log what we're doing
+                        if let Ok(mut log) = self.activity_log.lock() {
+                            log.log_info(format!("Processing action: {}", deeplink.action));
+                            if let Some(ref deck_id) = deeplink.deck_id {
+                                log.log_info(format!("Deck ID: {}", deck_id));
+                            }
+                        }
+                        
+                        // Create a log collector for real-time progress updates
+                        let log_collector: SharedLogCollector = Arc::new(Mutex::new(Vec::new()));
+                        
                         // Handle the command in a background thread
                         let settings = self.settings.clone();
                         let settings_state = self.settings_state.clone();
+                        let activity_log = self.activity_log.clone();
+                        let log_collector_clone = log_collector.clone();
                         let ctx_clone = ctx.clone();
                         
                         std::thread::spawn(move || {
                             let runtime = tokio::runtime::Runtime::new().unwrap();
-                            let result = runtime.block_on(commands::handle_command(&deeplink));
+                            let result = runtime.block_on(commands::handle_command_with_logger(&deeplink, Some(log_collector_clone.clone())));
+                            
+                            // Transfer collected logs to activity log
+                            if let Ok(collected_logs) = log_collector_clone.lock() {
+                                if let Ok(mut log) = activity_log.lock() {
+                                    for msg in collected_logs.iter() {
+                                        log.log_info(msg.as_str());
+                                    }
+                                }
+                            }
+                            
+                            // Log the final result
+                            if let Ok(mut log) = activity_log.lock() {
+                                match &result {
+                                    commands::CommandResult::DeckCreated(deck_result) => {
+                                        if deck_result.success {
+                                            log.log_success(&deck_result.message);
+                                        } else {
+                                            log.log_error(&deck_result.message);
+                                        }
+                                    }
+                                    commands::CommandResult::DeckCreatedAndLaunched(deck_result, forge_result) => {
+                                        if deck_result.success {
+                                            log.log_success(&deck_result.message);
+                                        } else {
+                                            log.log_error(&deck_result.message);
+                                        }
+                                        if forge_result.success {
+                                            log.log_success(&forge_result.message);
+                                        } else {
+                                            log.log_error(&forge_result.message);
+                                        }
+                                    }
+                                    commands::CommandResult::ForgeLaunched(forge_result) => {
+                                        if forge_result.success {
+                                            log.log_success(&forge_result.message);
+                                        } else {
+                                            log.log_error(&forge_result.message);
+                                        }
+                                    }
+                                    commands::CommandResult::AuthTokenSaved(msg) => {
+                                        log.log_success(msg);
+                                    }
+                                    commands::CommandResult::Error(err) => {
+                                        log.log_error(err);
+                                    }
+                                    commands::CommandResult::UnknownAction(action) => {
+                                        log.log_error(format!("Unknown action: {}", action));
+                                    }
+                                    commands::CommandResult::MissingParameters(msg) => {
+                                        log.log_error(format!("Missing parameters: {}", msg));
+                                    }
+                                    commands::CommandResult::UserDecksImported(result) => {
+                                        log.log_info(&result.message);
+                                    }
+                                    commands::CommandResult::UserDecksList(decks) => {
+                                        log.log_info(format!("Found {} decks", decks.len()));
+                                    }
+                                }
+                            }
                             
                             // Handle auth token saved result
                             if let commands::CommandResult::AuthTokenSaved(ref token) = result {
@@ -500,6 +736,68 @@ impl LauncherApp {
         });
     }
     
+    fn render_activity_tab(&self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.heading("Activity Log");
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.button("Clear").clicked() {
+                    if let Ok(mut log) = self.activity_log.lock() {
+                        log.clear();
+                    }
+                }
+            });
+        });
+        ui.separator();
+        ui.small("Shows progress when processing deeplink commands (e.g., playtest links)");
+        ui.add_space(8.0);
+        
+        // Scrollable log area
+        let available_height = ui.available_height().max(200.0);
+        egui::ScrollArea::vertical()
+            .max_height(available_height)
+            .auto_shrink([false, false])
+            .stick_to_bottom(false)
+            .show(ui, |ui| {
+                if let Ok(log) = self.activity_log.lock() {
+                    if log.entries.is_empty() {
+                        ui.vertical_centered(|ui| {
+                            ui.add_space(40.0);
+                            ui.label(egui::RichText::new("No activity yet").italics().color(egui::Color32::GRAY));
+                            ui.add_space(8.0);
+                            ui.small("Activity will appear here when you use playtest links");
+                        });
+                    } else {
+                        for entry in &log.entries {
+                            ui.horizontal(|ui| {
+                                ui.label(egui::RichText::new(&entry.timestamp)
+                                    .monospace()
+                                    .color(egui::Color32::GRAY));
+                                
+                                let color = if entry.is_error {
+                                    egui::Color32::from_rgb(176, 0, 32)
+                                } else if entry.is_success {
+                                    egui::Color32::from_rgb(0, 128, 0)
+                                } else {
+                                    egui::Color32::BLACK
+                                };
+                                
+                                let prefix = if entry.is_error {
+                                    "❌ "
+                                } else if entry.is_success {
+                                    "✅ "
+                                } else {
+                                    "ℹ️ "
+                                };
+                                
+                                ui.label(egui::RichText::new(format!("{}{}", prefix, &entry.message))
+                                    .color(color));
+                            });
+                        }
+                    }
+                }
+            });
+    }
+    
     fn detect_url_type(&self, url: &str) -> UrlType {
         let url = url.trim();
         
@@ -667,7 +965,7 @@ impl LauncherApp {
             )
         };
         
-        let has_decks = has_moxfield_decks || has_mamo_decks;
+        let _has_decks = has_moxfield_decks || has_mamo_decks;
         
         // Main action button based on URL type
         match &url_type {
@@ -735,7 +1033,7 @@ impl LauncherApp {
                 .id_source("mamo_decks_scroll")
                 .max_height(available_height.max(100.0))
                 .show(ui, |ui: &mut egui::Ui| {
-                    for (i, deck_id, name, format, is_selected, local_status, commander) in &mamo_decks_info {
+                    for (i, _deck_id, name, format, is_selected, local_status, commander) in &mamo_decks_info {
                         let mut selected = *is_selected;
                         ui.horizontal(|ui| {
                             if ui.checkbox(&mut selected, "").changed() {

@@ -27,6 +27,7 @@ use std::time::UNIX_EPOCH;
 
 /// Status of the game log watcher
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)]
 pub enum WatcherStatus {
     Stopped,
     Running,
@@ -86,6 +87,7 @@ pub struct ScanSummary {
 
 /// State for the game log watcher
 #[derive(Debug, Clone, Default)]
+#[allow(dead_code)]
 pub struct GameLogWatcherState {
     /// Current status of the watcher
     pub status: Option<WatcherStatus>,
@@ -614,6 +616,7 @@ impl GameLogFilterOptions {
 }
 
 /// Process new game logs from the configured directory
+#[allow(dead_code)]
 pub async fn process_new_logs(
     config: &GameLogConfig,
     processed_files: &Arc<Mutex<HashSet<String>>>,
@@ -633,7 +636,7 @@ pub async fn process_new_logs_with_filter(
     let files = scan_directory(config)?;
     summary.total_files_found = files.len();
     
-    let mut skipped_by_filter = 0usize;
+    let mut _skipped_by_filter = 0usize;
     
     for file_path in files {
         let filename = file_path
@@ -653,7 +656,7 @@ pub async fn process_new_logs_with_filter(
         // Check days filter based on file modification time
         let modified_time = file_path.metadata().ok().and_then(|m| m.modified().ok());
         if !filter.passes_days_filter(modified_time) {
-            skipped_by_filter += 1;
+            _skipped_by_filter += 1;
             continue;
         }
         
@@ -675,7 +678,7 @@ pub async fn process_new_logs_with_filter(
         
         // Check deck filter
         if !filter.passes_deck_filter(deck_identifier.as_deref()) {
-            skipped_by_filter += 1;
+            _skipped_by_filter += 1;
             continue;
         }
         
@@ -741,6 +744,7 @@ pub fn validate_directory(path: &str) -> Result<bool> {
 }
 
 /// Get file count in a directory matching extensions
+#[allow(dead_code)]
 pub fn get_file_count(config: &GameLogConfig) -> Result<usize> {
     let files = scan_directory(config)?;
     Ok(files.len())
@@ -830,6 +834,7 @@ pub struct DeckMappings {
     pub updated_at: Option<String>,
 }
 
+#[allow(dead_code)]
 impl DeckMappings {
     /// Load mappings from disk
     pub fn load() -> Result<Self> {
