@@ -437,9 +437,8 @@ fn format_moxfield_card(card_entry: &serde_json::Value) -> Option<String> {
     let card = card_entry.get("card")?;
     let full_name = card.get("name")?.as_str()?;
     
-    // For double-faced cards like "Brightclimb Pathway // Grimclimb Pathway",
-    // Forge only recognizes the front face name
-    let name = full_name.split(" // ").next().unwrap_or(full_name);
+    // For double-faced cards, Forge only recognizes the front face name
+    let name = front_face_name(full_name);
     
     let set = card.get("set")?.as_str()?.to_uppercase();
     let collector_number = card.get("cn").and_then(|c| c.as_str()).unwrap_or("1");
@@ -794,9 +793,8 @@ fn convert_archidekt_to_forge(deck_name: &str, deck: &ArchidektDeck) -> Result<S
         let is_sideboard = card.categories.iter()
             .any(|c| c.to_lowercase().contains("sideboard") || c.to_lowercase().contains("maybeboard"));
         
-        // Take only the front face for double-faced cards
-        let name = card.card.oracle_card.name.split(" // ").next()
-            .unwrap_or(&card.card.oracle_card.name);
+        // For double-faced cards, Forge only recognizes the front face name
+        let name = front_face_name(&card.card.oracle_card.name);
         let set = card.card.edition.edition_code.to_uppercase();
         let line = format!("{} {}|{}|1", card.quantity, name, set);
         
@@ -967,12 +965,7 @@ fn parse_deckstats_card_line(line: &str) -> Option<String> {
     }
     
     let quantity: u32 = parts[0].parse().ok()?;
-    let mut card_name = parts[1].to_string();
-    
-    // Take only the front face for double-faced cards
-    if let Some(pos) = card_name.find(" // ") {
-        card_name = card_name[..pos].to_string();
-    }
+    let mut card_name = front_face_name(parts[1]).to_string();
     
     // Remove any set info in brackets [SET]
     if let Some(pos) = card_name.find(" [") {
@@ -1097,6 +1090,10 @@ pub async fn create_deck_from_mamo_with_progress(
             existing_path,
         ));
     }
+    
+    // Post-process: strip double-faced card back faces (Forge only uses front face)
+    log("Processing double-faced card names...");
+    let body = post_process_forge_content(&body);
     
     log("Writing deck file...");
     // Content is already in Forge format, write directly
@@ -1504,6 +1501,44 @@ fn sanitize_filename(name: &str) -> String {
         .collect::<String>()
         .trim()
         .to_string()
+}
+
+/// For double-faced cards like "Brightclimb Pathway // Grimclimb Pathway",
+/// Forge only recognizes the front face name. This returns just the front face.
+fn front_face_name(full_name: &str) -> &str {
+    full_name.split(" // ").next().unwrap_or(full_name)
+}
+
+/// Post-process Forge deck content to fix double-faced card names.
+/// Replaces "Qty Front Face // Back Face|SET|CN" with "Qty Front Face|SET|CN"
+/// and "Qty Front Face // Back Face" with "Qty Front Face"
+fn post_process_forge_content(content: &str) -> String {
+    content.lines().map(|line| {
+        let trimmed = line.trim();
+        // Skip non-card lines (sections, metadata, empty)
+        if trimmed.is_empty() || trimmed.starts_with('[') || trimmed.contains('=') {
+            return line.to_string();
+        }
+        // Try to parse as a card line: "Qty CardName..." 
+        if let Some(space_idx) = trimmed.find(' ') {
+            let qty_str = &trimmed[..space_idx];
+            if qty_str.chars().all(|c| c.is_ascii_digit()) {
+                let rest = &trimmed[space_idx + 1..];
+                // Split off set info (pipe-separated): "CardName|SET|CN"
+                if let Some(pipe_idx) = rest.find('|') {
+                    let card_name = &rest[..pipe_idx];
+                    let set_info = &rest[pipe_idx..]; // includes leading '|'
+                    let front = front_face_name(card_name);
+                    return format!("{} {}{}", qty_str, front, set_info);
+                } else {
+                    // No set info, just "Qty CardName"
+                    let front = front_face_name(rest);
+                    return format!("{} {}", qty_str, front);
+                }
+            }
+        }
+        line.to_string()
+    }).collect::<Vec<_>>().join("\n")
 }
 
 fn format_deck_file(deck_data: &DeckData) -> String {
