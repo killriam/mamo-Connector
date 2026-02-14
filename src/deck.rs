@@ -1393,6 +1393,8 @@ fn find_deck_by_hash(target_hash: &str) -> Option<PathBuf> {
 // ==================== File Operations ====================
 
 /// Write deck content directly to file (content already in forge format from API)
+/// If an existing deck file with the same name exists, it is renamed with an "archive_" prefix
+/// so the old version is preserved.
 async fn write_deck_file(deck_name: &str, content: &str) -> Result<PathBuf> {
     let deck_dir = get_deck_directory()?;
     
@@ -1406,6 +1408,31 @@ async fn write_deck_file(deck_name: &str, content: &str) -> Result<PathBuf> {
     // Create deck file path (sanitize the name for filesystem)
     let sanitized_name = sanitize_filename(deck_name);
     let deck_file_path = deck_dir.join(format!("{}.dck", sanitized_name));
+
+    // If an existing deck file exists, archive it with "archive_" prefix
+    if deck_file_path.exists() {
+        // Remove any previous archive of this same deck to avoid accumulating old archives
+        // Find all existing archive files for this deck name
+        if let Ok(entries) = fs::read_dir(&deck_dir) {
+            let archive_prefix = format!("archive_{}", sanitized_name);
+            for entry in entries.flatten() {
+                let file_name = entry.file_name().to_string_lossy().to_string();
+                if file_name.starts_with(&archive_prefix) && file_name.ends_with(".dck") {
+                    if let Err(e) = fs::remove_file(entry.path()) {
+                        warn!("Failed to remove old archive file {:?}: {}", entry.path(), e);
+                    } else {
+                        info!("Removed old archive: {:?}", entry.path());
+                    }
+                }
+            }
+        }
+
+        let archive_name = format!("archive_{}.dck", sanitized_name);
+        let archive_path = deck_dir.join(&archive_name);
+        fs::rename(&deck_file_path, &archive_path)
+            .with_context(|| format!("Failed to archive old deck file {:?} -> {:?}", deck_file_path, archive_path))?;
+        info!("Archived old deck version: {:?} -> {:?}", deck_file_path, archive_path);
+    }
 
     // Write deck file with content from API
     fs::write(&deck_file_path, content)
