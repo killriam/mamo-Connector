@@ -272,7 +272,7 @@ pub async fn create_deck_from_moxfield(deck_id: &str) -> Result<DeckCreationResu
     let forge_content = convert_moxfield_to_forge(&full_name, &body)?;
     
     // Write the deck file with full name including author/date
-    let deck_path = write_deck_file(&full_name, &forge_content).await
+    let (deck_path, _archived) = write_deck_file(&full_name, &forge_content).await
         .context("Failed to create deck file")?;
     
     Ok(DeckCreationResult::success(
@@ -455,7 +455,7 @@ pub async fn create_deck_from_id(deck_id: &str, api_base_url: &str) -> Result<De
         .context("Failed to fetch deck data from API")?;
 
     // Create deck file with the content from API
-    let deck_path = write_deck_file(&export_response.name, &export_response.content).await
+    let (deck_path, _archived) = write_deck_file(&export_response.name, &export_response.content).await
         .context("Failed to create deck file")?;
 
     Ok(DeckCreationResult::success(
@@ -764,7 +764,7 @@ pub async fn create_deck_from_archidekt(deck_id: &str) -> Result<DeckCreationRes
     let forge_content = convert_archidekt_to_forge(&full_name, &deck)?;
     
     // Write the deck file
-    let deck_path = write_deck_file(&full_name, &forge_content).await
+    let (deck_path, _archived) = write_deck_file(&full_name, &forge_content).await
         .context("Failed to create deck file")?;
     
     Ok(DeckCreationResult::success(
@@ -882,7 +882,7 @@ pub async fn create_deck_from_deckstats(owner_id: &str, deck_id: &str) -> Result
     let forge_content = convert_deckstats_to_forge(&full_name, &body)?;
     
     // Write the deck file
-    let deck_path = write_deck_file(&full_name, &forge_content).await
+    let (deck_path, _archived) = write_deck_file(&full_name, &forge_content).await
         .context("Failed to create deck file")?;
     
     Ok(DeckCreationResult::success(
@@ -1076,20 +1076,10 @@ pub async fn create_deck_from_mamo_with_progress(
     
     log(&format!("Deck name: {}", deck_name));
     
-    // Calculate deck hash to check if deck already exists
+    // Calculate deck hash to check if deck content changed
     log("Calculating deck hash...");
     let new_deck_hash = calculate_deck_hash(&body);
     log(&format!("Deck hash: {}", new_deck_hash));
-    
-    // Check if a deck with this hash already exists locally
-    log("Checking for existing deck...");
-    if let Some(existing_path) = find_deck_by_hash(&new_deck_hash) {
-        log(&format!("Deck already exists at: {:?}", existing_path));
-        return Ok(DeckCreationResult::success(
-            format!("Deck '{}' already exists locally (no download needed)", deck_name),
-            existing_path,
-        ));
-    }
     
     // Post-process: strip double-faced card back faces (Forge only uses front face)
     log("Processing double-faced card names...");
@@ -1097,8 +1087,18 @@ pub async fn create_deck_from_mamo_with_progress(
     
     log("Writing deck file...");
     // Content is already in Forge format, write directly
-    let deck_path = write_deck_file(deck_name, &body).await
+    // write_deck_file renames any existing versions with "Archived_" prefix
+    let (deck_path, archived_files) = write_deck_file(deck_name, &body).await
         .context("Failed to create deck file")?;
+    
+    // Log archived old versions in the UI progress
+    for (archived_name, same_hash) in &archived_files {
+        if *same_hash {
+            log(&format!("📦 Archived old version (same deck content): {}", archived_name));
+        } else {
+            log(&format!("📦 Archived old version: {}", archived_name));
+        }
+    }
     
     log(&format!("Deck saved to: {:?}", deck_path));
     
@@ -1393,9 +1393,10 @@ fn find_deck_by_hash(target_hash: &str) -> Option<PathBuf> {
 // ==================== File Operations ====================
 
 /// Write deck content directly to file (content already in forge format from API)
-/// If an existing deck file with the same name exists, it is renamed with an "archive_" prefix
-/// so the old version is preserved.
-async fn write_deck_file(deck_name: &str, content: &str) -> Result<PathBuf> {
+/// Archives any existing versions of the same deck (even with different dates in the name)
+/// by renaming them with an "Archived_" prefix.
+/// Returns (new_file_path, list of (archived_file_name, same_hash)).
+async fn write_deck_file(deck_name: &str, content: &str) -> Result<(PathBuf, Vec<(String, bool)>)> {
     let deck_dir = get_deck_directory()?;
     
     // Ensure the directory exists
@@ -1409,29 +1410,74 @@ async fn write_deck_file(deck_name: &str, content: &str) -> Result<PathBuf> {
     let sanitized_name = sanitize_filename(deck_name);
     let deck_file_path = deck_dir.join(format!("{}.dck", sanitized_name));
 
-    // If an existing deck file exists, archive it with "archive_" prefix
-    if deck_file_path.exists() {
-        // Remove any previous archive of this same deck to avoid accumulating old archives
-        // Find all existing archive files for this deck name
-        if let Ok(entries) = fs::read_dir(&deck_dir) {
-            let archive_prefix = format!("archive_{}", sanitized_name);
-            for entry in entries.flatten() {
-                let file_name = entry.file_name().to_string_lossy().to_string();
-                if file_name.starts_with(&archive_prefix) && file_name.ends_with(".dck") {
+    // Calculate hash of the new content for comparison
+    let new_hash = calculate_deck_hash(content);
+
+    // Extract the base deck name without the date suffix, e.g.
+    // "killriam - Welcome to the Capital of Karl Marx (2026-02-15)" -> "killriam - Welcome to the Capital of Karl Marx"
+    // This allows us to find and archive old versions with different dates.
+    let base_name = if let Some(paren_pos) = sanitized_name.rfind(" (") {
+        // Verify it looks like a date pattern: " (YYYY-MM-DD)"
+        let after_paren = &sanitized_name[paren_pos..];
+        if after_paren.len() >= 12 && after_paren.ends_with(')') {
+            sanitized_name[..paren_pos].to_string()
+        } else {
+            sanitized_name.clone()
+        }
+    } else {
+        sanitized_name.clone()
+    };
+
+    // Archive any existing versions of this deck (same base name, any date)
+    // Rename them with "Archived_" prefix so they stay in the same directory but are visually distinct
+    let mut archived_files: Vec<(String, bool)> = Vec::new();
+    if let Ok(entries) = fs::read_dir(&deck_dir) {
+        for entry in entries.flatten() {
+            let file_name = entry.file_name().to_string_lossy().to_string();
+            
+            // Only look at .dck files (skip directories, other files)
+            if !file_name.ends_with(".dck") {
+                continue;
+            }
+            
+            // Skip files that are already archived (any legacy or current prefix)
+            if file_name.starts_with("Archived_") 
+                || file_name.starts_with("_archive_") 
+                || file_name.starts_with("archive_") 
+                || file_name.starts_with("PASTVersionS_") 
+            {
+                // Clean up old archive of this deck to avoid accumulation
+                if file_name.contains(&base_name) {
                     if let Err(e) = fs::remove_file(entry.path()) {
-                        warn!("Failed to remove old archive file {:?}: {}", entry.path(), e);
+                        warn!("Failed to remove old archive {:?}: {}", entry.path(), e);
                     } else {
-                        info!("Removed old archive: {:?}", entry.path());
+                        info!("Removed old archive: {}", file_name);
                     }
+                }
+                continue;
+            }
+            
+            // Check if this is an existing version of the same deck (matching base name)
+            if file_name.starts_with(&base_name) {
+                let path = entry.path();
+                
+                // Compare hash to detect if content actually changed
+                let old_hash = fs::read_to_string(&path)
+                    .map(|old_content| calculate_deck_hash(&old_content))
+                    .unwrap_or_default();
+                let same_hash = !old_hash.is_empty() && old_hash == new_hash;
+                
+                // Rename with "Archived_" prefix
+                let archived_name = format!("Archived_{}", file_name);
+                let archived_path = deck_dir.join(&archived_name);
+                if let Err(e) = fs::rename(&path, &archived_path) {
+                    warn!("Failed to archive {:?}: {}", path, e);
+                } else {
+                    info!("Archived old deck version: {} -> {}", file_name, archived_name);
+                    archived_files.push((file_name.clone(), same_hash));
                 }
             }
         }
-
-        let archive_name = format!("archive_{}.dck", sanitized_name);
-        let archive_path = deck_dir.join(&archive_name);
-        fs::rename(&deck_file_path, &archive_path)
-            .with_context(|| format!("Failed to archive old deck file {:?} -> {:?}", deck_file_path, archive_path))?;
-        info!("Archived old deck version: {:?} -> {:?}", deck_file_path, archive_path);
     }
 
     // Write deck file with content from API
@@ -1439,7 +1485,7 @@ async fn write_deck_file(deck_name: &str, content: &str) -> Result<PathBuf> {
         .with_context(|| format!("Failed to write deck file: {:?}", deck_file_path))?;
 
     info!("Successfully created deck file: {:?}", deck_file_path);
-    Ok(deck_file_path)
+    Ok((deck_file_path, archived_files))
 }
 
 /// Legacy function to fetch deck data as structured JSON (kept for compatibility)
@@ -1691,8 +1737,21 @@ impl DeckSyncResult {
     }
 }
 
-/// Prefix for archived old deck versions
-const PAST_VERSIONS_PREFIX: &str = "PASTVersionS_";
+/// Rename a deck file with "Archived_" prefix in the same directory.
+/// Returns the new path of the archived file.
+fn archive_deck_with_prefix(deck_path: &std::path::Path) -> Result<PathBuf> {
+    let deck_dir = deck_path.parent()
+        .ok_or_else(|| anyhow::anyhow!("Cannot determine parent directory of {:?}", deck_path))?;
+    let file_name = deck_path.file_name()
+        .ok_or_else(|| anyhow::anyhow!("Cannot determine filename of {:?}", deck_path))?
+        .to_string_lossy();
+    let archived_name = format!("Archived_{}", file_name);
+    let archived_path = deck_dir.join(&archived_name);
+    fs::rename(deck_path, &archived_path)
+        .with_context(|| format!("Failed to archive {:?} -> {:?}", deck_path, archived_path))?;
+    info!("Archived old deck: {} -> {}", file_name, archived_name);
+    Ok(archived_path)
+}
 
 /// Sync a single Moxfield deck - check if newer and update if needed
 pub async fn sync_moxfield_deck(deck_id: &str) -> Result<DeckSyncResult> {
@@ -1733,22 +1792,13 @@ pub async fn sync_moxfield_deck(deck_id: &str) -> Result<DeckSyncResult> {
         info!("Deck '{}' needs update (local: {:?}, moxfield: {})", 
               deck.name, &existing_date, moxfield_date);
         
-        // Rename old file with PAST_VERSIONS_PREFIX
-        let old_filename = existing_path.file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("unknown.dck");
-        let archived_path = existing_path.parent()
-            .unwrap_or(&deck_dir)
-            .join(format!("{}{}", PAST_VERSIONS_PREFIX, old_filename));
-        
-        fs::rename(&existing_path, &archived_path)
-            .with_context(|| format!("Failed to archive old deck: {:?}", existing_path))?;
-        info!("Archived old version to: {:?}", archived_path);
+        // Move old file to _archive subdirectory
+        let archived_path = archive_deck_with_prefix(&existing_path)?;
         
         // Download the new version
         let full_name = format!("{} - {} ({})", author, deck.name, moxfield_date);
         let forge_content = convert_moxfield_to_forge(&full_name, &body)?;
-        let new_path = write_deck_file(&full_name, &forge_content).await?;
+        let (new_path, _) = write_deck_file(&full_name, &forge_content).await?;
         
         Ok(DeckSyncResult::updated(deck.name, archived_path, new_path))
     } else {
@@ -1757,7 +1807,7 @@ pub async fn sync_moxfield_deck(deck_id: &str) -> Result<DeckSyncResult> {
         
         let full_name = format!("{} - {} ({})", author, deck.name, moxfield_date);
         let forge_content = convert_moxfield_to_forge(&full_name, &body)?;
-        let new_path = write_deck_file(&full_name, &forge_content).await?;
+        let (new_path, _) = write_deck_file(&full_name, &forge_content).await?;
         
         Ok(DeckSyncResult::new_downloaded(deck.name, new_path))
     }
@@ -1811,25 +1861,18 @@ pub async fn sync_archidekt_deck(deck_id: &str) -> Result<DeckSyncResult> {
             }
         }
         
-        // Archive old and download new
-        let old_filename = existing_path.file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("unknown.dck");
-        let archived_path = existing_path.parent()
-            .unwrap_or(&deck_dir)
-            .join(format!("{}{}", PAST_VERSIONS_PREFIX, old_filename));
-        
-        fs::rename(&existing_path, &archived_path)?;
+        // Move old file to _archive subdirectory
+        let archived_path = archive_deck_with_prefix(&existing_path)?;
         
         let full_name = format!("{} - {} ({})", author, deck.name, archidekt_date);
         let forge_content = convert_archidekt_to_forge(&full_name, &deck)?;
-        let new_path = write_deck_file(&full_name, &forge_content).await?;
+        let (new_path, _) = write_deck_file(&full_name, &forge_content).await?;
         
         Ok(DeckSyncResult::updated(deck.name, archived_path, new_path))
     } else {
         let full_name = format!("{} - {} ({})", author, deck.name, archidekt_date);
         let forge_content = convert_archidekt_to_forge(&full_name, &deck)?;
-        let new_path = write_deck_file(&full_name, &forge_content).await?;
+        let (new_path, _) = write_deck_file(&full_name, &forge_content).await?;
         
         Ok(DeckSyncResult::new_downloaded(deck.name, new_path))
     }
@@ -1861,23 +1904,16 @@ pub async fn sync_deckstats_deck(owner_id: &str, deck_id: &str) -> Result<DeckSy
     let (existing_file, _) = find_existing_deck_file("Deckstats", deck_name, &deck_dir)?;
     
     if let Some(existing_path) = existing_file {
-        // Archive old version
-        let old_filename = existing_path.file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("unknown.dck");
-        let archived_path = existing_path.parent()
-            .unwrap_or(&deck_dir)
-            .join(format!("{}{}", PAST_VERSIONS_PREFIX, old_filename));
-        
-        fs::rename(&existing_path, &archived_path)?;
+        // Move old file to _archive subdirectory
+        let archived_path = archive_deck_with_prefix(&existing_path)?;
         
         let forge_content = convert_deckstats_to_forge(&full_name, &body)?;
-        let new_path = write_deck_file(&full_name, &forge_content).await?;
+        let (new_path, _) = write_deck_file(&full_name, &forge_content).await?;
         
         Ok(DeckSyncResult::updated(deck_name.to_string(), archived_path, new_path))
     } else {
         let forge_content = convert_deckstats_to_forge(&full_name, &body)?;
-        let new_path = write_deck_file(&full_name, &forge_content).await?;
+        let (new_path, _) = write_deck_file(&full_name, &forge_content).await?;
         
         Ok(DeckSyncResult::new_downloaded(deck_name.to_string(), new_path))
     }
@@ -1916,21 +1952,14 @@ pub async fn sync_mamo_deck(deck_id: &str) -> Result<DeckSyncResult> {
     let (existing_file, _) = find_existing_deck_file(author, name, &deck_dir)?;
     
     if let Some(existing_path) = existing_file {
-        // Archive old version
-        let old_filename = existing_path.file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("unknown.dck");
-        let archived_path = existing_path.parent()
-            .unwrap_or(&deck_dir)
-            .join(format!("{}{}", PAST_VERSIONS_PREFIX, old_filename));
+        // Move old file to _archive subdirectory
+        let archived_path = archive_deck_with_prefix(&existing_path)?;
         
-        fs::rename(&existing_path, &archived_path)?;
-        
-        let new_path = write_deck_file(deck_name, &body).await?;
+        let (new_path, _) = write_deck_file(deck_name, &body).await?;
         
         Ok(DeckSyncResult::updated(name.to_string(), archived_path, new_path))
     } else {
-        let new_path = write_deck_file(deck_name, &body).await?;
+        let (new_path, _) = write_deck_file(deck_name, &body).await?;
         
         Ok(DeckSyncResult::new_downloaded(name.to_string(), new_path))
     }
@@ -1952,8 +1981,8 @@ fn find_existing_deck_file(author: &str, deck_name: &str, deck_dir: &PathBuf) ->
                 .and_then(|n| n.to_str())
                 .unwrap_or("");
             
-            // Skip archived versions
-            if filename.starts_with(PAST_VERSIONS_PREFIX) {
+            // Skip archived versions (legacy prefix or _archive_ prefix)
+            if filename.starts_with("PASTVersionS_") || filename.starts_with("_archive_") {
                 continue;
             }
             
