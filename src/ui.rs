@@ -276,6 +276,10 @@ struct LauncherApp {
     last_pending_check: Instant,
     /// Whether we have a pending initial deeplink to process (set once, consumed on first update)
     pending_initial_deeplink: Option<Deeplink>,
+    /// PID of Forge process launched via deeplink (for auto gamelog scanning)
+    forge_pid: Arc<Mutex<Option<u32>>>,
+    /// Timestamp of last automatic gamelog scan
+    last_auto_gamelog_scan: Option<Instant>,
 }
 
 impl LauncherApp {
@@ -392,6 +396,8 @@ impl LauncherApp {
             settings: Arc::new(Mutex::new(settings)),
             last_pending_check: Instant::now(),
             pending_initial_deeplink,
+            forge_pid: Arc::new(Mutex::new(None)),
+            last_auto_gamelog_scan: None,
         }
     }
 }
@@ -408,6 +414,47 @@ impl eframe::App for LauncherApp {
         if now.duration_since(self.last_pending_check).as_millis() > 500 {
             self.last_pending_check = now;
             self.check_pending_commands(ctx);
+        }
+        
+        // Auto gamelog scanning after deeplink Forge launch
+        {
+            let forge_pid_value = *self.forge_pid.lock().unwrap();
+            if let Some(pid) = forge_pid_value {
+                let forge_running = crate::forge::is_process_running(pid);
+                let is_scanning = self.gamelog_state.lock().unwrap().is_scanning;
+                
+                if !forge_running {
+                    // Forge closed - do final scan and stop
+                    if !is_scanning {
+                        if let Ok(mut log) = self.activity_log.lock() {
+                            log.log_info("\u{1F3AE} Forge closed - triggering final gamelog scan");
+                        }
+                        self.start_auto_gamelog_scan(ctx);
+                    }
+                    *self.forge_pid.lock().unwrap() = None;
+                    self.last_auto_gamelog_scan = None;
+                } else if !is_scanning {
+                    let should_scan = match self.last_auto_gamelog_scan {
+                        None => {
+                            // First check after Forge launch - set timer, don't scan yet
+                            self.last_auto_gamelog_scan = Some(now);
+                            if let Ok(mut log) = self.activity_log.lock() {
+                                log.log_info("\u{1F3AE} Forge launched - auto gamelog scanning active (every 5 min)");
+                            }
+                            false
+                        }
+                        Some(last) => now.duration_since(last).as_secs() >= 300, // 5 minutes
+                    };
+                    
+                    if should_scan {
+                        if let Ok(mut log) = self.activity_log.lock() {
+                            log.log_info("\u{1F504} Auto gamelog scan (periodic 5 min)");
+                        }
+                        self.start_auto_gamelog_scan(ctx);
+                        self.last_auto_gamelog_scan = Some(now);
+                    }
+                }
+            }
         }
         
         // Request a repaint in 500ms to keep checking for pending commands
@@ -494,6 +541,7 @@ impl LauncherApp {
         let settings_state = self.settings_state.clone();
         let activity_log = self.activity_log.clone();
         let activity_log_for_polling = self.activity_log.clone();
+        let forge_pid = self.forge_pid.clone();
         let ctx_clone = ctx.clone();
         let ctx_for_polling = ctx.clone();
         
@@ -584,6 +632,21 @@ impl LauncherApp {
                 }
             }
             
+            // Track Forge PID for auto gamelog scanning
+            match &result {
+                commands::CommandResult::DeckCreatedAndLaunched(_, forge_result) if forge_result.success => {
+                    if let Some(pid) = forge_result.pid {
+                        *forge_pid.lock().unwrap() = Some(pid);
+                    }
+                }
+                commands::CommandResult::ForgeLaunched(forge_result) if forge_result.success => {
+                    if let Some(pid) = forge_result.pid {
+                        *forge_pid.lock().unwrap() = Some(pid);
+                    }
+                }
+                _ => {}
+            }
+            
             // Handle auth token saved result
             if let commands::CommandResult::AuthTokenSaved(ref token) = result {
                 info!("Auth token saved via initial deeplink: {}", 
@@ -650,6 +713,7 @@ impl LauncherApp {
                         let settings_state = self.settings_state.clone();
                         let activity_log = self.activity_log.clone();
                         let activity_log_for_polling = self.activity_log.clone();
+                        let forge_pid = self.forge_pid.clone();
                         let log_collector_for_command = log_collector.clone();
                         let ctx_clone = ctx.clone();
                         let ctx_for_polling = ctx.clone();
@@ -735,6 +799,21 @@ impl LauncherApp {
                                         log.log_info(format!("Found {} decks", decks.len()));
                                     }
                                 }
+                            }
+                            
+                            // Track Forge PID for auto gamelog scanning
+                            match &result {
+                                commands::CommandResult::DeckCreatedAndLaunched(_, forge_result) if forge_result.success => {
+                                    if let Some(pid) = forge_result.pid {
+                                        *forge_pid.lock().unwrap() = Some(pid);
+                                    }
+                                }
+                                commands::CommandResult::ForgeLaunched(forge_result) if forge_result.success => {
+                                    if let Some(pid) = forge_result.pid {
+                                        *forge_pid.lock().unwrap() = Some(pid);
+                                    }
+                                }
+                                _ => {}
                             }
                             
                             // Handle auth token saved result
@@ -2557,6 +2636,83 @@ impl LauncherApp {
         } else {
             state.status_message = Some("Background scanning disabled.".to_string());
         }
+    }
+
+    /// Start an automatic gamelog scan (no filters, triggered by Forge process tracking)
+    fn start_auto_gamelog_scan(&mut self, ctx: &egui::Context) {
+        let gamelog_state = Arc::clone(&self.gamelog_state);
+        let settings = Arc::clone(&self.settings);
+        let activity_log = Arc::clone(&self.activity_log);
+        let ctx_clone = ctx.clone();
+        
+        // Don't scan if already scanning
+        {
+            let state = gamelog_state.lock().unwrap();
+            if state.is_scanning {
+                return;
+            }
+        }
+        
+        // Mark as scanning
+        {
+            let mut state = gamelog_state.lock().unwrap();
+            state.is_scanning = true;
+        }
+        
+        // No filters for auto-scan - scan all new logs
+        let filter_options = GameLogFilterOptions {
+            days_filter: 0,
+            deck_filter: HashSet::new(),
+        };
+        
+        tokio::spawn(async move {
+            let config = {
+                let settings = settings.lock().unwrap();
+                settings.gamelog_config.clone()
+            };
+            
+            let processed_files = {
+                let state = gamelog_state.lock().unwrap();
+                Arc::new(Mutex::new(state.processed_files.clone()))
+            };
+            
+            let result = process_new_logs_with_filter(&config, &processed_files, &filter_options).await;
+            
+            {
+                let mut state = gamelog_state.lock().unwrap();
+                state.is_scanning = false;
+                
+                match result {
+                    Ok(summary) => {
+                        state.scan_results = summary.results.clone();
+                        
+                        // Update processed files
+                        let new_processed = processed_files.lock().unwrap().clone();
+                        state.processed_files = new_processed.clone();
+                        let _ = save_processed_files(&new_processed);
+                        
+                        // Log to activity
+                        if summary.new_files > 0 {
+                            if let Ok(mut log) = activity_log.lock() {
+                                log.log_success(format!(
+                                    "\u{1F4CB} Auto-scan: {} new files, {} uploaded, {} failed",
+                                    summary.new_files, summary.successfully_uploaded, summary.failed_uploads
+                                ));
+                            }
+                        }
+                        
+                        state.last_scan_summary = Some(summary);
+                    }
+                    Err(e) => {
+                        if let Ok(mut log) = activity_log.lock() {
+                            log.log_error(format!("Auto-scan error: {}", e));
+                        }
+                    }
+                }
+            }
+            
+            ctx_clone.request_repaint();
+        });
     }
 
     fn clear_processed_history(&mut self) {

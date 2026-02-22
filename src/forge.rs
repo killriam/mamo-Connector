@@ -13,15 +13,17 @@ pub struct ForgeLaunchResult {
     pub message: String,
     pub deck_path: Option<String>,
     pub forge_path: Option<String>,
+    pub pid: Option<u32>,
 }
 
 impl ForgeLaunchResult {
-    pub fn success(message: impl Into<String>, deck_path: Option<String>, forge_path: Option<String>) -> Self {
+    pub fn success(message: impl Into<String>, deck_path: Option<String>, forge_path: Option<String>, pid: Option<u32>) -> Self {
         Self {
             success: true,
             message: message.into(),
             deck_path,
             forge_path,
+            pid,
         }
     }
 
@@ -31,6 +33,7 @@ impl ForgeLaunchResult {
             message: message.into(),
             deck_path: None,
             forge_path: None,
+            pid: None,
         }
     }
 }
@@ -286,11 +289,13 @@ pub fn launch_forge(forge_path: &str, deck_path: Option<&str>) -> Result<ForgeLa
 
     match result {
         Ok(child) => {
-            info!("Forge launched successfully with PID: {:?}", child.id());
+            let pid = child.id();
+            info!("Forge launched successfully with PID: {:?}", pid);
             Ok(ForgeLaunchResult::success(
                 format!("Forge launched successfully"),
                 deck_path.map(|s| s.to_string()),
                 Some(forge_path.to_string()),
+                Some(pid),
             ))
         }
         Err(e) => {
@@ -346,6 +351,34 @@ pub fn get_forge_deck_directory() -> Option<PathBuf> {
     }
     
     None
+}
+
+/// Check if a process with the given PID is still running
+pub fn is_process_running(pid: u32) -> bool {
+    #[cfg(windows)]
+    {
+        use winapi::um::processthreadsapi::OpenProcess;
+        use winapi::um::handleapi::CloseHandle;
+        
+        // PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+        const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
+        
+        unsafe {
+            let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+            if handle.is_null() {
+                false
+            } else {
+                CloseHandle(handle);
+                true
+            }
+        }
+    }
+    
+    #[cfg(not(windows))]
+    {
+        // On Unix, check /proc/PID or use kill -0
+        std::path::Path::new(&format!("/proc/{}", pid)).exists()
+    }
 }
 
 #[cfg(test)]

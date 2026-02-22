@@ -349,8 +349,9 @@ pub async fn upload_game_log(
     let auth_token = config.auth_token.as_ref()
         .ok_or_else(|| anyhow::anyhow!("No authentication token configured. Please add your MaMo token in Settings."))?;
     
-    // Extract deck identifier from filename or content
+    // Extract deck identifier and deck link from filename or content
     let deck_identifier = extract_deck_identifier(&log_content.filename, &log_content.content);
+    let deck_link = extract_deck_link(&log_content.content);
     
     // Calculate SHA256 checksum of the content
     let mut hasher = Sha256::new();
@@ -366,6 +367,7 @@ pub async fn upload_game_log(
         uploaded_at: chrono::Utc::now().to_rfc3339(),
         checksum,
         deck_identifier,
+        deck_link,
     };
     
     let url = format!("{}/api/gamelog/upload", config.api_url);
@@ -389,6 +391,53 @@ pub async fn upload_game_log(
         let error_text = response.text().await.unwrap_or_else(|_| "Unknown error".to_string());
         Err(anyhow::anyhow!("Upload failed with status {}: {}", status, error_text))
     }
+}
+
+/// Extract deck link/URL from JSON content
+///
+/// Looks for deck link in:
+/// - `meta.players.P1.deck_link` or `meta.players.P1.deck_url` (MTG Replay Notation)
+/// - `meta.deck_link` or `meta.deck_url`
+/// - Top-level `deck_link` or `deck_url`
+fn extract_deck_link(content: &str) -> Option<String> {
+    let json_value: serde_json::Value = serde_json::from_str(content).ok()?;
+    let link_fields = ["deck_link", "deckLink", "deck_url", "deckUrl"];
+    
+    // Check meta.players.P1
+    if let Some(meta) = json_value.get("meta") {
+        if let Some(players) = meta.get("players").and_then(|v| v.as_object()) {
+            for key in &["P1", "P2"] {
+                if let Some(player) = players.get(*key) {
+                    for field in &link_fields {
+                        if let Some(link) = player.get(field).and_then(|v| v.as_str()) {
+                            if !link.is_empty() {
+                                return Some(link.to_string());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        // meta-level
+        for field in &link_fields {
+            if let Some(link) = meta.get(field).and_then(|v| v.as_str()) {
+                if !link.is_empty() {
+                    return Some(link.to_string());
+                }
+            }
+        }
+    }
+    
+    // Top-level
+    for field in &link_fields {
+        if let Some(link) = json_value.get(field).and_then(|v| v.as_str()) {
+            if !link.is_empty() {
+                return Some(link.to_string());
+            }
+        }
+    }
+    
+    None
 }
 
 /// Extract deck identifier from filename or JSON content
@@ -558,6 +607,8 @@ pub struct GameLogUploadPayload {
     pub checksum: String,
     /// Deck identifier extracted from filename or content
     pub deck_identifier: Option<String>,
+    /// Deck link/URL extracted from content (e.g. MaMo deck page URL)
+    pub deck_link: Option<String>,
 }
 
 /// Response from upload API

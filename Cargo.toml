@@ -27,7 +27,7 @@ sha2 = "0.10"
 
 [target.'cfg(windows)'.dependencies]
 winreg = "0.52"
-winapi = { version = "0.3", features = ["winuser", "windef", "fileapi"] }
+winapi = { version = "0.3", features = ["winuser", "windef", "fileapi", "processthreadsapi", "handleapi"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 core-foundation = "0.9"
