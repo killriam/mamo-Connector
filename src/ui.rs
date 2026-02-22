@@ -276,8 +276,10 @@ struct LauncherApp {
     last_pending_check: Instant,
     /// Whether we have a pending initial deeplink to process (set once, consumed on first update)
     pending_initial_deeplink: Option<Deeplink>,
-    /// PID of Forge process launched via deeplink (for auto gamelog scanning)
+    /// PID of Forge launcher process (may exit quickly if forge.exe is a wrapper)
     forge_pid: Arc<Mutex<Option<u32>>>,
+    /// When Forge monitoring started (for startup grace period)
+    forge_monitoring_since: Arc<Mutex<Option<Instant>>>,
     /// Timestamp of last automatic gamelog scan
     last_auto_gamelog_scan: Option<Instant>,
 }
@@ -397,6 +399,7 @@ impl LauncherApp {
             last_pending_check: Instant::now(),
             pending_initial_deeplink,
             forge_pid: Arc::new(Mutex::new(None)),
+            forge_monitoring_since: Arc::new(Mutex::new(None)),
             last_auto_gamelog_scan: None,
         }
     }
@@ -417,42 +420,56 @@ impl eframe::App for LauncherApp {
         }
         
         // Auto gamelog scanning after deeplink Forge launch
-        {
+        // Two-phase detection: first track launcher PID, then switch to window-based
+        // detection since forge.exe is a launcher that spawns java.exe and exits.
+        let monitoring_since = *self.forge_monitoring_since.lock().unwrap();
+        if let Some(start_time) = monitoring_since {
             let forge_pid_value = *self.forge_pid.lock().unwrap();
-            if let Some(pid) = forge_pid_value {
-                let forge_running = crate::forge::is_process_running(pid);
-                let is_scanning = self.gamelog_state.lock().unwrap().is_scanning;
-                
-                if !forge_running {
-                    // Forge closed - do final scan and stop
+            let pid_alive = forge_pid_value.map(|p| crate::forge::is_process_running(p)).unwrap_or(false);
+            let window_open = crate::forge::is_forge_window_open();
+            let forge_alive = pid_alive || window_open;
+            let is_scanning = self.gamelog_state.lock().unwrap().is_scanning;
+            let elapsed = now.duration_since(start_time);
+            
+            // Clear launcher PID once it exits (launcher is just a wrapper)
+            if !pid_alive && forge_pid_value.is_some() {
+                *self.forge_pid.lock().unwrap() = None;
+            }
+            
+            if !forge_alive {
+                if elapsed.as_secs() < 20 {
+                    // Grace period: launcher may have exited but Java/Forge window
+                    // hasn't appeared yet. Wait before declaring Forge closed.
+                } else {
+                    // Forge is truly closed (no PID, no window, past grace period)
                     if !is_scanning {
                         if let Ok(mut log) = self.activity_log.lock() {
                             log.log_info("\u{1F3AE} Forge closed - triggering final gamelog scan");
                         }
                         self.start_auto_gamelog_scan(ctx);
                     }
-                    *self.forge_pid.lock().unwrap() = None;
+                    *self.forge_monitoring_since.lock().unwrap() = None;
                     self.last_auto_gamelog_scan = None;
-                } else if !is_scanning {
-                    let should_scan = match self.last_auto_gamelog_scan {
-                        None => {
-                            // First check after Forge launch - set timer, don't scan yet
-                            self.last_auto_gamelog_scan = Some(now);
-                            if let Ok(mut log) = self.activity_log.lock() {
-                                log.log_info("\u{1F3AE} Forge launched - auto gamelog scanning active (every 5 min)");
-                            }
-                            false
-                        }
-                        Some(last) => now.duration_since(last).as_secs() >= 300, // 5 minutes
-                    };
-                    
-                    if should_scan {
-                        if let Ok(mut log) = self.activity_log.lock() {
-                            log.log_info("\u{1F504} Auto gamelog scan (periodic 5 min)");
-                        }
-                        self.start_auto_gamelog_scan(ctx);
+                }
+            } else if !is_scanning {
+                // Forge is running - handle periodic scans
+                let should_scan = match self.last_auto_gamelog_scan {
+                    None => {
                         self.last_auto_gamelog_scan = Some(now);
+                        if let Ok(mut log) = self.activity_log.lock() {
+                            log.log_info("\u{1F3AE} Forge running - auto gamelog scanning active (every 5 min)");
+                        }
+                        false
                     }
+                    Some(last) => now.duration_since(last).as_secs() >= 300,
+                };
+                
+                if should_scan {
+                    if let Ok(mut log) = self.activity_log.lock() {
+                        log.log_info("\u{1F504} Auto gamelog scan (periodic 5 min)");
+                    }
+                    self.start_auto_gamelog_scan(ctx);
+                    self.last_auto_gamelog_scan = Some(now);
                 }
             }
         }
@@ -542,6 +559,7 @@ impl LauncherApp {
         let activity_log = self.activity_log.clone();
         let activity_log_for_polling = self.activity_log.clone();
         let forge_pid = self.forge_pid.clone();
+        let forge_monitoring_since = self.forge_monitoring_since.clone();
         let ctx_clone = ctx.clone();
         let ctx_for_polling = ctx.clone();
         
@@ -637,11 +655,13 @@ impl LauncherApp {
                 commands::CommandResult::DeckCreatedAndLaunched(_, forge_result) if forge_result.success => {
                     if let Some(pid) = forge_result.pid {
                         *forge_pid.lock().unwrap() = Some(pid);
+                        *forge_monitoring_since.lock().unwrap() = Some(Instant::now());
                     }
                 }
                 commands::CommandResult::ForgeLaunched(forge_result) if forge_result.success => {
                     if let Some(pid) = forge_result.pid {
                         *forge_pid.lock().unwrap() = Some(pid);
+                        *forge_monitoring_since.lock().unwrap() = Some(Instant::now());
                     }
                 }
                 _ => {}
@@ -714,6 +734,7 @@ impl LauncherApp {
                         let activity_log = self.activity_log.clone();
                         let activity_log_for_polling = self.activity_log.clone();
                         let forge_pid = self.forge_pid.clone();
+                        let forge_monitoring_since = self.forge_monitoring_since.clone();
                         let log_collector_for_command = log_collector.clone();
                         let ctx_clone = ctx.clone();
                         let ctx_for_polling = ctx.clone();
@@ -806,11 +827,13 @@ impl LauncherApp {
                                 commands::CommandResult::DeckCreatedAndLaunched(_, forge_result) if forge_result.success => {
                                     if let Some(pid) = forge_result.pid {
                                         *forge_pid.lock().unwrap() = Some(pid);
+                                        *forge_monitoring_since.lock().unwrap() = Some(Instant::now());
                                     }
                                 }
                                 commands::CommandResult::ForgeLaunched(forge_result) if forge_result.success => {
                                     if let Some(pid) = forge_result.pid {
                                         *forge_pid.lock().unwrap() = Some(pid);
+                                        *forge_monitoring_since.lock().unwrap() = Some(Instant::now());
                                     }
                                 }
                                 _ => {}

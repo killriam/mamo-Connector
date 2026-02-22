@@ -381,6 +381,48 @@ pub fn is_process_running(pid: u32) -> bool {
     }
 }
 
+/// Check if a Forge window is currently open by scanning all visible window titles.
+/// This is needed because forge.exe is a launcher that spawns java.exe and exits immediately.
+/// The actual Forge game runs as a Java process with a window titled "Forge ...".
+pub fn is_forge_window_open() -> bool {
+    #[cfg(windows)]
+    {
+        use winapi::um::winuser::{EnumWindows, GetWindowTextW, IsWindowVisible};
+        use winapi::shared::windef::HWND;
+        use winapi::shared::minwindef::{BOOL, LPARAM, TRUE};
+        
+        unsafe extern "system" fn enum_callback(hwnd: HWND, lparam: LPARAM) -> BOOL {
+            unsafe {
+                if IsWindowVisible(hwnd) == 0 {
+                    return TRUE; // continue
+                }
+                let mut buf = [0u16; 256];
+                let len = GetWindowTextW(hwnd, buf.as_mut_ptr(), buf.len() as i32);
+                if len > 0 {
+                    let title = String::from_utf16_lossy(&buf[..len as usize]);
+                    if title.contains("Forge") {
+                        let found = &mut *(lparam as *mut bool);
+                        *found = true;
+                        return 0; // stop enumeration
+                    }
+                }
+                TRUE // continue
+            }
+        }
+        
+        let mut found = false;
+        unsafe {
+            EnumWindows(Some(enum_callback), &mut found as *mut bool as LPARAM);
+        }
+        found
+    }
+    
+    #[cfg(not(windows))]
+    {
+        false
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
