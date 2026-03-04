@@ -280,6 +280,9 @@ struct LauncherApp {
     forge_pid: Arc<Mutex<Option<u32>>>,
     /// When Forge monitoring started (for startup grace period)
     forge_monitoring_since: Arc<Mutex<Option<Instant>>>,
+    /// Whether the Forge window has been observed open at least once during this monitoring session.
+    /// Used to distinguish "window not yet open" from "window was open and now closed".
+    forge_window_seen: bool,
     /// Timestamp of last automatic gamelog scan
     last_auto_gamelog_scan: Option<Instant>,
 }
@@ -400,6 +403,7 @@ impl LauncherApp {
             pending_initial_deeplink,
             forge_pid: Arc::new(Mutex::new(None)),
             forge_monitoring_since: Arc::new(Mutex::new(None)),
+            forge_window_seen: false,
             last_auto_gamelog_scan: None,
         }
     }
@@ -436,10 +440,20 @@ impl eframe::App for LauncherApp {
                 *self.forge_pid.lock().unwrap() = None;
             }
             
+            // Track if we've ever seen the Forge window open
+            if window_open {
+                self.forge_window_seen = true;
+            }
+            
             if !forge_alive {
-                if elapsed.as_secs() < 20 {
-                    // Grace period: launcher may have exited but Java/Forge window
-                    // hasn't appeared yet. Wait before declaring Forge closed.
+                // Determine whether to declare Forge truly closed:
+                // - If the window was never observed: give up to 120 s for Java to start
+                //   (launcher exits almost immediately, Java window can be slow to appear)
+                // - If the window was observed before: only need the normal 20 s grace period
+                //   so we don't delay the final scan unnecessarily
+                let close_threshold = if self.forge_window_seen { 20 } else { 120 };
+                if elapsed.as_secs() < close_threshold {
+                    // Still within grace period - Java/Forge window may not have appeared yet
                 } else {
                     // Forge is truly closed (no PID, no window, past grace period)
                     if !is_scanning {
@@ -449,6 +463,7 @@ impl eframe::App for LauncherApp {
                         self.start_auto_gamelog_scan(ctx);
                     }
                     *self.forge_monitoring_since.lock().unwrap() = None;
+                    self.forge_window_seen = false;
                     self.last_auto_gamelog_scan = None;
                 }
             } else if !is_scanning {
