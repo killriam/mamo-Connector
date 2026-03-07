@@ -14,11 +14,12 @@ for automatic upload.
 
 - **Language**: Rust (2024 edition)
 - **UI framework**: eframe/egui (immediate-mode GUI)
-- **HTTP client**: reqwest (async, with rustls-tls)
+- **HTTP client**: reqwest (async, with json feature)
 - **Async runtime**: tokio (full features)
 - **Serialization**: serde + serde_json
 - **File watching**: notify (cross-platform filesystem events)
 - **File dialog**: rfd (native file dialogs)
+- **Logging**: `log` crate + `env_logger` backend
 - **Platform-specific**:
   - Windows: `winreg` (registry), `winapi`
   - macOS: `core-foundation` (LaunchServices)
@@ -127,8 +128,8 @@ Only one Connector instance runs at a time:
   production code paths. `unwrap()` only in tests and provably safe contexts
 - **Async**: tokio runtime for HTTP requests and file watching. Use `async/await`, not
   manual `Future` implementations
-- **Logging**: Use `println!` with emoji prefixes for status (✅ ❌ ⚠️) — no external
-  logging framework currently
+- **Logging**: Use `log` crate macros (`info!`, `warn!`, `error!`, `debug!`) with `env_logger`.
+  Initialize in `main.rs` with `env_logger::init()`. Do NOT use raw `println!` for status output.
 
 ### Code Patterns
 
