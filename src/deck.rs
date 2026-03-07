@@ -1087,16 +1087,16 @@ pub async fn create_deck_from_mamo_with_progress(
     
     log("Writing deck file...");
     // Content is already in Forge format, write directly
-    // write_deck_file renames any existing versions with "Archived_" prefix
-    let (deck_path, archived_files) = write_deck_file(deck_name, &body).await
+    // write_deck_file deletes any existing versions to avoid duplicates in Forge
+    let (deck_path, removed_files) = write_deck_file(deck_name, &body).await
         .context("Failed to create deck file")?;
     
-    // Log archived old versions in the UI progress
-    for (archived_name, same_hash) in &archived_files {
+    // Log removed old versions in the UI progress
+    for (removed_name, same_hash) in &removed_files {
         if *same_hash {
-            log(&format!("📦 Archived old version (same deck content): {}", archived_name));
+            log(&format!("🗑️ Replaced old version (same deck content): {}", removed_name));
         } else {
-            log(&format!("📦 Archived old version: {}", archived_name));
+            log(&format!("🗑️ Replaced old version: {}", removed_name));
         }
     }
     
@@ -1415,7 +1415,7 @@ async fn write_deck_file(deck_name: &str, content: &str) -> Result<(PathBuf, Vec
 
     // Extract the base deck name without the date suffix, e.g.
     // "killriam - Welcome to the Capital of Karl Marx (2026-02-15)" -> "killriam - Welcome to the Capital of Karl Marx"
-    // This allows us to find and archive old versions with different dates.
+    // This allows us to find and remove old versions with different dates.
     let base_name = if let Some(paren_pos) = sanitized_name.rfind(" (") {
         // Verify it looks like a date pattern: " (YYYY-MM-DD)"
         let after_paren = &sanitized_name[paren_pos..];
@@ -1428,9 +1428,9 @@ async fn write_deck_file(deck_name: &str, content: &str) -> Result<(PathBuf, Vec
         sanitized_name.clone()
     };
 
-    // Archive any existing versions of this deck (same base name, any date)
-    // Rename them with "Archived_" prefix so they stay in the same directory but are visually distinct
-    let mut archived_files: Vec<(String, bool)> = Vec::new();
+    // Remove any existing versions of this deck (same base name, any date)
+    // Old versions are deleted so Forge doesn't show duplicate entries
+    let mut removed_files: Vec<(String, bool)> = Vec::new();
     if let Ok(entries) = fs::read_dir(&deck_dir) {
         for entry in entries.flatten() {
             let file_name = entry.file_name().to_string_lossy().to_string();
@@ -1440,19 +1440,17 @@ async fn write_deck_file(deck_name: &str, content: &str) -> Result<(PathBuf, Vec
                 continue;
             }
             
-            // Skip files that are already archived (any legacy or current prefix)
-            if file_name.starts_with("Archived_") 
+            // Clean up any legacy archived files for this deck
+            if (file_name.starts_with("Archived_") 
                 || file_name.starts_with("_archive_") 
                 || file_name.starts_with("archive_") 
-                || file_name.starts_with("PASTVersionS_") 
+                || file_name.starts_with("PASTVersionS_"))
+                && file_name.contains(&base_name)
             {
-                // Clean up old archive of this deck to avoid accumulation
-                if file_name.contains(&base_name) {
-                    if let Err(e) = fs::remove_file(entry.path()) {
-                        warn!("Failed to remove old archive {:?}: {}", entry.path(), e);
-                    } else {
-                        info!("Removed old archive: {}", file_name);
-                    }
+                if let Err(e) = fs::remove_file(entry.path()) {
+                    warn!("Failed to remove old archive {:?}: {}", entry.path(), e);
+                } else {
+                    info!("Removed old archive: {}", file_name);
                 }
                 continue;
             }
@@ -1467,14 +1465,12 @@ async fn write_deck_file(deck_name: &str, content: &str) -> Result<(PathBuf, Vec
                     .unwrap_or_default();
                 let same_hash = !old_hash.is_empty() && old_hash == new_hash;
                 
-                // Rename with "Archived_" prefix
-                let archived_name = format!("Archived_{}", file_name);
-                let archived_path = deck_dir.join(&archived_name);
-                if let Err(e) = fs::rename(&path, &archived_path) {
-                    warn!("Failed to archive {:?}: {}", path, e);
+                // Delete old version
+                if let Err(e) = fs::remove_file(&path) {
+                    warn!("Failed to remove old deck version {:?}: {}", path, e);
                 } else {
-                    info!("Archived old deck version: {} -> {}", file_name, archived_name);
-                    archived_files.push((file_name.clone(), same_hash));
+                    info!("Removed old deck version: {}", file_name);
+                    removed_files.push((file_name.clone(), same_hash));
                 }
             }
         }
@@ -1485,7 +1481,7 @@ async fn write_deck_file(deck_name: &str, content: &str) -> Result<(PathBuf, Vec
         .with_context(|| format!("Failed to write deck file: {:?}", deck_file_path))?;
 
     info!("Successfully created deck file: {:?}", deck_file_path);
-    Ok((deck_file_path, archived_files))
+    Ok((deck_file_path, removed_files))
 }
 
 /// Legacy function to fetch deck data as structured JSON (kept for compatibility)
