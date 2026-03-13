@@ -117,12 +117,40 @@ pub fn get_default_forge_path() -> Option<PathBuf> {
     None
 }
 
+/// Scan a directory for the latest `forge-gui-desktop-*-jar-with-dependencies.jar`.
+/// Returns the JAR with the most-recent modification time, or `None` if none found.
+pub fn resolve_latest_forge_jar(dir: &std::path::Path) -> Option<PathBuf> {
+    let entries = std::fs::read_dir(dir).ok()?;
+    let mut candidates: Vec<(PathBuf, std::time::SystemTime)> = entries
+        .filter_map(|e| e.ok())
+        .filter_map(|e| {
+            let path = e.path();
+            let name = path.file_name()?.to_string_lossy().to_lowercase();
+            if name.starts_with("forge-gui-desktop-")
+                && name.ends_with("-jar-with-dependencies.jar")
+            {
+                let modified = e.metadata().ok()?.modified().ok()?;
+                Some((path, modified))
+            } else {
+                None
+            }
+        })
+        .collect();
+    candidates.sort_by(|a, b| b.1.cmp(&a.1)); // newest first
+    candidates.into_iter().next().map(|(p, _)| p)
+}
+
 /// Validate that a Forge path is valid
 pub fn validate_forge_path(path: &str) -> bool {
     let path = PathBuf::from(path);
     
     if !path.exists() {
         return false;
+    }
+
+    // If it's a directory, check whether it contains a forge-gui-desktop JAR
+    if path.is_dir() {
+        return resolve_latest_forge_jar(&path).is_some();
     }
 
     // Check if it's a valid executable
@@ -173,7 +201,25 @@ pub fn launch_forge(forge_path: &str, deck_path: Option<&str>) -> Result<ForgeLa
         )));
     }
 
-    info!("Launching Forge from: {}", forge_path);
+    // If a directory was configured, resolve to the latest forge-gui-desktop JAR inside it
+    let forge_path_buf = if forge_path_buf.is_dir() {
+        match resolve_latest_forge_jar(&forge_path_buf) {
+            Some(jar) => {
+                info!("Resolved Forge directory to latest JAR: {}", jar.display());
+                jar
+            }
+            None => {
+                return Ok(ForgeLaunchResult::failure(format!(
+                    "No forge-gui-desktop JAR found in directory: {}", forge_path
+                )));
+            }
+        }
+    } else {
+        forge_path_buf
+    };
+
+    let resolved_path_str = forge_path_buf.to_string_lossy().to_string();
+    info!("Launching Forge from: {}", resolved_path_str);
     if let Some(deck) = deck_path {
         info!("With deck: {}", deck);
     }
@@ -294,7 +340,7 @@ pub fn launch_forge(forge_path: &str, deck_path: Option<&str>) -> Result<ForgeLa
             Ok(ForgeLaunchResult::success(
                 format!("Forge launched successfully"),
                 deck_path.map(|s| s.to_string()),
-                Some(forge_path.to_string()),
+                Some(resolved_path_str.clone()),
                 Some(pid),
             ))
         }

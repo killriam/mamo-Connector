@@ -9,7 +9,7 @@ use crate::commands::CommandResult;
 use crate::deck::{create_deck_from_moxfield, MoxfieldDeckEntry, MamoDeckEntry, DeckStatus, fetch_user_decks_direct, create_deck_from_archidekt, create_deck_from_deckstats, create_deck_from_mamo, parse_archidekt_url, parse_deckstats_url, parse_mamo_url, parse_mamo_user_url, fetch_mamo_user_decks, sync_moxfield_deck, sync_moxfield_user_decks, sync_archidekt_deck, sync_deckstats_deck, sync_mamo_deck, DeckSyncResult, SyncStatus, get_deck_directory_display};
 use rfd::FileDialog;
 use crate::deeplink::Deeplink;
-use crate::forge::{get_default_forge_path, validate_forge_path, launch_forge_from_settings};
+use crate::forge::{get_default_forge_path, resolve_latest_forge_jar, validate_forge_path, launch_forge_from_settings};
 use crate::gamelog::{GameLogConfig, GameLogProcessResult, ScanSummary, get_default_forge_log_directory, validate_directory, scan_directory, load_processed_files, save_processed_files, DeckMappings, fetch_my_decks, suggest_deck_matches, load_cached_decks, save_cached_decks, process_new_logs_with_filter, GameLogFilterOptions, preview_scan, FilePreviewInfo};
 use crate::registration::{RegistrationOutcome, RegistrationStatus};
 use crate::settings::{Settings, SavedLink, SavedLinkType};
@@ -3035,7 +3035,7 @@ impl LauncherApp {
                 let response = ui.add(
                     egui::TextEdit::singleline(&mut path_input)
                         .desired_width(400.0)
-                        .hint_text("Path to forge.exe, forge.jar, or Forge.app")
+                        .hint_text("Path to forge.exe, .jar, Forge.app, or target/ dir")
                 );
                 
                 if response.changed() {
@@ -3091,13 +3091,56 @@ impl LauncherApp {
                     }
                 }
                 
+                if ui.button("� Folder...").clicked() {
+                    if let Some(folder) = rfd::FileDialog::new()
+                        .set_title("Select Forge Directory (e.g. forge-gui-desktop/target/)")
+                        .pick_folder()
+                    {
+                        let path_str = folder.to_string_lossy().to_string();
+                        let is_valid = validate_forge_path(&path_str);
+                        let mut state = self.settings_state.lock().unwrap();
+                        state.forge_path_input = path_str.clone();
+                        state.forge_path_valid = is_valid;
+                        if is_valid {
+                            if let Some(jar) = resolve_latest_forge_jar(&folder) {
+                                state.status_message = Some(format!(
+                                    "Folder OK — will launch: {}",
+                                    jar.file_name().unwrap_or_default().to_string_lossy()
+                                ));
+                            }
+                        } else {
+                            state.status_message = Some(format!(
+                                "No forge-gui-desktop JAR found in: {}", path_str
+                            ));
+                        }
+                    }
+                }
+
                 if ui.button("💾 Save").clicked() {
                     self.save_forge_settings();
                 }
             });
-            
+
             ui.add_space(5.0);
-            
+
+            // If a directory is configured, show which JAR will be launched
+            if forge_path_valid {
+                let p = std::path::Path::new(&forge_path_input);
+                if p.is_dir() {
+                    if let Some(jar) = resolve_latest_forge_jar(p) {
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "→  {}",
+                                jar.file_name().unwrap_or_default().to_string_lossy()
+                            ))
+                            .color(egui::Color32::from_rgb(80, 130, 200))
+                            .small(),
+                        );
+                        ui.add_space(3.0);
+                    }
+                }
+            }
+
             // Auto-launch checkbox
             let mut auto_launch = forge_auto_launch;
             if ui.checkbox(&mut auto_launch, "Auto-launch Forge after downloading deck").changed() {
