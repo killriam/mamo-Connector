@@ -479,18 +479,25 @@ fn extract_deck_from_json(value: &serde_json::Value) -> Option<String> {
             let player_keys = ["P1", "P2"];
             for key in &player_keys {
                 if let Some(player) = players.get(*key) {
-                    // deck_hash is used in MTG Replay Notation
+                    // Prefer human-readable deck_name over the internal deck_hash,
+                    // because deck_hash cannot be matched against MaMo deck names.
+                    for field in &["deck_name", "deckName"] {
+                        if let Some(name) = player.get(field).and_then(|v| v.as_str()) {
+                            if !name.is_empty() {
+                                return Some(name.to_string());
+                            }
+                        }
+                    }
+                    // Fall back to deck_hash only if no human-readable name is available
                     if let Some(deck_hash) = player.get("deck_hash").and_then(|v| v.as_str()) {
                         if !deck_hash.is_empty() {
                             return Some(deck_hash.to_string());
                         }
                     }
-                    // Also try deck_name or name as deck identifier
-                    for field in &["deck_name", "deckName", "deck"] {
-                        if let Some(name) = player.get(field).and_then(|v| v.as_str()) {
-                            if !name.is_empty() {
-                                return Some(name.to_string());
-                            }
+                    // Also try generic deck field
+                    if let Some(name) = player.get("deck").and_then(|v| v.as_str()) {
+                        if !name.is_empty() {
+                            return Some(name.to_string());
                         }
                     }
                 }
