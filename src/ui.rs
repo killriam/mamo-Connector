@@ -352,14 +352,18 @@ impl LauncherApp {
                     } else {
                         activity_log.log_error(&deck_result.message);
                     }
-                    if forge_result.success {
+                    if forge_result.already_running {
+                        activity_log.log_info(&forge_result.message);
+                    } else if forge_result.success {
                         activity_log.log_success(&forge_result.message);
                     } else {
                         activity_log.log_error(&forge_result.message);
                     }
                 }
                 CommandResult::ForgeLaunched(forge_result) => {
-                    if forge_result.success {
+                    if forge_result.already_running {
+                        activity_log.log_info(&forge_result.message);
+                    } else if forge_result.success {
                         activity_log.log_success(&forge_result.message);
                     } else {
                         activity_log.log_error(&forge_result.message);
@@ -440,8 +444,12 @@ impl eframe::App for LauncherApp {
                 *self.forge_pid.lock().unwrap() = None;
             }
             
-            // Track if we've ever seen the Forge window open
-            if window_open {
+            // Track if we've ever seen the Forge window open.
+            // Only count it after the launcher PID has exited — while the launcher is
+            // still alive, any "Forge" window belongs to the launcher itself (not the
+            // real Java game), so counting it would incorrectly reduce close_threshold
+            // from 120 s to 20 s before Java has had a chance to start.
+            if window_open && !pid_alive {
                 self.forge_window_seen = true;
             }
             
@@ -631,14 +639,18 @@ impl LauncherApp {
                         } else {
                             log.log_error(&deck_result.message);
                         }
-                        if forge_result.success {
+                        if forge_result.already_running {
+                            log.log_info(&forge_result.message);
+                        } else if forge_result.success {
                             log.log_success(&forge_result.message);
                         } else {
                             log.log_error(&forge_result.message);
                         }
                     }
                     commands::CommandResult::ForgeLaunched(forge_result) => {
-                        if forge_result.success {
+                        if forge_result.already_running {
+                            log.log_info(&forge_result.message);
+                        } else if forge_result.success {
                             log.log_success(&forge_result.message);
                         } else {
                             log.log_error(&forge_result.message);
@@ -803,14 +815,18 @@ impl LauncherApp {
                                         } else {
                                             log.log_error(&deck_result.message);
                                         }
-                                        if forge_result.success {
+                                        if forge_result.already_running {
+                                            log.log_info(&forge_result.message);
+                                        } else if forge_result.success {
                                             log.log_success(&forge_result.message);
                                         } else {
                                             log.log_error(&forge_result.message);
                                         }
                                     }
                                     commands::CommandResult::ForgeLaunched(forge_result) => {
-                                        if forge_result.success {
+                                        if forge_result.already_running {
+                                            log.log_info(&forge_result.message);
+                                        } else if forge_result.success {
                                             log.log_success(&forge_result.message);
                                         } else {
                                             log.log_error(&forge_result.message);
@@ -936,7 +952,9 @@ impl LauncherApp {
                     ui.label(egui::RichText::new(&deck_result.message)
                         .color(egui::Color32::from_rgb(0, 128, 0)));
                     ui.label(egui::RichText::new(&forge_result.message)
-                        .color(if forge_result.success {
+                        .color(if forge_result.already_running {
+                            egui::Color32::from_rgb(180, 120, 0)
+                        } else if forge_result.success {
                             egui::Color32::from_rgb(0, 128, 0)
                         } else {
                             egui::Color32::from_rgb(176, 0, 32)
@@ -944,7 +962,9 @@ impl LauncherApp {
                 }
                 CommandResult::ForgeLaunched(forge_result) => {
                     ui.label(egui::RichText::new(&forge_result.message)
-                        .color(if forge_result.success {
+                        .color(if forge_result.already_running {
+                            egui::Color32::from_rgb(180, 120, 0)
+                        } else if forge_result.success {
                             egui::Color32::from_rgb(0, 128, 0)
                         } else {
                             egui::Color32::from_rgb(176, 0, 32)

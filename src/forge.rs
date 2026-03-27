@@ -10,6 +10,8 @@ use crate::settings::Settings;
 #[allow(dead_code)]
 pub struct ForgeLaunchResult {
     pub success: bool,
+    /// True when Forge was already running and was not launched again
+    pub already_running: bool,
     pub message: String,
     pub deck_path: Option<String>,
     pub forge_path: Option<String>,
@@ -20,6 +22,7 @@ impl ForgeLaunchResult {
     pub fn success(message: impl Into<String>, deck_path: Option<String>, forge_path: Option<String>, pid: Option<u32>) -> Self {
         Self {
             success: true,
+            already_running: false,
             message: message.into(),
             deck_path,
             forge_path,
@@ -30,7 +33,26 @@ impl ForgeLaunchResult {
     pub fn failure(message: impl Into<String>) -> Self {
         Self {
             success: false,
+            already_running: false,
             message: message.into(),
+            deck_path: None,
+            forge_path: None,
+            pid: None,
+        }
+    }
+
+    pub fn hint_already_running(deck_name: Option<String>) -> Self {
+        let message = match deck_name {
+            Some(name) => format!(
+                "Forge is already open. The deck '{}' was saved to your Forge decks folder — open it manually.",
+                name
+            ),
+            None => "Forge is already open.".to_string(),
+        };
+        Self {
+            success: true,
+            already_running: true,
+            message,
             deck_path: None,
             forge_path: None,
             pid: None,
@@ -355,6 +377,18 @@ pub fn launch_forge(forge_path: &str, deck_path: Option<&str>) -> Result<ForgeLa
 
 /// Launch Forge using the path from settings
 pub fn launch_forge_from_settings(deck_path: Option<&str>) -> Result<ForgeLaunchResult> {
+    // Don't open another Forge window if one is already visible
+    if is_forge_window_open() {
+        info!("Forge is already running — skipping launch");
+        let deck_name = deck_path.map(|p| {
+            PathBuf::from(p)
+                .file_stem()
+                .map(|s| s.to_string_lossy().to_string())
+                .unwrap_or_else(|| p.to_string())
+        });
+        return Ok(ForgeLaunchResult::hint_already_running(deck_name));
+    }
+
     let settings = Settings::load()?;
     
     let forge_path = match &settings.forge_path {
