@@ -2750,12 +2750,34 @@ impl LauncherApp {
                         let _ = save_processed_files(&new_processed);
                         
                         // Log to activity
-                        if summary.new_files > 0 {
+                        if summary.new_files > 0 || summary.failed_uploads > 0 {
                             if let Ok(mut log) = activity_log.lock() {
-                                log.log_success(format!(
-                                    "\u{1F4CB} Auto-scan: {} new files, {} uploaded, {} failed",
-                                    summary.new_files, summary.successfully_uploaded, summary.failed_uploads
-                                ));
+                                if summary.failed_uploads > 0 && summary.successfully_uploaded == 0 {
+                                    // All failed — find first distinct error message
+                                    let first_error = summary.results.iter()
+                                        .find(|r| !r.success)
+                                        .map(|r| r.message.as_str())
+                                        .unwrap_or("Unknown error");
+                                    log.log_error(format!(
+                                        "\u{1F4CB} Auto-scan: {} new files, 0 uploaded, {} failed — {}",
+                                        summary.new_files, summary.failed_uploads, first_error
+                                    ));
+                                } else if summary.failed_uploads > 0 {
+                                    // Partial failure
+                                    let first_error = summary.results.iter()
+                                        .find(|r| !r.success)
+                                        .map(|r| r.message.as_str())
+                                        .unwrap_or("Unknown error");
+                                    log.log_success(format!(
+                                        "\u{1F4CB} Auto-scan: {} new files, {} uploaded, {} failed — {}",
+                                        summary.new_files, summary.successfully_uploaded, summary.failed_uploads, first_error
+                                    ));
+                                } else {
+                                    log.log_success(format!(
+                                        "\u{1F4CB} Auto-scan: {} new files, {} uploaded, {} failed",
+                                        summary.new_files, summary.successfully_uploaded, summary.failed_uploads
+                                    ));
+                                }
                             }
                         }
                         

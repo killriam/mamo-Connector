@@ -623,7 +623,7 @@ pub struct GameLogUploadPayload {
 pub struct UploadResponse {
     pub success: bool,
     pub message: String,
-    pub gamelog_id: Option<String>,
+    pub id: Option<String>,
 }
 
 /// Filter options for processing game logs
@@ -687,6 +687,16 @@ pub async fn process_new_logs_with_filter(
 ) -> Result<ScanSummary> {
     let mut summary = ScanSummary::default();
     
+    // Pre-flight: check auth token before scanning files
+    if config.auth_token.is_none() {
+        summary.failed_uploads = 1;
+        summary.results.push(GameLogProcessResult::failed(
+            "(all)".to_string(),
+            "No authentication token configured. Please add your MaMo token in Settings.".to_string(),
+        ));
+        return Ok(summary);
+    }
+    
     // Scan directory for files
     let files = scan_directory(config)?;
     summary.total_files_found = files.len();
@@ -747,7 +757,7 @@ pub async fn process_new_logs_with_filter(
                     summary.results.push(GameLogProcessResult::success(
                         filename.clone(),
                         log_content.file_size,
-                        response.gamelog_id,
+                        response.id,
                         deck_identifier,
                     ));
                     
