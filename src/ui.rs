@@ -388,6 +388,15 @@ impl LauncherApp {
                 CommandResult::UserDecksList(decks) => {
                     activity_log.log_info(format!("Found {} decks", decks.len()));
                 }
+                CommandResult::ReplayGameLaunched(forge_result) => {
+                    if forge_result.already_running {
+                        activity_log.log_info(&forge_result.message);
+                    } else if forge_result.success {
+                        activity_log.log_success(&forge_result.message);
+                    } else {
+                        activity_log.log_error(&forge_result.message);
+                    }
+                }
             }
         }
         
@@ -684,6 +693,15 @@ impl LauncherApp {
                     commands::CommandResult::UserDecksList(decks) => {
                         log.log_info(format!("Found {} decks", decks.len()));
                     }
+                    commands::CommandResult::ReplayGameLaunched(forge_result) => {
+                        if forge_result.already_running {
+                            log.log_info(&forge_result.message);
+                        } else if forge_result.success {
+                            log.log_success(&forge_result.message);
+                        } else {
+                            log.log_error(&forge_result.message);
+                        }
+                    }
                 }
             }
             
@@ -696,6 +714,12 @@ impl LauncherApp {
                     }
                 }
                 commands::CommandResult::ForgeLaunched(forge_result) if forge_result.success => {
+                    if let Some(pid) = forge_result.pid {
+                        *forge_pid.lock().unwrap() = Some(pid);
+                        *forge_monitoring_since.lock().unwrap() = Some(Instant::now());
+                    }
+                }
+                commands::CommandResult::ReplayGameLaunched(forge_result) if forge_result.success => {
                     if let Some(pid) = forge_result.pid {
                         *forge_pid.lock().unwrap() = Some(pid);
                         *forge_monitoring_since.lock().unwrap() = Some(Instant::now());
@@ -860,6 +884,15 @@ impl LauncherApp {
                                     commands::CommandResult::UserDecksList(decks) => {
                                         log.log_info(format!("Found {} decks", decks.len()));
                                     }
+                                    commands::CommandResult::ReplayGameLaunched(forge_result) => {
+                                        if forge_result.already_running {
+                                            log.log_info(&forge_result.message);
+                                        } else if forge_result.success {
+                                            log.log_success(&forge_result.message);
+                                        } else {
+                                            log.log_error(&forge_result.message);
+                                        }
+                                    }
                                 }
                             }
                             
@@ -872,6 +905,12 @@ impl LauncherApp {
                                     }
                                 }
                                 commands::CommandResult::ForgeLaunched(forge_result) if forge_result.success => {
+                                    if let Some(pid) = forge_result.pid {
+                                        *forge_pid.lock().unwrap() = Some(pid);
+                                        *forge_monitoring_since.lock().unwrap() = Some(Instant::now());
+                                    }
+                                }
+                                commands::CommandResult::ReplayGameLaunched(forge_result) if forge_result.success => {
                                     if let Some(pid) = forge_result.pid {
                                         *forge_pid.lock().unwrap() = Some(pid);
                                         *forge_monitoring_since.lock().unwrap() = Some(Instant::now());

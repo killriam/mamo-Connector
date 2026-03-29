@@ -2,7 +2,8 @@ use log::{error, info, warn};
 use std::sync::{Arc, Mutex};
 use crate::deeplink::Deeplink;
 use crate::deck::{create_deck_from_id, create_deck_from_moxfield, create_deck_from_mamo, create_deck_from_mamo_with_progress, DeckCreationResult, UserDecksImportResult, import_user_decks, list_moxfield_user_decks, MoxfieldDeckEntry, ProgressCallback};
-use crate::forge::{launch_forge_from_settings, ForgeLaunchResult};
+use crate::forge::{launch_forge_from_settings, launch_forge_replay, ForgeLaunchResult};
+use crate::gamelog::{download_replay_content, save_replay_to_forge_dir};
 use crate::settings::Settings;
 
 /// Type alias for a shared log collector
@@ -23,6 +24,7 @@ pub enum CommandResult {
     DeckCreated(DeckCreationResult),
     DeckCreatedAndLaunched(DeckCreationResult, ForgeLaunchResult),
     ForgeLaunched(ForgeLaunchResult),
+    ReplayGameLaunched(ForgeLaunchResult),
     UserDecksImported(UserDecksImportResult),
     UserDecksList(Vec<MoxfieldDeckEntry>),
     AuthTokenSaved(String),  // Success message
@@ -40,6 +42,7 @@ impl CommandResult {
                 format!("{} | {}", deck_result.message, forge_result.message)
             }
             CommandResult::ForgeLaunched(result) => result.message.clone(),
+            CommandResult::ReplayGameLaunched(result) => result.message.clone(),
             CommandResult::UserDecksImported(result) => result.message.clone(),
             CommandResult::UserDecksList(decks) => format!("Found {} decks", decks.len()),
             CommandResult::AuthTokenSaved(msg) => msg.clone(),
@@ -56,6 +59,7 @@ impl CommandResult {
                 deck_result.success && forge_result.success
             }
             CommandResult::ForgeLaunched(result) => result.success,
+            CommandResult::ReplayGameLaunched(result) => result.success,
             CommandResult::UserDecksImported(result) => result.success,
             CommandResult::UserDecksList(decks) => !decks.is_empty(),
             CommandResult::AuthTokenSaved(_) => true,
@@ -88,6 +92,7 @@ pub async fn handle_command_with_logger(deeplink: &Deeplink, log_collector: Opti
         "deck" => handle_deck_download(deeplink).await, // New: mamoConnector://deck/DECK_ID
         "mamo" => handle_mamo_deck_download(deeplink).await, // MaMo backend: mamoConnector://mamo/DECK_UUID
         "launch-forge" | "launchforge" | "playtest" => handle_launch_forge_with_logger(deeplink, log_collector).await, // Launch Forge with deck
+        "replay-game" | "replaygame" => handle_replay_game_with_logger(deeplink, log_collector).await, // Replay a game in Forge
         "import-user-decks" | "importuserdecks" => handle_import_user_decks(deeplink).await,
         "list-user-decks" | "listuserdecks" => handle_list_user_decks(deeplink).await,
         "auth" | "authenticate" | "connect" => handle_auth(deeplink).await, // Auth token: mamoConnector://auth?token=xxx
@@ -402,6 +407,98 @@ async fn handle_auth(deeplink: &Deeplink) -> CommandResult {
 
     info!("Auth token saved successfully");
     CommandResult::AuthTokenSaved("Authentication token saved successfully! Game log uploads are now enabled.".to_string())
+}
+
+/// Handle mamoConnector://replay-game/GAMELOG_UUID — download replay from backend and launch Forge in replay mode
+async fn handle_replay_game_with_logger(deeplink: &Deeplink, log_collector: Option<SharedLogCollector>) -> CommandResult {
+    let log = |msg: &str| {
+        info!("{}", msg);
+        if let Some(ref collector) = log_collector {
+            if let Ok(mut logs) = collector.lock() {
+                logs.push(msg.to_string());
+            }
+        }
+    };
+
+    // Extract gamelog ID from path (same as deck_id extraction — URL path segment)
+    let gamelog_id = deeplink.deck_id.clone()
+        .or_else(|| get_parameter(&deeplink.params, "id"))
+        .or_else(|| get_parameter(&deeplink.params, "gamelog_id"))
+        .or_else(|| get_parameter(&deeplink.params, "gamelogId"));
+
+    let gamelog_id = match gamelog_id {
+        Some(id) if !id.is_empty() => id,
+        _ => {
+            error!("No gamelog ID provided in replay-game command");
+            return CommandResult::MissingParameters(
+                "Gamelog ID is required. Use mamoConnector://replay-game/GAMELOG_UUID".to_string()
+            );
+        }
+    };
+
+    log(&format!("Replay game command — gamelog ID: {}", gamelog_id));
+
+    // Load settings and check for auth token + API URL
+    let settings = match Settings::load() {
+        Ok(s) => s,
+        Err(e) => {
+            log(&format!("Failed to load settings: {}", e));
+            return CommandResult::Error(format!("Failed to load settings: {}", e));
+        }
+    };
+
+    let auth_token = match settings.auth_token.as_ref().or(settings.gamelog_config.auth_token.as_ref()) {
+        Some(t) if !t.is_empty() => t.clone(),
+        _ => {
+            log("No authentication token found. Please authenticate the Connector from MaMo first.");
+            return CommandResult::Error(
+                "Not authenticated. Please connect the Connector to MaMo first (use the auth deeplink).".to_string()
+            );
+        }
+    };
+
+    let api_url = &settings.gamelog_config.api_url;
+    log(&format!("Downloading replay from backend: {}", api_url));
+
+    // Download replay content
+    let (content, filename) = match download_replay_content(api_url, &gamelog_id, &auth_token).await {
+        Ok(result) => result,
+        Err(e) => {
+            log(&format!("Failed to download replay: {}", e));
+            return CommandResult::Error(format!("Failed to download replay: {}", e));
+        }
+    };
+
+    log(&format!("Downloaded replay: {} ({} bytes)", filename, content.len()));
+
+    // Save replay to Forge gamelogs directory
+    let replay_path = match save_replay_to_forge_dir(&filename, &content) {
+        Ok(path) => path,
+        Err(e) => {
+            log(&format!("Failed to save replay file: {}", e));
+            return CommandResult::Error(format!("Failed to save replay file: {}", e));
+        }
+    };
+
+    let replay_path_str = replay_path.to_string_lossy().to_string();
+    log(&format!("Saved replay to: {}", replay_path_str));
+
+    // Launch Forge in replay mode
+    log("Launching Forge in replay mode...");
+    match launch_forge_replay(&replay_path_str) {
+        Ok(result) => {
+            if result.success {
+                log(&format!("Forge replay: {}", result.message));
+            } else {
+                log(&format!("Forge launch issue: {}", result.message));
+            }
+            CommandResult::ReplayGameLaunched(result)
+        }
+        Err(e) => {
+            log(&format!("Failed to launch Forge: {}", e));
+            CommandResult::Error(format!("Replay file saved but Forge launch failed: {}", e))
+        }
+    }
 }
 
 async fn handle_create_deck(deeplink: &Deeplink) -> CommandResult {

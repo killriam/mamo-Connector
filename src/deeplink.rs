@@ -57,7 +57,7 @@ pub fn parse_deeplink_url(raw: &str) -> Option<Deeplink> {
                 let path_parts: Vec<&str> = path.trim_start_matches('/').split('/').collect();
                 if !path_parts.is_empty() && !path_parts[0].is_empty() {
                     // If action is "deck", "mamo", "playtest", "launch-forge", or "launchforge", the path is the deck ID
-                    if (action == "deck" || action == "mamo" || action == "playtest" || action == "launch-forge" || action == "launchforge") && deck_id.is_none() {
+                    if (action == "deck" || action == "mamo" || action == "playtest" || action == "launch-forge" || action == "launchforge" || action == "replay-game" || action == "replaygame") && deck_id.is_none() {
                         deck_id = Some(path_parts[0].to_string());
                     } else if action == "user" && username.is_none() {
                         username = Some(path_parts[0].to_string());
@@ -270,5 +270,34 @@ mod tests {
         
         assert_eq!(result.action, "launchforge");
         assert_eq!(result.deck_id, Some("xyz789".to_string()));
+    }
+
+    // ── Replay Game Tests ───────────────────────────────────────────
+
+    #[test]
+    fn test_parse_replay_game_with_gamelog_id_in_path() {
+        let url = "mamoConnector://replay-game/b15ace87-3153-45c9-afc9-5c8a2163384d";
+        let result = parse_deeplink_url(url).unwrap();
+
+        assert_eq!(result.action, "replay-game");
+        assert_eq!(result.deck_id, Some("b15ace87-3153-45c9-afc9-5c8a2163384d".to_string()));
+    }
+
+    #[test]
+    fn test_parse_replaygame_with_gamelog_id_in_path() {
+        let url = "mamoConnector://replaygame/abc-123-def";
+        let result = parse_deeplink_url(url).unwrap();
+
+        assert_eq!(result.action, "replaygame");
+        assert_eq!(result.deck_id, Some("abc-123-def".to_string()));
+    }
+
+    #[test]
+    fn test_parse_replay_game_no_id() {
+        let url = "mamoConnector://replay-game";
+        let result = parse_deeplink_url(url).unwrap();
+
+        assert_eq!(result.action, "replay-game");
+        assert_eq!(result.deck_id, None);
     }
 }

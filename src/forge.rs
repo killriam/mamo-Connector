@@ -375,6 +375,163 @@ pub fn launch_forge(forge_path: &str, deck_path: Option<&str>) -> Result<ForgeLa
     }
 }
 
+/// Launch Forge in replay mode with a specific replay JSON file
+///
+/// Uses the `replay <path>` CLI argument documented in Forge's FEATURE_GAME_REPLAY.md.
+/// JAR/macOS/Linux: passes `replay <path>` directly to Forge CLI.
+/// Windows EXE: cannot pass CLI args — logs a warning, launches Forge normally
+/// (user must pick from Replay Mode menu; file is already in gamelogs dir).
+pub fn launch_forge_replay(replay_path: &str) -> Result<ForgeLaunchResult> {
+    // Don't open another Forge window if one is already visible
+    if is_forge_window_open() {
+        info!("Forge is already running — replay file was saved to gamelogs directory");
+        return Ok(ForgeLaunchResult::hint_already_running(Some(
+            "Replay file saved. Open Replay Mode in Forge to start.".to_string(),
+        )));
+    }
+
+    let settings = Settings::load()?;
+
+    let forge_path = match &settings.forge_path {
+        Some(path) if !path.is_empty() => path.clone(),
+        _ => match get_default_forge_path() {
+            Some(path) => path.to_string_lossy().to_string(),
+            None => {
+                return Ok(ForgeLaunchResult::failure(
+                    "Forge path not configured. Please set it in the Settings tab.",
+                ));
+            }
+        },
+    };
+
+    let forge_path_buf = PathBuf::from(&forge_path);
+
+    if !forge_path_buf.exists() {
+        return Ok(ForgeLaunchResult::failure(format!(
+            "Forge executable not found at: {}", forge_path
+        )));
+    }
+
+    // Resolve directory to latest JAR if needed
+    let forge_path_buf = if forge_path_buf.is_dir() {
+        match resolve_latest_forge_jar(&forge_path_buf) {
+            Some(jar) => {
+                info!("Resolved Forge directory to latest JAR: {}", jar.display());
+                jar
+            }
+            None => {
+                return Ok(ForgeLaunchResult::failure(format!(
+                    "No forge-gui-desktop JAR found in directory: {}", forge_path
+                )));
+            }
+        }
+    } else {
+        forge_path_buf
+    };
+
+    let resolved_path_str = forge_path_buf.to_string_lossy().to_string();
+    info!("Launching Forge in replay mode from: {}", resolved_path_str);
+    info!("Replay file: {}", replay_path);
+
+    let forge_dir = forge_path_buf.parent().map(|p| p.to_path_buf());
+    let extension = forge_path_buf
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_lowercase();
+
+    let result = match extension.as_str() {
+        "jar" => {
+            let mut cmd = Command::new("java");
+            cmd.arg("-Xmx4096m")
+                .arg("-Dio.netty.tryReflectionSetAccessible=true")
+                .arg("-Dfile.encoding=UTF-8")
+                .arg("-jar")
+                .arg(&forge_path_buf);
+
+            if let Some(dir) = &forge_dir {
+                cmd.current_dir(dir);
+            }
+
+            // Forge replay CLI: `replay <path>`
+            cmd.arg("replay").arg(replay_path);
+
+            cmd.spawn()
+        }
+        "exe" | "cmd" | "bat" => {
+            // Windows EXE cannot accept CLI replay argument
+            info!("Windows Forge EXE does not support replay CLI args. Replay file is in gamelogs directory — user must open Replay Mode manually.");
+            #[cfg(windows)]
+            {
+                use std::os::windows::process::CommandExt;
+                const DETACHED_PROCESS: u32 = 0x00000008;
+
+                let mut cmd = Command::new(&forge_path_buf);
+                if let Some(dir) = &forge_dir {
+                    cmd.current_dir(dir);
+                }
+                cmd.creation_flags(DETACHED_PROCESS);
+                cmd.spawn()
+            }
+            #[cfg(not(windows))]
+            {
+                let mut cmd = Command::new(&forge_path_buf);
+                if let Some(dir) = &forge_dir {
+                    cmd.current_dir(dir);
+                }
+                cmd.arg("replay").arg(replay_path);
+                cmd.spawn()
+            }
+        }
+        "app" => {
+            let mut cmd = Command::new("open");
+            cmd.arg(&forge_path_buf);
+            cmd.arg("--args").arg("replay").arg(replay_path);
+            cmd.spawn()
+        }
+        "sh" => {
+            let mut cmd = Command::new(&forge_path_buf);
+            if let Some(dir) = &forge_dir {
+                cmd.current_dir(dir);
+            }
+            cmd.arg("replay").arg(replay_path);
+            cmd.spawn()
+        }
+        _ => {
+            let mut cmd = Command::new(&forge_path_buf);
+            if let Some(dir) = &forge_dir {
+                cmd.current_dir(dir);
+            }
+            cmd.arg("replay").arg(replay_path);
+            cmd.spawn()
+        }
+    };
+
+    match result {
+        Ok(child) => {
+            let pid = child.id();
+            info!("Forge launched in replay mode with PID: {:?}", pid);
+            let msg = if extension == "exe" || extension == "bat" || extension == "cmd" {
+                "Forge launched. Open Replay Mode and select the game to replay.".to_string()
+            } else {
+                "Forge launched in replay mode.".to_string()
+            };
+            Ok(ForgeLaunchResult::success(
+                msg,
+                Some(replay_path.to_string()),
+                Some(resolved_path_str),
+                Some(pid),
+            ))
+        }
+        Err(e) => {
+            error!("Failed to launch Forge for replay: {}", e);
+            Ok(ForgeLaunchResult::failure(format!(
+                "Failed to launch Forge: {}", e
+            )))
+        }
+    }
+}
+
 /// Launch Forge using the path from settings
 pub fn launch_forge_from_settings(deck_path: Option<&str>) -> Result<ForgeLaunchResult> {
     // Don't open another Forge window if one is already visible

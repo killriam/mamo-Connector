@@ -626,6 +626,87 @@ pub struct UploadResponse {
     pub id: Option<String>,
 }
 
+/// Response from replay-content API
+#[derive(Debug, Clone, Deserialize)]
+pub struct ReplayContentResponse {
+    pub success: bool,
+    pub content: Option<String>,
+    pub filename: Option<String>,
+    pub error: Option<String>,
+}
+
+/// Download replay content from the backend for a specific game log
+///
+/// Calls `GET /api/gamelog/{id}/replay-content` with PAT authentication.
+/// Returns (content, filename) on success.
+pub async fn download_replay_content(
+    api_url: &str,
+    gamelog_id: &str,
+    auth_token: &str,
+) -> Result<(String, String)> {
+    let client = reqwest::Client::new();
+    let url = format!("{}/api/gamelog/{}/replay-content", api_url, gamelog_id);
+
+    log::info!("Downloading replay content from: {}", url);
+
+    let response = client
+        .get(&url)
+        .header("Authorization", format!("Bearer {}", auth_token))
+        .send()
+        .await
+        .context("Failed to connect to backend for replay download")?;
+
+    let status = response.status();
+    if !status.is_success() {
+        let error_text = response.text().await.unwrap_or_else(|_| "Unknown error".to_string());
+        if status.as_u16() == 401 {
+            return Err(anyhow::anyhow!("Authentication failed. Please re-authenticate the Connector from MaMo."));
+        } else if status.as_u16() == 404 {
+            return Err(anyhow::anyhow!("Game log not found. It may have been deleted."));
+        } else if status.as_u16() == 400 {
+            return Err(anyhow::anyhow!("Game log has not been parsed. Only parsed logs can be replayed."));
+        }
+        return Err(anyhow::anyhow!("Failed to download replay: {} - {}", status, error_text));
+    }
+
+    let data: ReplayContentResponse = response.json().await
+        .context("Failed to parse replay content response")?;
+
+    if !data.success {
+        return Err(anyhow::anyhow!("Server returned error: {}", data.error.unwrap_or_default()));
+    }
+
+    let content = data.content
+        .ok_or_else(|| anyhow::anyhow!("Response missing replay content"))?;
+    let filename = data.filename
+        .unwrap_or_else(|| format!("replay_{}.json", gamelog_id));
+
+    Ok((content, filename))
+}
+
+/// Save replay content to the Forge gamelogs directory
+///
+/// Returns the full path to the saved file.
+pub fn save_replay_to_forge_dir(filename: &str, content: &str) -> Result<PathBuf> {
+    let gamelogs_dir = get_default_forge_log_directory();
+    if gamelogs_dir.is_empty() {
+        return Err(anyhow::anyhow!("Could not determine Forge gamelogs directory"));
+    }
+
+    let dir = Path::new(&gamelogs_dir);
+    if !dir.exists() {
+        fs::create_dir_all(dir)
+            .with_context(|| format!("Failed to create Forge gamelogs directory: {}", gamelogs_dir))?;
+    }
+
+    let file_path = dir.join(filename);
+    fs::write(&file_path, content)
+        .with_context(|| format!("Failed to write replay file: {:?}", file_path))?;
+
+    log::info!("Saved replay file to: {:?}", file_path);
+    Ok(file_path)
+}
+
 /// Filter options for processing game logs
 #[derive(Debug, Clone, Default)]
 pub struct GameLogFilterOptions {
