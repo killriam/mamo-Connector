@@ -10,18 +10,15 @@ use crate::deck::{create_deck_from_moxfield, MoxfieldDeckEntry, MamoDeckEntry, D
 use rfd::FileDialog;
 use crate::deeplink::Deeplink;
 use crate::forge::{get_default_forge_path, resolve_latest_forge_jar, validate_forge_path, launch_forge_from_settings};
-use crate::gamelog::{GameLogConfig, GameLogProcessResult, ScanSummary, get_default_forge_log_directory, validate_directory, scan_directory, load_processed_files, save_processed_files, DeckMappings, fetch_my_decks, suggest_deck_matches, load_cached_decks, save_cached_decks, process_new_logs_with_filter, GameLogFilterOptions, preview_scan, FilePreviewInfo};
+use crate::gamelog::{GameLogConfig, GameLogProcessResult, ScanSummary, get_default_forge_log_directory, validate_directory, scan_directory, load_processed_files, save_processed_files, DeckMappings, fetch_my_decks, suggest_deck_matches, load_cached_decks, save_cached_decks, process_new_logs_with_filter, GameLogFilterOptions, FilePreviewInfo};
 use crate::registration::{RegistrationOutcome, RegistrationStatus};
 use crate::settings::{Settings, SavedLink, SavedLinkType};
 use crate::get_pending_command_path;
 
 #[derive(Clone, PartialEq, Eq)]
 enum Tab {
-    Status,
-    Activity,
-    Import,
-    Sync,
-    GameLogs,
+    Home,
+    Decks,
     Settings,
 }
 
@@ -285,6 +282,10 @@ struct LauncherApp {
     forge_window_seen: bool,
     /// Timestamp of last automatic gamelog scan
     last_auto_gamelog_scan: Option<Instant>,
+    /// Whether the bottom activity panel is collapsed
+    activity_panel_collapsed: bool,
+    /// Track entry count to auto-expand on new errors
+    last_seen_entry_count: usize,
 }
 
 impl LauncherApp {
@@ -390,8 +391,8 @@ impl LauncherApp {
             }
         }
         
-        // Switch to Activity tab if started with a deeplink
-        let initial_tab = if started_with_deeplink { Tab::Activity } else { Tab::Import };
+        // Switch to Home tab (activity panel will auto-expand for deeplink progress)
+        let initial_tab = Tab::Home;
         
         Self {
             state,
@@ -409,6 +410,8 @@ impl LauncherApp {
             forge_monitoring_since: Arc::new(Mutex::new(None)),
             forge_window_seen: false,
             last_auto_gamelog_scan: None,
+            activity_panel_collapsed: !started_with_deeplink,
+            last_seen_entry_count: 0,
         }
     }
 }
@@ -500,6 +503,25 @@ impl eframe::App for LauncherApp {
         // Request a repaint in 500ms to keep checking for pending commands
         ctx.request_repaint_after(std::time::Duration::from_millis(500));
         
+        // Auto-expand activity panel when new errors arrive
+        {
+            if let Ok(log) = self.activity_log.lock() {
+                let current_count = log.entries.len();
+                if current_count > self.last_seen_entry_count {
+                    // Check if any new entry is an error
+                    let new_entries = current_count - self.last_seen_entry_count;
+                    let has_new_error = log.entries.iter().take(new_entries).any(|e| e.is_error);
+                    if has_new_error {
+                        self.activity_panel_collapsed = false;
+                    }
+                    self.last_seen_entry_count = current_count;
+                }
+            }
+        }
+        
+        // Bottom panel: Activity Log (rendered BEFORE CentralPanel per egui rules)
+        self.render_activity_panel(ctx);
+        
         egui::CentralPanel::default()
             .frame(egui::Frame::default().fill(egui::Color32::WHITE))
             .show(ctx, |ui| {
@@ -516,22 +538,13 @@ impl eframe::App for LauncherApp {
                 });
                 ui.separator();
                 
-                // Tab bar
+                // Tab bar — 3 tabs: Home, Decks, Settings
                 ui.horizontal(|ui| {
-                    if ui.selectable_label(self.current_tab == Tab::Status, "Status").clicked() {
-                        self.current_tab = Tab::Status;
+                    if ui.selectable_label(self.current_tab == Tab::Home, "🏠 Home").clicked() {
+                        self.current_tab = Tab::Home;
                     }
-                    if ui.selectable_label(self.current_tab == Tab::Import, "Import Decks").clicked() {
-                        self.current_tab = Tab::Import;
-                    }
-                    if ui.selectable_label(self.current_tab == Tab::Sync, "Sync").clicked() {
-                        self.current_tab = Tab::Sync;
-                    }
-                    if ui.selectable_label(self.current_tab == Tab::GameLogs, "Game Logs").clicked() {
-                        self.current_tab = Tab::GameLogs;
-                    }
-                    if ui.selectable_label(self.current_tab == Tab::Activity, "📋 Activity").clicked() {
-                        self.current_tab = Tab::Activity;
+                    if ui.selectable_label(self.current_tab == Tab::Decks, "📋 Decks").clicked() {
+                        self.current_tab = Tab::Decks;
                     }
                     if ui.selectable_label(self.current_tab == Tab::Settings, "⚙ Settings").clicked() {
                         self.current_tab = Tab::Settings;
@@ -541,11 +554,8 @@ impl eframe::App for LauncherApp {
                 
                 // Tab content
                 match self.current_tab {
-                    Tab::Status => self.render_status_tab(ui),
-                    Tab::Activity => self.render_activity_tab(ui),
-                    Tab::Import => self.render_import_tab(ui, ctx),
-                    Tab::Sync => self.render_sync_tab(ui, ctx),
-                    Tab::GameLogs => self.render_gamelog_tab(ui, ctx),
+                    Tab::Home => self.render_home_tab(ui, ctx),
+                    Tab::Decks => self.render_decks_tab(ui, ctx),
                     Tab::Settings => self.render_settings_tab(ui, ctx),
                 }
             });
@@ -560,8 +570,8 @@ impl LauncherApp {
         
         info!("Processing deeplink with progress: {}", deeplink.raw);
         
-        // Switch to Activity tab to show progress
-        self.current_tab = Tab::Activity;
+        // Expand activity panel to show progress (visible on all tabs)
+        self.activity_panel_collapsed = false;
         
         // Log the incoming command
         if let Ok(mut log) = self.activity_log.lock() {
@@ -733,8 +743,8 @@ impl LauncherApp {
                 if !raw_command.is_empty() {
                     info!("Processing pending command: {}", raw_command);
                     
-                    // Switch to Activity tab to show progress
-                    self.current_tab = Tab::Activity;
+                    // Expand activity panel to show progress
+                    self.activity_panel_collapsed = false;
                     
                     // Log the incoming command
                     if let Ok(mut log) = self.activity_log.lock() {
@@ -905,205 +915,349 @@ impl LauncherApp {
             }
         }
     }
-    
-    fn render_status_tab(&self, ui: &mut egui::Ui) {
-        ui.label("Registration Status");
-        let status_text = match self.state.registration.status {
-            RegistrationStatus::Registered => {
-                egui::RichText::new("[OK] Custom URI scheme registered")
-                    .color(egui::Color32::from_rgb(0, 128, 0))
-            }
-            RegistrationStatus::Failed => {
-                egui::RichText::new("[FAIL] Failed to register custom URI scheme")
-                    .color(egui::Color32::from_rgb(176, 0, 32))
-            }
-            RegistrationStatus::Skipped => {
-                egui::RichText::new("[SKIP] Scheme registration not supported")
-                    .color(egui::Color32::from_rgb(196, 112, 0))
-            }
-        };
-        ui.label(status_text);
-        ui.small(&self.state.registration.message);
-        
-        ui.separator();
-        
-        // Show deeplink info if available
-        if let Some(ref deeplink) = self.state.deeplink {
-            ui.label(egui::RichText::new("Deeplink Received:").strong());
-            if let Some(ref deck_id) = deeplink.deck_id {
-                ui.label(format!("  Deck ID: {}", deck_id));
-            }
-            if let Some(ref username) = deeplink.username {
-                ui.label(format!("  Username: {}", username));
-            }
-            ui.small(format!("  Raw URI: {}", &deeplink.raw));
-        }
-        
-        // Show command result if available
-        if let Some(ref result) = self.state.command_result {
-            ui.separator();
-            ui.label(egui::RichText::new("Command Result:").strong());
-            match result {
-                CommandResult::DeckCreated(deck_result) => {
-                    ui.label(egui::RichText::new(&deck_result.message)
-                        .color(egui::Color32::from_rgb(0, 128, 0)));
-                }
-                CommandResult::DeckCreatedAndLaunched(deck_result, forge_result) => {
-                    ui.label(egui::RichText::new(&deck_result.message)
-                        .color(egui::Color32::from_rgb(0, 128, 0)));
-                    ui.label(egui::RichText::new(&forge_result.message)
-                        .color(if forge_result.already_running {
-                            egui::Color32::from_rgb(180, 120, 0)
-                        } else if forge_result.success {
-                            egui::Color32::from_rgb(0, 128, 0)
-                        } else {
-                            egui::Color32::from_rgb(176, 0, 32)
-                        }));
-                }
-                CommandResult::ForgeLaunched(forge_result) => {
-                    ui.label(egui::RichText::new(&forge_result.message)
-                        .color(if forge_result.already_running {
-                            egui::Color32::from_rgb(180, 120, 0)
-                        } else if forge_result.success {
-                            egui::Color32::from_rgb(0, 128, 0)
-                        } else {
-                            egui::Color32::from_rgb(176, 0, 32)
-                        }));
-                }
-                CommandResult::Error(err) => {
-                    ui.label(egui::RichText::new(err)
-                        .color(egui::Color32::from_rgb(176, 0, 32)));
-                }
-                CommandResult::UserDecksImported(result) => {
-                    let success_count = result.imported_decks.iter().filter(|d| d.success).count();
-                    ui.label(format!("Imported {} of {} decks", success_count, result.total_decks));
-                    ui.small(&result.message);
-                }
-                CommandResult::UserDecksList(decks) => {
-                    ui.label(format!("Found {} decks for user", decks.len()));
-                    for deck in decks.iter().take(5) {
-                        let format_str = deck.format.as_deref().unwrap_or("Unknown");
-                        ui.small(format!("  - {} ({})", deck.name, format_str));
-                    }
-                    if decks.len() > 5 {
-                        ui.small(format!("  ... and {} more", decks.len() - 5));
-                    }
-                }
-                CommandResult::AuthTokenSaved(msg) => {
-                    ui.label(egui::RichText::new(msg)
-                        .color(egui::Color32::from_rgb(0, 128, 0)));
-                    // Reload settings from disk to get the new token
-                    if let Ok(new_settings) = Settings::load() {
-                        if let Some(ref token) = new_settings.auth_token {
-                            // Update the in-memory settings
-                            {
-                                let mut settings = self.settings.lock().unwrap();
-                                settings.auth_token = Some(token.clone());
-                                settings.gamelog_config.auth_token = Some(token.clone());
-                            }
-                            // Update the settings state UI
-                            {
-                                let mut state = self.settings_state.lock().unwrap();
-                                state.auth_token_input = token.clone();
-                                state.status_message = Some("Connected via deeplink!".to_string());
-                            }
+
+    // ==================== Activity Bottom Panel ====================
+
+    fn render_activity_panel(&mut self, ctx: &egui::Context) {
+        let panel_id = egui::Id::new("activity_panel");
+
+        if self.activity_panel_collapsed {
+            // Collapsed: single-line status bar
+            egui::TopBottomPanel::bottom(panel_id)
+                .resizable(false)
+                .min_height(28.0)
+                .max_height(28.0)
+                .frame(egui::Frame::default()
+                    .fill(egui::Color32::from_rgb(245, 245, 250))
+                    .inner_margin(egui::Margin::symmetric(8.0, 4.0))
+                    .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(220, 220, 230))))
+                .show(ctx, |ui| {
+                    ui.horizontal(|ui| {
+                        if ui.small_button("▲ Activity").clicked() {
+                            self.activity_panel_collapsed = false;
                         }
-                    }
-                }
-                CommandResult::UnknownAction(action) => {
-                    ui.label(egui::RichText::new(format!("Unknown action: {}", action))
-                        .color(egui::Color32::from_rgb(176, 0, 32)));
-                }
-                CommandResult::MissingParameters(msg) => {
-                    ui.label(egui::RichText::new(format!("Missing parameters: {}", msg))
-                        .color(egui::Color32::from_rgb(176, 0, 32)));
-                }
-            }
-        }
-        
-        // Build info section at the bottom
-        ui.separator();
-        ui.label(egui::RichText::new("Build Information").strong());
-        ui.horizontal(|ui| {
-            ui.label("Version:");
-            ui.label(egui::RichText::new(env!("CARGO_PKG_VERSION")).monospace());
-        });
-        ui.horizontal(|ui| {
-            ui.label("Git Commit:");
-            ui.label(egui::RichText::new(env!("GIT_HASH")).monospace());
-        });
-        ui.horizontal(|ui| {
-            ui.label("Branch:");
-            ui.label(egui::RichText::new(env!("GIT_BRANCH")).monospace());
-        });
-        ui.horizontal(|ui| {
-            ui.label("Built:");
-            ui.label(egui::RichText::new(env!("BUILD_TIME")).monospace());
-        });
-    }
-    
-    fn render_activity_tab(&self, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| {
-            ui.heading("Activity Log");
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui.button("Clear").clicked() {
-                    if let Ok(mut log) = self.activity_log.lock() {
-                        log.clear();
-                    }
-                }
-            });
-        });
-        ui.separator();
-        ui.small("Shows progress when processing deeplink commands (e.g., playtest links)");
-        ui.add_space(8.0);
-        
-        // Scrollable log area
-        let available_height = ui.available_height().max(200.0);
-        egui::ScrollArea::vertical()
-            .max_height(available_height)
-            .auto_shrink([false, false])
-            .stick_to_bottom(false)
-            .show(ui, |ui| {
-                if let Ok(log) = self.activity_log.lock() {
-                    if log.entries.is_empty() {
-                        ui.vertical_centered(|ui| {
-                            ui.add_space(40.0);
-                            ui.label(egui::RichText::new("No activity yet").italics().color(egui::Color32::GRAY));
-                            ui.add_space(8.0);
-                            ui.small("Activity will appear here when you use playtest links");
-                        });
-                    } else {
-                        for entry in &log.entries {
-                            ui.horizontal(|ui| {
-                                ui.label(egui::RichText::new(&entry.timestamp)
-                                    .monospace()
-                                    .color(egui::Color32::GRAY));
-                                
+                        // Show latest entry inline
+                        if let Ok(log) = self.activity_log.lock() {
+                            if let Some(entry) = log.entries.first() {
                                 let color = if entry.is_error {
                                     egui::Color32::from_rgb(176, 0, 32)
                                 } else if entry.is_success {
                                     egui::Color32::from_rgb(0, 128, 0)
                                 } else {
-                                    egui::Color32::BLACK
+                                    egui::Color32::GRAY
                                 };
-                                
-                                let prefix = if entry.is_error {
-                                    "❌ "
-                                } else if entry.is_success {
-                                    "✅ "
-                                } else {
-                                    "ℹ️ "
-                                };
-                                
-                                ui.label(egui::RichText::new(format!("{}{}", prefix, &entry.message))
-                                    .color(color));
-                            });
+                                let prefix = if entry.is_error { "❌" } else if entry.is_success { "✅" } else { "ℹ️" };
+                                ui.label(egui::RichText::new(format!("{} {} {}", entry.timestamp, prefix, entry.message))
+                                    .small().color(color));
+                            }
                         }
+                    });
+                });
+        } else {
+            // Expanded: scrollable log area
+            egui::TopBottomPanel::bottom(panel_id)
+                .resizable(true)
+                .min_height(60.0)
+                .max_height(250.0)
+                .default_height(150.0)
+                .frame(egui::Frame::default()
+                    .fill(egui::Color32::from_rgb(245, 245, 250))
+                    .inner_margin(egui::Margin::symmetric(8.0, 4.0))
+                    .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(220, 220, 230))))
+                .show(ctx, |ui| {
+                    // Header row
+                    ui.horizontal(|ui| {
+                        if ui.small_button("▼ Activity").clicked() {
+                            self.activity_panel_collapsed = true;
+                        }
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui.small_button("Clear").clicked() {
+                                if let Ok(mut log) = self.activity_log.lock() {
+                                    log.clear();
+                                    self.last_seen_entry_count = 0;
+                                }
+                            }
+                        });
+                    });
+
+                    // Scrollable log entries
+                    egui::ScrollArea::vertical()
+                        .auto_shrink([false, false])
+                        .stick_to_bottom(false)
+                        .show(ui, |ui| {
+                            if let Ok(log) = self.activity_log.lock() {
+                                if log.entries.is_empty() {
+                                    ui.label(egui::RichText::new("No activity yet").italics().color(egui::Color32::GRAY).small());
+                                } else {
+                                    for entry in &log.entries {
+                                        ui.horizontal(|ui| {
+                                            ui.label(egui::RichText::new(&entry.timestamp)
+                                                .monospace().small()
+                                                .color(egui::Color32::GRAY));
+
+                                            let color = if entry.is_error {
+                                                egui::Color32::from_rgb(176, 0, 32)
+                                            } else if entry.is_success {
+                                                egui::Color32::from_rgb(0, 128, 0)
+                                            } else {
+                                                egui::Color32::BLACK
+                                            };
+
+                                            let prefix = if entry.is_error {
+                                                "❌ "
+                                            } else if entry.is_success {
+                                                "✅ "
+                                            } else {
+                                                "ℹ️ "
+                                            };
+
+                                            ui.label(egui::RichText::new(format!("{}{}", prefix, &entry.message))
+                                                .small().color(color));
+                                        });
+                                    }
+                                }
+                            }
+                        });
+                });
+        }
+    }
+
+    // ==================== Home Tab ====================
+
+    fn render_home_tab(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        egui::ScrollArea::vertical().show(ui, |ui| {
+            // Connection status section
+            ui.group(|ui| {
+                ui.horizontal(|ui| {
+                    let has_token = {
+                        let state = self.settings_state.lock().unwrap();
+                        !state.auth_token_input.is_empty()
+                    };
+                    if has_token {
+                        ui.label(egui::RichText::new("● Connected to MaMo").color(egui::Color32::from_rgb(0, 128, 0)));
+                    } else {
+                        ui.label(egui::RichText::new("● Not connected").color(egui::Color32::from_rgb(176, 0, 32)));
+                        if ui.small_button("Configure →").clicked() {
+                            self.current_tab = Tab::Settings;
+                        }
+                    }
+
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        // Registration status (compact)
+                        let reg_text = match self.state.registration.status {
+                            RegistrationStatus::Registered => {
+                                egui::RichText::new("🔗 Deeplink OK").small().color(egui::Color32::from_rgb(0, 128, 0))
+                            }
+                            RegistrationStatus::Failed => {
+                                egui::RichText::new("🔗 Deeplink FAIL").small().color(egui::Color32::from_rgb(176, 0, 32))
+                            }
+                            RegistrationStatus::Skipped => {
+                                egui::RichText::new("🔗 Deeplink N/A").small().color(egui::Color32::from_rgb(196, 112, 0))
+                            }
+                        };
+                        ui.label(reg_text);
+                    });
+                });
+            });
+
+            ui.add_space(10.0);
+
+            // Quick Actions section
+            ui.group(|ui| {
+                ui.label(egui::RichText::new("Quick Actions").strong());
+                ui.add_space(5.0);
+
+                ui.horizontal(|ui| {
+                    // Launch Forge button
+                    let forge_configured = {
+                        let state = self.settings_state.lock().unwrap();
+                        state.forge_path_valid
+                    };
+                    if forge_configured {
+                        if ui.button("🎮 Launch Forge").clicked() {
+                            match launch_forge_from_settings(None) {
+                                Ok(result) => {
+                                    if let Ok(mut log) = self.activity_log.lock() {
+                                        if result.success {
+                                            log.log_success(&result.message);
+                                        } else {
+                                            log.log_info(&result.message);
+                                        }
+                                    }
+                                    // Track Forge PID for auto gamelog scanning
+                                    if let Some(pid) = result.pid {
+                                        *self.forge_pid.lock().unwrap() = Some(pid);
+                                        *self.forge_monitoring_since.lock().unwrap() = Some(Instant::now());
+                                        self.forge_window_seen = false;
+                                    }
+                                }
+                                Err(e) => {
+                                    if let Ok(mut log) = self.activity_log.lock() {
+                                        log.log_error(format!("Failed to launch Forge: {}", e));
+                                    }
+                                }
+                            }
+                        }
+                    } else {
+                        ui.add_enabled(false, egui::Button::new("🎮 Launch Forge"));
+                        if ui.small_button("Configure Forge →").clicked() {
+                            self.current_tab = Tab::Settings;
+                        }
+                    }
+
+                    // Upload Logs button
+                    let (is_scanning, directory_valid) = {
+                        let state = self.gamelog_state.lock().unwrap();
+                        (state.is_scanning, state.directory_valid)
+                    };
+                    if ui.add_enabled(!is_scanning && directory_valid, egui::Button::new("📋 Upload Logs")).clicked() {
+                        self.start_gamelog_scan(ctx);
+                    }
+                    if is_scanning {
+                        ui.spinner();
+                        ui.label("Uploading...");
+                    }
+                });
+            });
+
+            ui.add_space(10.0);
+
+            // Forge monitoring status
+            {
+                let monitoring = self.forge_monitoring_since.lock().unwrap().is_some();
+                if monitoring {
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new("🎮 Forge running").color(egui::Color32::from_rgb(0, 128, 0)));
+                        ui.label(egui::RichText::new("— auto-scanning active").small().color(egui::Color32::GRAY));
+                    });
+                    ui.add_space(5.0);
+                }
+            }
+
+            // Game Logs summary section
+            ui.group(|ui| {
+                ui.label(egui::RichText::new("Game Logs").strong());
+                ui.add_space(5.0);
+
+                let (directory_valid, processed_count, last_summary, status_message) = {
+                    let state = self.gamelog_state.lock().unwrap();
+                    (
+                        state.directory_valid,
+                        state.processed_files.len(),
+                        state.last_scan_summary.clone(),
+                        state.status_message.clone(),
+                    )
+                };
+
+                if !directory_valid {
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new("⚠ Log directory not configured").color(egui::Color32::from_rgb(196, 112, 0)));
+                        if ui.small_button("Configure →").clicked() {
+                            self.current_tab = Tab::Settings;
+                        }
+                    });
+                } else {
+                    ui.label(format!("Total files processed: {}", processed_count));
+
+                    if let Some(ref summary) = last_summary {
+                        ui.horizontal(|ui| {
+                            ui.label(egui::RichText::new(format!("Last scan: {} new, {} uploaded, {} failed",
+                                summary.new_files, summary.successfully_uploaded, summary.failed_uploads))
+                                .small());
+                        });
+                    }
+
+                    if let Some(ref msg) = status_message {
+                        let color = if msg.contains("Error") || msg.contains("failed") {
+                            egui::Color32::from_rgb(176, 0, 32)
+                        } else if msg.contains("uploaded") || msg.contains("Success") {
+                            egui::Color32::from_rgb(0, 128, 0)
+                        } else {
+                            egui::Color32::DARK_GRAY
+                        };
+                        ui.label(egui::RichText::new(msg).small().color(color));
                     }
                 }
             });
+
+            ui.add_space(10.0);
+
+            // Scan results (if any from last upload)
+            let scan_results: Vec<GameLogProcessResult> = {
+                let state = self.gamelog_state.lock().unwrap();
+                state.scan_results.clone()
+            };
+
+            if !scan_results.is_empty() {
+                ui.group(|ui| {
+                    ui.label(egui::RichText::new("📋 Last Upload Results").strong());
+                    ui.add_space(5.0);
+
+                    let successful = scan_results.iter().filter(|r| r.success).count();
+                    let failed = scan_results.len() - successful;
+
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new(format!("✓ {} uploaded", successful)).color(egui::Color32::from_rgb(0, 128, 0)));
+                        if failed > 0 {
+                            ui.label(egui::RichText::new(format!("✗ {} failed", failed)).color(egui::Color32::from_rgb(176, 0, 32)));
+                        }
+                    });
+
+                    egui::ScrollArea::vertical()
+                        .id_source("home_scan_results")
+                        .max_height(150.0)
+                        .show(ui, |ui| {
+                            for result in &scan_results {
+                                ui.horizontal(|ui| {
+                                    let (icon, color) = if result.success {
+                                        ("✓", egui::Color32::from_rgb(0, 128, 0))
+                                    } else {
+                                        ("✗", egui::Color32::from_rgb(176, 0, 32))
+                                    };
+                                    ui.label(egui::RichText::new(icon).color(color));
+                                    ui.label(egui::RichText::new(&result.filename).small());
+                                    if !result.success {
+                                        ui.label(egui::RichText::new(&result.message).small().color(egui::Color32::from_rgb(176, 0, 32)));
+                                    } else if let Some(ref deck) = result.deck_identifier {
+                                        ui.label(egui::RichText::new(format!("→ {}", deck)).small().color(egui::Color32::from_rgb(100, 149, 237)));
+                                    }
+                                });
+                            }
+                        });
+                });
+            }
+
+            ui.add_space(10.0);
+
+            // Build info (compact)
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new(format!(
+                    "v{}  ({})  {}",
+                    env!("CARGO_PKG_VERSION"),
+                    env!("GIT_HASH"),
+                    env!("GIT_BRANCH")
+                )).small().color(egui::Color32::GRAY));
+            });
+        });
     }
-    
+
+    // ==================== Decks Tab (merged Import + Sync) ====================
+
+    fn render_decks_tab(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        ui.label(egui::RichText::new(format!("Deck folder: {}", get_deck_directory_display())).weak().small());
+        ui.add_space(5.0);
+
+        // URL input section (from Import tab)
+        self.render_import_tab(ui, ctx);
+
+        ui.add_space(10.0);
+        ui.separator();
+        ui.add_space(5.0);
+
+        // Sync section (from Sync tab)
+        self.render_sync_tab(ui, ctx);
+    }
+
     fn detect_url_type(&self, url: &str) -> UrlType {
         let url = url.trim();
         
@@ -2139,373 +2293,6 @@ impl LauncherApp {
         });
     }
 
-    // ==================== Game Log Tab ====================
-
-    fn render_gamelog_tab(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
-        ui.label(egui::RichText::new("Game Log Reader").strong());
-        ui.add_space(5.0);
-        ui.label("Monitor Forge game logs and upload them to MaMo for analysis.");
-        ui.add_space(10.0);
-        
-        // Get current state
-        let (is_scanning, background_enabled, directory_input, directory_valid, file_count, status_message) = {
-            let state = self.gamelog_state.lock().unwrap();
-            (
-                state.is_scanning,
-                state.background_enabled,
-                state.directory_input.clone(),
-                state.directory_valid,
-                state.file_count,
-                state.status_message.clone(),
-            )
-        };
-        
-        // Directory configuration section
-        ui.group(|ui| {
-            ui.label(egui::RichText::new("📁 Directory Configuration").strong());
-            ui.add_space(5.0);
-            
-            ui.horizontal(|ui| {
-                ui.label("Watch Directory:");
-                let response = ui.add(
-                    egui::TextEdit::singleline(&mut self.gamelog_state.lock().unwrap().directory_input)
-                        .desired_width(400.0)
-                        .hint_text("Path to Forge game logs directory")
-                );
-                
-                if response.changed() {
-                    // Validate directory on change
-                    let new_path = self.gamelog_state.lock().unwrap().directory_input.clone();
-                    let valid = validate_directory(&new_path).unwrap_or(false);
-                    let mut state = self.gamelog_state.lock().unwrap();
-                    state.directory_valid = valid;
-                    state.file_count = None;
-                }
-                
-                if ui.button("Browse...").clicked() {
-                    // Use native file dialog to pick folder
-                    if let Some(folder) = rfd::FileDialog::new()
-                        .set_title("Select Forge Game Log Directory")
-                        .pick_folder()
-                    {
-                        let folder_str = folder.to_string_lossy().to_string();
-                        let valid = validate_directory(&folder_str).unwrap_or(false);
-                        let mut state = self.gamelog_state.lock().unwrap();
-                        state.directory_input = folder_str;
-                        state.directory_valid = valid;
-                        state.file_count = None;
-                    }
-                }
-            });
-            
-            ui.horizontal(|ui| {
-                if ui.button("Use Default").clicked() {
-                    let default_dir = get_default_forge_log_directory();
-                    let valid = validate_directory(&default_dir).unwrap_or(false);
-                    let mut state = self.gamelog_state.lock().unwrap();
-                    state.directory_input = default_dir;
-                    state.directory_valid = valid;
-                    state.file_count = None;
-                }
-                
-                if ui.button("Save").clicked() {
-                    self.save_gamelog_directory();
-                }
-                
-                // Show validation status
-                if directory_valid {
-                    ui.label(egui::RichText::new("✓ Valid").color(egui::Color32::from_rgb(0, 128, 0)));
-                    if let Some(count) = file_count {
-                        ui.label(format!("({} log files)", count));
-                    }
-                } else if !directory_input.is_empty() {
-                    ui.label(egui::RichText::new("✗ Invalid or inaccessible").color(egui::Color32::from_rgb(176, 0, 32)));
-                }
-            });
-        });
-        
-        ui.add_space(10.0);
-        
-        // Filter options section
-        ui.group(|ui| {
-            ui.label(egui::RichText::new("🔧 Filter Options").strong());
-            ui.add_space(5.0);
-            
-            // Days filter
-            ui.horizontal(|ui| {
-                ui.label("Only upload logs from last");
-                let mut days_input = {
-                    let state = self.gamelog_state.lock().unwrap();
-                    state.days_filter_input.clone()
-                };
-                let response = ui.add(
-                    egui::TextEdit::singleline(&mut days_input)
-                        .desired_width(50.0)
-                        .hint_text("0")
-                );
-                if response.changed() {
-                    let mut state = self.gamelog_state.lock().unwrap();
-                    state.days_filter_input = days_input.clone();
-                    // Parse and update days filter
-                    state.days_filter = days_input.parse().unwrap_or(0);
-                }
-                ui.label("days (0 = all)");
-            });
-            
-            ui.add_space(5.0);
-            
-            // Deck filter dropdown
-            let (user_decks, selected_deck_filters, show_dropdown) = {
-                let state = self.gamelog_state.lock().unwrap();
-                (state.user_decks.clone(), state.selected_deck_filters.clone(), state.show_deck_filter_dropdown)
-            };
-            
-            ui.horizontal(|ui| {
-                ui.label("Filter by decks:");
-                
-                let button_text = if selected_deck_filters.is_empty() {
-                    "All Decks ▼".to_string()
-                } else {
-                    format!("{} deck(s) selected ▼", selected_deck_filters.len())
-                };
-                
-                if ui.button(&button_text).clicked() {
-                    let mut state = self.gamelog_state.lock().unwrap();
-                    state.show_deck_filter_dropdown = !state.show_deck_filter_dropdown;
-                }
-                
-                if !selected_deck_filters.is_empty() {
-                    if ui.button("Clear").clicked() {
-                        let mut state = self.gamelog_state.lock().unwrap();
-                        state.selected_deck_filters.clear();
-                    }
-                }
-            });
-            
-            // Deck filter dropdown content
-            if show_dropdown && !user_decks.is_empty() {
-                ui.indent("deck_filter_dropdown", |ui| {
-                    egui::ScrollArea::vertical()
-                        .max_height(150.0)
-                        .show(ui, |ui| {
-                            for deck in &user_decks {
-                                let mut selected = selected_deck_filters.contains(&deck.deck_name);
-                                if ui.checkbox(&mut selected, &deck.deck_name).changed() {
-                                    let mut state = self.gamelog_state.lock().unwrap();
-                                    if selected {
-                                        state.selected_deck_filters.insert(deck.deck_name.clone());
-                                    } else {
-                                        state.selected_deck_filters.remove(&deck.deck_name);
-                                    }
-                                }
-                            }
-                        });
-                });
-            } else if show_dropdown && user_decks.is_empty() {
-                ui.label(egui::RichText::new("No decks loaded. Click 'Refresh Decks' below.").small().weak());
-            }
-            
-            // Show current filter summary
-            let days_filter = {
-                let state = self.gamelog_state.lock().unwrap();
-                state.days_filter
-            };
-            if days_filter > 0 || !selected_deck_filters.is_empty() {
-                ui.add_space(3.0);
-                let mut filter_parts = Vec::new();
-                if days_filter > 0 {
-                    filter_parts.push(format!("Last {} days", days_filter));
-                }
-                if !selected_deck_filters.is_empty() {
-                    filter_parts.push(format!("{} decks", selected_deck_filters.len()));
-                }
-                ui.label(egui::RichText::new(format!("Active filters: {}", filter_parts.join(", "))).small().color(egui::Color32::from_rgb(0, 100, 200)));
-            }
-        });
-        
-        ui.add_space(10.0);
-        
-        // Scan controls section
-        let (is_previewing, preview_results) = {
-            let state = self.gamelog_state.lock().unwrap();
-            (state.is_previewing, state.preview_results.clone())
-        };
-        
-        ui.group(|ui| {
-            ui.label(egui::RichText::new("🔍 Scan Controls").strong());
-            ui.add_space(5.0);
-            
-            ui.horizontal(|ui| {
-                // Preview button - shows what would be uploaded
-                if ui.add_enabled(!is_scanning && !is_previewing && directory_valid, egui::Button::new("👁 Preview")).clicked() {
-                    self.preview_gamelog_scan();
-                }
-                
-                // Manual scan button
-                if ui.add_enabled(!is_scanning && directory_valid, egui::Button::new("🔄 Upload")).clicked() {
-                    self.start_gamelog_scan(ctx);
-                }
-                
-                // Background scanning toggle
-                let mut bg_enabled = background_enabled;
-                if ui.checkbox(&mut bg_enabled, "Enable Background Scanning").changed() {
-                    self.toggle_background_scanning(bg_enabled);
-                }
-                
-                if is_scanning {
-                    ui.spinner();
-                    ui.label("Uploading...");
-                }
-                if is_previewing {
-                    ui.spinner();
-                    ui.label("Scanning...");
-                }
-            });
-            
-            if background_enabled {
-                ui.label(egui::RichText::new("Background scanning is active. New logs will be uploaded automatically.").small().weak());
-            }
-        });
-        
-        // Preview results section
-        if !preview_results.is_empty() {
-            ui.add_space(10.0);
-            ui.group(|ui| {
-                ui.label(egui::RichText::new(format!("📋 Preview: {} files to upload", preview_results.len())).strong());
-                ui.add_space(5.0);
-                
-                // Count by deck
-                let mut deck_counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
-                for p in &preview_results {
-                    let deck = p.detected_deck.clone().unwrap_or_else(|| "Unknown".to_string());
-                    *deck_counts.entry(deck).or_insert(0) += 1;
-                }
-                
-                // Show deck summary
-                ui.label(egui::RichText::new("Decks detected:").small());
-                for (deck, count) in &deck_counts {
-                    ui.horizontal(|ui| {
-                        ui.label(egui::RichText::new(format!("  • {} ({})", deck, count)).small().color(egui::Color32::from_rgb(100, 149, 237)));
-                    });
-                }
-                
-                ui.add_space(5.0);
-                
-                // File list
-                egui::ScrollArea::vertical()
-                    .max_height(200.0)
-                    .show(ui, |ui| {
-                        for preview in &preview_results {
-                            ui.horizontal(|ui| {
-                                ui.label(egui::RichText::new("○").color(egui::Color32::GRAY));
-                                ui.label(&preview.filename);
-                                ui.label(egui::RichText::new(format!("({} bytes)", preview.file_size)).small().weak());
-                                if let Some(ref deck) = preview.detected_deck {
-                                    ui.label(egui::RichText::new(format!("→ {}", deck)).small().color(egui::Color32::from_rgb(100, 149, 237)));
-                                } else {
-                                    ui.label(egui::RichText::new("→ ?").small().color(egui::Color32::GRAY));
-                                }
-                            });
-                        }
-                    });
-                
-                ui.add_space(5.0);
-                ui.horizontal(|ui| {
-                    if ui.button("Clear Preview").clicked() {
-                        let mut state = self.gamelog_state.lock().unwrap();
-                        state.preview_results.clear();
-                    }
-                });
-            });
-        }
-        
-        ui.add_space(10.0);
-        
-        // Deck Mapping section
-        self.render_deck_mapping_section(ui, ctx);
-        
-        ui.add_space(10.0);
-        
-        // Status message
-        if let Some(msg) = status_message {
-            let color = if msg.contains("Error") || msg.contains("failed") {
-                egui::Color32::from_rgb(176, 0, 32)
-            } else if msg.contains("Success") || msg.contains("uploaded") {
-                egui::Color32::from_rgb(0, 128, 0)
-            } else {
-                egui::Color32::DARK_GRAY
-            };
-            ui.label(egui::RichText::new(&msg).color(color));
-            ui.add_space(5.0);
-        }
-        
-        // Results section
-        let scan_results: Vec<GameLogProcessResult> = {
-            let state = self.gamelog_state.lock().unwrap();
-            state.scan_results.clone()
-        };
-        
-        if !scan_results.is_empty() {
-            ui.separator();
-            ui.label(egui::RichText::new("📋 Scan Results").strong());
-            ui.add_space(5.0);
-            
-            // Summary
-            let successful = scan_results.iter().filter(|r| r.success).count();
-            let failed = scan_results.len() - successful;
-            
-            ui.horizontal(|ui| {
-                ui.label(egui::RichText::new(format!("✓ {} uploaded", successful)).color(egui::Color32::from_rgb(0, 128, 0)));
-                if failed > 0 {
-                    ui.label(egui::RichText::new(format!("✗ {} failed", failed)).color(egui::Color32::from_rgb(176, 0, 32)));
-                }
-            });
-            
-            ui.add_space(5.0);
-            
-            // Results list
-            egui::ScrollArea::vertical()
-                .max_height(200.0)
-                .show(ui, |ui| {
-                    for result in &scan_results {
-                        ui.horizontal(|ui| {
-                            let (icon, color) = if result.success {
-                                ("✓", egui::Color32::from_rgb(0, 128, 0))
-                            } else {
-                                ("✗", egui::Color32::from_rgb(176, 0, 32))
-                            };
-                            ui.label(egui::RichText::new(icon).color(color));
-                            ui.label(&result.filename);
-                            if result.success {
-                                ui.label(egui::RichText::new(format!("({} bytes)", result.file_size)).small().weak());
-                                // Show detected deck if available
-                                if let Some(ref deck) = result.deck_identifier {
-                                    ui.label(egui::RichText::new(format!("→ {}", deck)).small().color(egui::Color32::from_rgb(100, 149, 237)));
-                                }
-                            } else {
-                                ui.label(egui::RichText::new(&result.message).small().color(egui::Color32::from_rgb(176, 0, 32)));
-                            }
-                        });
-                    }
-                });
-        }
-        
-        // Processed files info
-        let processed_count = {
-            let state = self.gamelog_state.lock().unwrap();
-            state.processed_files.len()
-        };
-        
-        ui.add_space(10.0);
-        ui.separator();
-        ui.horizontal(|ui| {
-            ui.label(egui::RichText::new(format!("Total files processed: {}", processed_count)).small().weak());
-            if ui.small_button("Clear History").clicked() {
-                self.clear_processed_history();
-            }
-        });
-    }
-
     fn save_gamelog_directory(&mut self) {
         let directory_input = {
             let state = self.gamelog_state.lock().unwrap();
@@ -2541,61 +2328,6 @@ impl LauncherApp {
             state.status_message = Some("Directory saved successfully".to_string());
         } else {
             state.status_message = Some("Error: Directory is not valid or accessible".to_string());
-        }
-    }
-
-    fn preview_gamelog_scan(&mut self) {
-        let gamelog_state = Arc::clone(&self.gamelog_state);
-        let settings = Arc::clone(&self.settings);
-        
-        // Get filter options
-        let filter_options = {
-            let state = gamelog_state.lock().unwrap();
-            GameLogFilterOptions {
-                days_filter: state.days_filter,
-                deck_filter: state.selected_deck_filters.clone(),
-            }
-        };
-        
-        // Mark as previewing
-        {
-            let mut state = gamelog_state.lock().unwrap();
-            state.is_previewing = true;
-            state.preview_results.clear();
-        }
-        
-        // Run preview synchronously (it's fast, just reads files)
-        let config = {
-            let settings = settings.lock().unwrap();
-            settings.gamelog_config.clone()
-        };
-        
-        let processed_files = {
-            let state = gamelog_state.lock().unwrap();
-            state.processed_files.clone()
-        };
-        
-        let result = preview_scan(&config, &processed_files, &filter_options);
-        
-        {
-            let mut state = gamelog_state.lock().unwrap();
-            state.is_previewing = false;
-            
-            match result {
-                Ok(previews) => {
-                    let count = previews.len();
-                    state.preview_results = previews.into_iter().map(|p| FilePreviewInfo {
-                        filename: p.filename,
-                        file_size: p.file_size,
-                        detected_deck: p.detected_deck,
-                        modified_date: p.modified_date,
-                    }).collect();
-                    state.status_message = Some(format!("Preview: {} files ready to upload", count));
-                }
-                Err(e) => {
-                    state.status_message = Some(format!("Preview error: {}", e));
-                }
-            }
         }
     }
 
@@ -3046,7 +2778,8 @@ impl LauncherApp {
 
     // ==================== Settings Tab ====================
 
-    fn render_settings_tab(&mut self, ui: &mut egui::Ui, _ctx: &egui::Context) {
+    fn render_settings_tab(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        egui::ScrollArea::vertical().show(ui, |ui| {
         ui.label(egui::RichText::new("⚙ Settings").strong());
         ui.add_space(10.0);
         
@@ -3270,6 +3003,106 @@ impl LauncherApp {
         });
         
         ui.add_space(15.0);
+
+        // Game Logs — Directory & Filters section (moved from GameLogs tab)
+        {
+            let (directory_input, directory_valid, file_count, background_enabled) = {
+                let state = self.gamelog_state.lock().unwrap();
+                (
+                    state.directory_input.clone(),
+                    state.directory_valid,
+                    state.file_count,
+                    state.background_enabled,
+                )
+            };
+
+            ui.group(|ui| {
+                ui.label(egui::RichText::new("📁 Game Logs — Directory & Filters").strong());
+                ui.add_space(5.0);
+
+                ui.horizontal(|ui| {
+                    ui.label("Watch Directory:");
+                    let response = ui.add(
+                        egui::TextEdit::singleline(&mut self.gamelog_state.lock().unwrap().directory_input)
+                            .desired_width(400.0)
+                            .hint_text("Path to Forge game logs directory")
+                    );
+
+                    if response.changed() {
+                        let new_path = self.gamelog_state.lock().unwrap().directory_input.clone();
+                        let valid = validate_directory(&new_path).unwrap_or(false);
+                        let mut state = self.gamelog_state.lock().unwrap();
+                        state.directory_valid = valid;
+                        state.file_count = None;
+                    }
+
+                    if ui.button("Browse...").clicked() {
+                        if let Some(folder) = rfd::FileDialog::new()
+                            .set_title("Select Forge Game Log Directory")
+                            .pick_folder()
+                        {
+                            let folder_str = folder.to_string_lossy().to_string();
+                            let valid = validate_directory(&folder_str).unwrap_or(false);
+                            let mut state = self.gamelog_state.lock().unwrap();
+                            state.directory_input = folder_str;
+                            state.directory_valid = valid;
+                            state.file_count = None;
+                        }
+                    }
+                });
+
+                ui.horizontal(|ui| {
+                    if ui.button("Use Default").clicked() {
+                        let default_dir = get_default_forge_log_directory();
+                        let valid = validate_directory(&default_dir).unwrap_or(false);
+                        let mut state = self.gamelog_state.lock().unwrap();
+                        state.directory_input = default_dir;
+                        state.directory_valid = valid;
+                        state.file_count = None;
+                    }
+
+                    if ui.button("Save").clicked() {
+                        self.save_gamelog_directory();
+                    }
+
+                    if directory_valid {
+                        ui.label(egui::RichText::new("✓ Valid").color(egui::Color32::from_rgb(0, 128, 0)));
+                        if let Some(count) = file_count {
+                            ui.label(format!("({} log files)", count));
+                        }
+                    } else if !directory_input.is_empty() {
+                        ui.label(egui::RichText::new("✗ Invalid or inaccessible").color(egui::Color32::from_rgb(176, 0, 32)));
+                    }
+                });
+
+                ui.add_space(5.0);
+
+                // Background scanning toggle
+                let mut bg_enabled = background_enabled;
+                if ui.checkbox(&mut bg_enabled, "Enable Background Scanning").changed() {
+                    self.toggle_background_scanning(bg_enabled);
+                }
+
+                // Processed files info
+                let processed_count = {
+                    let state = self.gamelog_state.lock().unwrap();
+                    state.processed_files.len()
+                };
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new(format!("Total files processed: {}", processed_count)).small().weak());
+                    if ui.small_button("Clear History").clicked() {
+                        self.clear_processed_history();
+                    }
+                });
+            });
+        }
+
+        ui.add_space(15.0);
+
+        // Deck Mapping section (moved from GameLogs tab)
+        self.render_deck_mapping_section(ui, ctx);
+
+        ui.add_space(15.0);
         
         // URL Scheme Info
         ui.group(|ui| {
@@ -3321,6 +3154,7 @@ impl LauncherApp {
             };
             ui.label(egui::RichText::new(msg).color(color));
         }
+        }); // end ScrollArea
     }
 
     fn save_forge_settings(&mut self) {
