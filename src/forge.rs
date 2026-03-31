@@ -213,11 +213,15 @@ fn is_executable(path: &PathBuf) -> bool {
         .unwrap_or(false)
 }
 
+use log::debug;
 /// Launch Forge with an optional deck file
 pub fn launch_forge(forge_path: &str, deck_path: Option<&str>) -> Result<ForgeLaunchResult> {
     let forge_path_buf = PathBuf::from(forge_path);
-    
+    debug!("[launch_forge] Input forge_path: {}", forge_path);
+    debug!("[launch_forge] Input deck_path: {:?}", deck_path);
+
     if !forge_path_buf.exists() {
+        error!("[launch_forge] Forge path does not exist: {}", forge_path);
         return Ok(ForgeLaunchResult::failure(format!(
             "Forge executable not found at: {}", forge_path
         )));
@@ -225,12 +229,14 @@ pub fn launch_forge(forge_path: &str, deck_path: Option<&str>) -> Result<ForgeLa
 
     // If a directory was configured, resolve to the latest forge-gui-desktop JAR inside it
     let forge_path_buf = if forge_path_buf.is_dir() {
+        debug!("[launch_forge] Forge path is a directory, attempting to resolve latest JAR");
         match resolve_latest_forge_jar(&forge_path_buf) {
             Some(jar) => {
                 info!("Resolved Forge directory to latest JAR: {}", jar.display());
                 jar
             }
             None => {
+                error!("[launch_forge] No forge-gui-desktop JAR found in directory: {}", forge_path);
                 return Ok(ForgeLaunchResult::failure(format!(
                     "No forge-gui-desktop JAR found in directory: {}", forge_path
                 )));
@@ -248,109 +254,99 @@ pub fn launch_forge(forge_path: &str, deck_path: Option<&str>) -> Result<ForgeLa
 
     // Get the directory containing Forge - important for finding dependencies
     let forge_dir = forge_path_buf.parent().map(|p| p.to_path_buf());
+    debug!("[launch_forge] Forge directory: {:?}", forge_dir);
 
     let extension = forge_path_buf.extension()
         .and_then(|e| e.to_str())
         .unwrap_or("")
         .to_lowercase();
+    debug!("[launch_forge] Forge file extension: {}", extension);
 
     let result = match extension.as_str() {
         "jar" => {
-            // Launch JAR file with java - need to set working directory
+            debug!("[launch_forge] Launching as JAR with java");
             let mut cmd = Command::new("java");
             cmd.arg("-Xmx4096m")
                .arg("-Dio.netty.tryReflectionSetAccessible=true")
                .arg("-Dfile.encoding=UTF-8")
                .arg("-jar")
                .arg(&forge_path_buf);
-            
+            debug!("[launch_forge] Java command: java -Xmx4096m -Dio.netty.tryReflectionSetAccessible=true -Dfile.encoding=UTF-8 -jar {}", resolved_path_str);
             if let Some(dir) = &forge_dir {
+                debug!("[launch_forge] Setting working directory: {}", dir.display());
                 cmd.current_dir(dir);
             }
-            
             if let Some(deck) = deck_path {
+                debug!("[launch_forge] Adding deck argument: {}", deck);
                 cmd.arg("--deck").arg(deck);
             }
-            
             cmd.spawn()
         }
         "exe" | "cmd" | "bat" => {
-            // On Windows, directly launch the executable from its directory
-            // The forge.exe launcher needs to run from its directory to find the JAR
-            // Note: Forge doesn't support command-line deck loading, 
-            // but the deck is saved to the Forge decks directory for manual opening
+            debug!("[launch_forge] Launching as Windows executable");
             #[cfg(windows)]
             {
                 use std::os::windows::process::CommandExt;
                 const DETACHED_PROCESS: u32 = 0x00000008;
-                
                 let mut cmd = Command::new(&forge_path_buf);
-                
-                // Critical: Set working directory to forge's directory
+                debug!("[launch_forge] Executable command: {:?}", &forge_path_buf);
                 if let Some(dir) = &forge_dir {
+                    debug!("[launch_forge] Setting working directory: {}", dir.display());
                     cmd.current_dir(dir);
                 }
-                
-                // Use DETACHED_PROCESS so forge runs independently
                 cmd.creation_flags(DETACHED_PROCESS);
-                
-                // Note: Forge doesn't support --deck command line argument
-                // Deck is available in Forge's deck folder after download
-                
+                debug!("[launch_forge] Using DETACHED_PROCESS flag");
                 cmd.spawn()
             }
             #[cfg(not(windows))]
             {
                 let mut cmd = Command::new(&forge_path_buf);
-                
+                debug!("[launch_forge] Executable command (non-windows): {:?}", &forge_path_buf);
                 if let Some(dir) = &forge_dir {
+                    debug!("[launch_forge] Setting working directory: {}", dir.display());
                     cmd.current_dir(dir);
                 }
-                
                 if let Some(deck) = deck_path {
+                    debug!("[launch_forge] Adding deck argument: {}", deck);
                     cmd.arg("--deck").arg(deck);
                 }
-                
                 cmd.spawn()
             }
         }
         "app" => {
-            // Launch macOS app bundle
+            debug!("[launch_forge] Launching as macOS app bundle");
             let mut cmd = Command::new("open");
             cmd.arg(&forge_path_buf);
-            
             if let Some(deck) = deck_path {
+                debug!("[launch_forge] Adding deck argument for macOS: {}", deck);
                 cmd.arg("--args").arg("--deck").arg(deck);
             }
-            
             cmd.spawn()
         }
         "sh" => {
-            // Launch shell script with working directory
+            debug!("[launch_forge] Launching as shell script");
             let mut cmd = Command::new(&forge_path_buf);
-            
             if let Some(dir) = &forge_dir {
+                debug!("[launch_forge] Setting working directory: {}", dir.display());
                 cmd.current_dir(dir);
             }
-            
             if let Some(deck) = deck_path {
+                debug!("[launch_forge] Adding deck argument: {}", deck);
                 cmd.arg("--deck").arg(deck);
             }
-            
             cmd.spawn()
         }
         _ => {
-            // Try to launch as executable with working directory
+            debug!("[launch_forge] Launching as generic executable");
             let mut cmd = Command::new(&forge_path_buf);
-            
             if let Some(dir) = &forge_dir {
+                debug!("[launch_forge] Setting working directory: {}", dir.display());
                 cmd.current_dir(dir);
             }
-            
             if let Some(deck) = deck_path {
+                debug!("[launch_forge] Adding deck argument: {}", deck);
                 cmd.arg("--deck").arg(deck);
             }
-            
             cmd.spawn()
         }
     };
@@ -359,6 +355,7 @@ pub fn launch_forge(forge_path: &str, deck_path: Option<&str>) -> Result<ForgeLa
         Ok(child) => {
             let pid = child.id();
             info!("Forge launched successfully with PID: {:?}", pid);
+            debug!("[launch_forge] Child process PID: {:?}", pid);
             Ok(ForgeLaunchResult::success(
                 format!("Forge launched successfully"),
                 deck_path.map(|s| s.to_string()),
@@ -368,6 +365,7 @@ pub fn launch_forge(forge_path: &str, deck_path: Option<&str>) -> Result<ForgeLa
         }
         Err(e) => {
             error!("Failed to launch Forge: {}", e);
+            debug!("[launch_forge] Command spawn error: {}", e);
             Ok(ForgeLaunchResult::failure(format!(
                 "Failed to launch Forge: {}", e
             )))
@@ -534,16 +532,9 @@ pub fn launch_forge_replay(replay_path: &str) -> Result<ForgeLaunchResult> {
 
 /// Launch Forge using the path from settings
 pub fn launch_forge_from_settings(deck_path: Option<&str>) -> Result<ForgeLaunchResult> {
-    // Don't open another Forge window if one is already visible
+    // Log if Forge is already running, but do not skip launch
     if is_forge_window_open() {
-        info!("Forge is already running — skipping launch");
-        let deck_name = deck_path.map(|p| {
-            PathBuf::from(p)
-                .file_stem()
-                .map(|s| s.to_string_lossy().to_string())
-                .unwrap_or_else(|| p.to_string())
-        });
-        return Ok(ForgeLaunchResult::hint_already_running(deck_name));
+        info!("Forge is already running (window detected), but will attempt to launch again.");
     }
 
     let settings = Settings::load()?;
