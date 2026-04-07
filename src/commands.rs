@@ -5,6 +5,7 @@ use crate::deck::{create_deck_from_id, create_deck_from_moxfield, create_deck_fr
 use crate::forge::{launch_forge_from_settings, launch_forge_replay, ForgeLaunchResult};
 use crate::gamelog::{download_replay_content, save_replay_to_forge_dir};
 use crate::settings::Settings;
+use crate::simulation::{run_simulation_for_deck, SimulationResult};
 
 /// Type alias for a shared log collector
 pub type SharedLogCollector = Arc<Mutex<Vec<String>>>;
@@ -28,6 +29,7 @@ pub enum CommandResult {
     UserDecksImported(UserDecksImportResult),
     UserDecksList(Vec<MoxfieldDeckEntry>),
     AuthTokenSaved(String),  // Success message
+    SimulationCompleted(SimulationResult),
     UnknownAction(String),
     MissingParameters(String),
     Error(String),
@@ -46,6 +48,7 @@ impl CommandResult {
             CommandResult::UserDecksImported(result) => result.message.clone(),
             CommandResult::UserDecksList(decks) => format!("Found {} decks", decks.len()),
             CommandResult::AuthTokenSaved(msg) => msg.clone(),
+            CommandResult::SimulationCompleted(result) => result.message.clone(),
             CommandResult::UnknownAction(action) => format!("Unknown action: {}", action),
             CommandResult::MissingParameters(msg) => format!("Missing parameters: {}", msg),
             CommandResult::Error(msg) => format!("Error: {}", msg),
@@ -63,6 +66,7 @@ impl CommandResult {
             CommandResult::UserDecksImported(result) => result.success,
             CommandResult::UserDecksList(decks) => !decks.is_empty(),
             CommandResult::AuthTokenSaved(_) => true,
+            CommandResult::SimulationCompleted(result) => result.success,
             _ => false,
         }
     }
@@ -96,6 +100,7 @@ pub async fn handle_command_with_logger(deeplink: &Deeplink, log_collector: Opti
         "import-user-decks" | "importuserdecks" => handle_import_user_decks(deeplink).await,
         "list-user-decks" | "listuserdecks" => handle_list_user_decks(deeplink).await,
         "auth" | "authenticate" | "connect" => handle_auth(deeplink).await, // Auth token: mamoConnector://auth?token=xxx
+        "simulate" => handle_simulate(deeplink, log_collector).await, // AI simulation: mamoConnector://simulate/DECK_UUID
         "" => CommandResult::MissingParameters("No action specified in deeplink".to_string()),
         action => {
             warn!("Unknown action received: {}", action);
@@ -595,6 +600,73 @@ async fn handle_list_user_decks(deeplink: &Deeplink) -> CommandResult {
             CommandResult::Error(format!("Failed to list user decks: {}", err))
         }
     }
+}
+
+/// Handle mamoConnector://simulate/DECK_UUID
+///
+/// Full simulation pipeline:
+///   1. Download deck from MaMo backend (.dck format)
+///   2. Run Forge headless batch simulation
+///   3. Analyse per-game stat JSONs with Python script
+///   4. POST aggregated report to MaMo backend
+async fn handle_simulate(deeplink: &Deeplink, log_collector: Option<SharedLogCollector>) -> CommandResult {
+    let log = |msg: &str| {
+        info!("{}", msg);
+        if let Some(ref collector) = log_collector {
+            if let Ok(mut logs) = collector.lock() {
+                logs.push(msg.to_string());
+            }
+        }
+    };
+
+    let deck_id = deeplink.deck_id.clone()
+        .or_else(|| get_parameter(&deeplink.params, "id"))
+        .or_else(|| get_parameter(&deeplink.params, "deck_id"))
+        .or_else(|| get_parameter(&deeplink.params, "deckId"));
+
+    let deck_id = match deck_id {
+        Some(id) if !id.is_empty() => id,
+        _ => {
+            error!("No deck UUID provided in simulate command");
+            return CommandResult::MissingParameters(
+                "Deck UUID is required. Use mamoConnector://simulate/DECK_UUID".to_string(),
+            );
+        }
+    };
+
+    log(&format!("Simulate command — deck UUID: {}", deck_id));
+
+    // Download deck from MaMo backend to get the local .dck file name
+    log("Downloading deck from MaMo backend…");
+    let deck_result = match create_deck_from_mamo(&deck_id).await {
+        Ok(r) => r,
+        Err(e) => {
+            error!("Failed to download deck for simulation: {}", e);
+            return CommandResult::Error(format!("Failed to download deck: {}", e));
+        }
+    };
+
+    if !deck_result.success {
+        return CommandResult::Error(format!("Deck download failed: {}", deck_result.message));
+    }
+
+    // Extract deck name stem from the saved .dck file path
+    let deck_name = match &deck_result.deck_path {
+        Some(path) => path
+            .file_stem()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_else(|| "Unknown".to_string()),
+        None => {
+            return CommandResult::Error(
+                "Deck downloaded but path unknown — cannot determine deck name for simulation".to_string(),
+            )
+        }
+    };
+
+    log(&format!("Deck '{}' ready. Starting AI simulation…", deck_name));
+
+    let result = run_simulation_for_deck(&deck_id, &deck_name, &log).await;
+    CommandResult::SimulationCompleted(result)
 }
 
 fn get_parameter(params: &[(String, String)], key: &str) -> Option<String> {

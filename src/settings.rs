@@ -56,6 +56,10 @@ fn default_true() -> bool {
     true
 }
 
+fn default_simulation_games() -> u32 {
+    100
+}
+
 impl SavedLink {
     /// Create a new saved link
     pub fn new(name: String, link_type: SavedLinkType, url: String) -> Self {
@@ -112,6 +116,12 @@ pub struct Settings {
     /// Authentication token for MaMo API (JWT)
     #[serde(default)]
     pub auth_token: Option<String>,
+    /// Path to the Forge scripts directory (contains run_commander_simulation.ps1 etc.)
+    #[serde(default)]
+    pub forge_scripts_path: Option<String>,
+    /// Default number of games to run in AI simulations
+    #[serde(default = "default_simulation_games")]
+    pub simulation_games: u32,
 }
 
 impl Settings {

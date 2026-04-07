@@ -397,9 +397,16 @@ impl LauncherApp {
                         activity_log.log_error(&forge_result.message);
                     }
                 }
+                CommandResult::SimulationCompleted(sim_result) => {
+                    if sim_result.success {
+                        activity_log.log_success(&sim_result.message);
+                    } else {
+                        activity_log.log_error(&sim_result.message);
+                    }
+                }
             }
         }
-        
+
         // Switch to Home tab (activity panel will auto-expand for deeplink progress)
         let initial_tab = Tab::Home;
         
@@ -702,9 +709,16 @@ impl LauncherApp {
                             log.log_error(&forge_result.message);
                         }
                     }
+                    commands::CommandResult::SimulationCompleted(sim_result) => {
+                        if sim_result.success {
+                            log.log_success(&sim_result.message);
+                        } else {
+                            log.log_error(&sim_result.message);
+                        }
+                    }
                 }
             }
-            
+
             // Track Forge PID for auto gamelog scanning
             match &result {
                 commands::CommandResult::DeckCreatedAndLaunched(_, forge_result) if forge_result.success => {
@@ -893,9 +907,16 @@ impl LauncherApp {
                                             log.log_error(&forge_result.message);
                                         }
                                     }
+                                    commands::CommandResult::SimulationCompleted(sim_result) => {
+                                        if sim_result.success {
+                                            log.log_success(&sim_result.message);
+                                        } else {
+                                            log.log_error(&sim_result.message);
+                                        }
+                                    }
                                 }
                             }
-                            
+
                             // Track Forge PID for auto gamelog scanning
                             match &result {
                                 commands::CommandResult::DeckCreatedAndLaunched(_, forge_result) if forge_result.success => {

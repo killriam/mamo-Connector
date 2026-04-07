@@ -5,6 +5,7 @@ mod forge;
 mod gamelog;
 mod registration;
 mod settings;
+mod simulation;
 mod ui;
 
 use anyhow::Result;
