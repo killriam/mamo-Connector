@@ -119,6 +119,8 @@ struct SettingsState {
     forge_path_valid: bool,
     /// Auto-launch Forge after deck download
     forge_auto_launch: bool,
+    /// Path to the Forge scripts directory (run_commander_simulation.ps1 etc.)
+    forge_scripts_path_input: String,
     /// MaMo API authentication token
     auth_token_input: String,
     /// Status message
@@ -325,6 +327,7 @@ impl LauncherApp {
             forge_path_input: settings.forge_path.clone().unwrap_or_default(),
             forge_path_valid: settings.forge_path.as_ref().map(|p| validate_forge_path(p)).unwrap_or(false),
             forge_auto_launch: settings.forge_auto_launch,
+            forge_scripts_path_input: settings.forge_scripts_path.clone().unwrap_or_default(),
             auth_token_input: settings.auth_token.clone().unwrap_or_default(),
             status_message: None,
         };
@@ -2844,12 +2847,13 @@ impl LauncherApp {
         ui.add_space(10.0);
         
         // Get current state
-        let (forge_path_input, forge_path_valid, forge_auto_launch, status_message) = {
+        let (forge_path_input, forge_path_valid, forge_auto_launch, forge_scripts_path_input, status_message) = {
             let state = self.settings_state.lock().unwrap();
             (
                 state.forge_path_input.clone(),
                 state.forge_path_valid,
                 state.forge_auto_launch,
+                state.forge_scripts_path_input.clone(),
                 state.status_message.clone(),
             )
         };
@@ -3001,7 +3005,59 @@ impl LauncherApp {
         });
         
         ui.add_space(15.0);
-        
+
+        // AI Simulation Scripts Section
+        ui.group(|ui| {
+            ui.label(egui::RichText::new("🤖 AI Simulation Scripts").strong());
+            ui.add_space(5.0);
+            ui.label("Path to the folder containing run_commander_simulation.ps1 and analyze_commander_stats.py.");
+            ui.label(egui::RichText::new("Example: D:\\Dev\\forge\\forge").small().weak());
+            ui.add_space(8.0);
+
+            ui.horizontal(|ui| {
+                ui.label("Scripts folder:");
+                let mut scripts_input = forge_scripts_path_input.clone();
+                let response = ui.add(
+                    egui::TextEdit::singleline(&mut scripts_input)
+                        .desired_width(400.0)
+                        .hint_text("Path to folder with .ps1 and .py scripts"),
+                );
+                if response.changed() {
+                    let mut state = self.settings_state.lock().unwrap();
+                    state.forge_scripts_path_input = scripts_input.clone();
+                }
+
+                // Valid indicator
+                let scripts_valid = !forge_scripts_path_input.is_empty()
+                    && std::path::Path::new(&forge_scripts_path_input)
+                        .join("run_commander_simulation.ps1")
+                        .exists();
+                if !forge_scripts_path_input.is_empty() {
+                    if scripts_valid {
+                        ui.label(egui::RichText::new("✓").color(egui::Color32::from_rgb(0, 128, 0)));
+                    } else {
+                        ui.label(egui::RichText::new("✗ ps1 not found").color(egui::Color32::from_rgb(176, 0, 32)));
+                    }
+                }
+            });
+
+            ui.add_space(5.0);
+            ui.horizontal(|ui| {
+                if ui.button("📂 Browse…").clicked() {
+                    if let Some(folder) = rfd::FileDialog::new().pick_folder() {
+                        let path_str = folder.to_string_lossy().to_string();
+                        let mut state = self.settings_state.lock().unwrap();
+                        state.forge_scripts_path_input = path_str;
+                    }
+                }
+                if ui.button("💾 Save").clicked() {
+                    self.save_forge_scripts_path();
+                }
+            });
+        });
+
+        ui.add_space(15.0);
+
         // Authentication Section
         ui.group(|ui| {
             ui.label(egui::RichText::new("🔐 MaMo Authentication").strong());
@@ -3238,6 +3294,24 @@ impl LauncherApp {
         
         let mut state = self.settings_state.lock().unwrap();
         state.status_message = Some("Settings saved successfully!".to_string());
+    }
+
+    fn save_forge_scripts_path(&mut self) {
+        let path = {
+            let state = self.settings_state.lock().unwrap();
+            state.forge_scripts_path_input.clone()
+        };
+        {
+            let mut settings = self.settings.lock().unwrap();
+            settings.forge_scripts_path = if path.is_empty() { None } else { Some(path) };
+            if let Err(e) = settings.save() {
+                let mut state = self.settings_state.lock().unwrap();
+                state.status_message = Some(format!("Failed to save scripts path: {}", e));
+                return;
+            }
+        }
+        let mut state = self.settings_state.lock().unwrap();
+        state.status_message = Some("Scripts path saved!".to_string());
     }
 
     fn save_auth_token(&mut self) {

@@ -5,7 +5,7 @@ use crate::deck::{create_deck_from_id, create_deck_from_moxfield, create_deck_fr
 use crate::forge::{launch_forge_from_settings, launch_forge_replay, ForgeLaunchResult};
 use crate::gamelog::{download_replay_content, save_replay_to_forge_dir};
 use crate::settings::Settings;
-use crate::simulation::{run_simulation_for_deck, SimulationResult};
+use crate::simulation::{run_simulation_for_deck, post_simulation_report, SimulationResult};
 
 /// Type alias for a shared log collector
 pub type SharedLogCollector = Arc<Mutex<Vec<String>>>;
@@ -666,6 +666,21 @@ async fn handle_simulate(deeplink: &Deeplink, log_collector: Option<SharedLogCol
     log(&format!("Deck '{}' ready. Starting AI simulation…", deck_name));
 
     let result = run_simulation_for_deck(&deck_id, &deck_name, &log).await;
+
+    // If simulation failed, POST an error report so the frontend poll detects it
+    if !result.success {
+        let error_report = serde_json::json!({
+            "error": result.message,
+            "success": false
+        });
+        let auth_token = Settings::load().ok().and_then(|s| s.auth_token);
+        if let Err(e) = post_simulation_report(&deck_id, &error_report, auth_token.as_deref()).await {
+            warn!("Could not upload error report: {}", e);
+        } else {
+            log("Error report uploaded — frontend will be notified.");
+        }
+    }
+
     CommandResult::SimulationCompleted(result)
 }
 
