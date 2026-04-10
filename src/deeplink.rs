@@ -56,8 +56,8 @@ pub fn parse_deeplink_url(raw: &str) -> Option<Deeplink> {
             if !path.is_empty() && path != "/" {
                 let path_parts: Vec<&str> = path.trim_start_matches('/').split('/').collect();
                 if !path_parts.is_empty() && !path_parts[0].is_empty() {
-                    // If action is "deck", "mamo", "playtest", "launch-forge", or "launchforge", the path is the deck ID
-                    if (action == "deck" || action == "mamo" || action == "playtest" || action == "launch-forge" || action == "launchforge" || action == "replay-game" || action == "replaygame") && deck_id.is_none() {
+                    // If action refers to a deck operation, the first path segment is the deck ID
+                    if (action == "deck" || action == "mamo" || action == "playtest" || action == "launch-forge" || action == "launchforge" || action == "replay-game" || action == "replaygame" || action == "simulate") && deck_id.is_none() {
                         deck_id = Some(path_parts[0].to_string());
                     } else if action == "user" && username.is_none() {
                         username = Some(path_parts[0].to_string());
@@ -145,6 +145,19 @@ mod tests {
         let result = parse_deeplink(&args, SCHEME_PREFIX);
         
         assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_parse_simulate_url_path_uuid() {
+        // mamoConnector://simulate/{UUID} — UUID is in path, not query string
+        let url = "mamoConnector://simulate/a1b2c3d4-e5f6-7890-abcd-ef1234567890";
+        let result = parse_deeplink_url(url).unwrap();
+
+        assert_eq!(result.action, "simulate");
+        assert_eq!(
+            result.deck_id,
+            Some("a1b2c3d4-e5f6-7890-abcd-ef1234567890".to_string())
+        );
     }
 
     #[test]
