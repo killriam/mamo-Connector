@@ -355,8 +355,9 @@ fn resolve_scripts_dir(settings: &Settings) -> Option<PathBuf> {
     None
 }
 
-/// Return the Forge simulation stats directory.
-/// On Windows: `%APPDATA%\Forge\games\simulation_stats`
+/// Return the directory where Forge writes Commander replay gamelogs.
+/// On Windows: `%APPDATA%\Forge\games\gamelogs`
+/// Pattern: `replay_Commander_*.json`
 fn get_forge_simulation_stats_dir() -> PathBuf {
     #[cfg(windows)]
     {
@@ -364,7 +365,7 @@ fn get_forge_simulation_stats_dir() -> PathBuf {
             .unwrap_or_else(|| PathBuf::from("."))
             .join("Forge")
             .join("games")
-            .join("simulation_stats")
+            .join("gamelogs")
     }
     #[cfg(not(windows))]
     {
@@ -372,7 +373,7 @@ fn get_forge_simulation_stats_dir() -> PathBuf {
             .unwrap_or_else(|| PathBuf::from("."))
             .join(".forge")
             .join("games")
-            .join("simulation_stats")
+            .join("gamelogs")
     }
 }
 
