@@ -3,7 +3,6 @@ mod deck;
 mod deeplink;
 mod forge;
 mod gamelog;
-mod local_server;
 mod registration;
 mod settings;
 mod simulation;
@@ -128,10 +127,6 @@ async fn run() -> Result<()> {
     // Don't process the command here - let the UI handle it with progress logging
     // The UI will switch to Activity tab and show real-time progress
     let command_result: Option<commands::CommandResult> = None;
-
-    // Spawn local simulation HTTP server (loopback only, port 52340)
-    local_server::spawn(&tokio::runtime::Handle::current());
-    info!("local_server: spawned on port {}", local_server::LOCAL_SIM_PORT);
 
     info!("Launching UI with {} arguments, deeplink: {:?}", args.len(), deeplink.as_ref().map(|d| &d.raw));
 

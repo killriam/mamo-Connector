@@ -12,11 +12,12 @@ use anyhow::{Context, Result, anyhow};
 use log::{error, info, warn};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
+use std::process::Stdio;
 use tokio::process::Command as TokioCommand;
 
 use crate::settings::Settings;
 
-const MAMO_API_BASE: &str = "https://new-backend-two-eosin.vercel.app";
+pub const MAMO_API_BASE: &str = "https://new-backend-two-eosin.vercel.app";
 
 // ==================== Public types ====================
 
@@ -91,7 +92,9 @@ pub async fn run_simulation_for_deck(
     };
 
     let config = SimulationConfig {
-        deck1_name: sanitize_deck_name(deck_name),
+        // deck_name already comes from the actual saved .dck file stem — do NOT sanitize it,
+        // as that would produce a different name than the file on disk.
+        deck1_name: deck_name.to_string(),
         deck2_name: None, // mirror match by default
         games: settings.simulation_games,
         timeout_secs: 180,
@@ -109,7 +112,7 @@ pub async fn run_simulation_for_deck(
 
     // Step 2: Analyse stats
     let report_path = scripts_dir.join("commander_simulation_report.json");
-    if let Err(e) = run_analysis_script(&scripts_dir, &report_path, log).await {
+    if let Err(e) = run_analysis_script(&scripts_dir, &report_path, config.games, log).await {
         return SimulationResult::failure(format!("Analysis script failed: {}", e));
     }
 
@@ -184,6 +187,7 @@ async fn run_simulation_script(
 
     let output = TokioCommand::new("powershell")
         .args(&args)
+        .stdin(Stdio::null()) // prevent any interactive prompt from blocking
         .current_dir(scripts_dir)
         .output()
         .await
@@ -215,6 +219,7 @@ async fn run_simulation_script(
 async fn run_analysis_script(
     scripts_dir: &Path,
     output_path: &Path,
+    limit: u32,
     log: &dyn Fn(&str),
 ) -> Result<()> {
     let script = scripts_dir.join("analyze_commander_stats.py");
@@ -238,8 +243,12 @@ async fn run_analysis_script(
 
     let output = TokioCommand::new("python")
         .arg(&script)
+        .arg("--limit")
+        .arg(limit.to_string())
         .arg(&stats_dir)
         .arg(output_path)
+        .env("PYTHONUTF8", "1") // force UTF-8 I/O on Windows (avoids cp1252 UnicodeEncodeError)
+        .stdin(Stdio::null()) // ensure isatty() returns False → no interactive prompt
         .current_dir(scripts_dir)
         .output()
         .await

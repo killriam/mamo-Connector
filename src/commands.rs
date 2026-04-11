@@ -100,7 +100,8 @@ pub async fn handle_command_with_logger(deeplink: &Deeplink, log_collector: Opti
         "import-user-decks" | "importuserdecks" => handle_import_user_decks(deeplink).await,
         "list-user-decks" | "listuserdecks" => handle_list_user_decks(deeplink).await,
         "auth" | "authenticate" | "connect" => handle_auth(deeplink).await, // Auth token: mamoConnector://auth?token=xxx
-        "simulate" => handle_simulate(deeplink, log_collector).await, // AI simulation: mamoConnector://simulate/DECK_UUID
+        "simulate" => handle_simulate(deeplink, log_collector).await, // Forge simulation: mamoConnector://simulate/DECK_UUID
+        "simulate-ai" => handle_simulate_ai(deeplink, log_collector).await, // Native mamo-sim: mamoConnector://simulate-ai/DECK_UUID
         "" => CommandResult::MissingParameters("No action specified in deeplink".to_string()),
         action => {
             warn!("Unknown action received: {}", action);
@@ -688,6 +689,299 @@ fn get_parameter(params: &[(String, String)], key: &str) -> Option<String> {
     params.iter()
         .find(|(k, _)| k.eq_ignore_ascii_case(key))
         .map(|(_, v)| v.clone())
+}
+
+// ── Native AI simulation via mamo-sim ─────────────────────────────────────────
+
+/// mamoConnector://simulate-ai/DECK_UUID
+///
+/// Flow:
+///   1. Fetch structured deck input from GET /api/simulation/deck-input/:deckId
+///   2. Encode into binary wire format (same layout as codec.ts)
+///   3. Run mamo_sim::run_batch_native() — pure Rust, no WASM, full CPU
+///   4. POST result to POST /api/simulation-report/:deckId
+///   5. Frontend polls GET /api/simulation-report/:deckId and displays results
+async fn handle_simulate_ai(deeplink: &Deeplink, log_collector: Option<SharedLogCollector>) -> CommandResult {
+    let log = |msg: &str| {
+        info!("{}", msg);
+        if let Some(ref collector) = log_collector {
+            if let Ok(mut logs) = collector.lock() {
+                logs.push(msg.to_string());
+            }
+        }
+    };
+
+    let deck_id = deeplink.deck_id.clone()
+        .or_else(|| get_parameter(&deeplink.params, "id"))
+        .or_else(|| get_parameter(&deeplink.params, "deck_id"))
+        .or_else(|| get_parameter(&deeplink.params, "deckId"));
+
+    let deck_id = match deck_id {
+        Some(id) if !id.is_empty() => id,
+        _ => return CommandResult::MissingParameters(
+            "Deck UUID required. Use mamoConnector://simulate-ai/DECK_UUID".to_string(),
+        ),
+    };
+
+    let settings = match Settings::load() {
+        Ok(s) => s,
+        Err(e) => return CommandResult::Error(format!("Failed to load settings: {}", e)),
+    };
+    let auth_token = match &settings.auth_token {
+        Some(t) => t.clone(),
+        None => return CommandResult::Error("No auth token configured in MaMo Connector settings.".to_string()),
+    };
+
+    let api_base = crate::simulation::MAMO_API_BASE;
+
+    // ── 1. Fetch deck input ───────────────────────────────────────────────────
+    log(&format!("Fetching deck input for {}…", deck_id));
+    let client = reqwest::Client::new();
+    let deck_input_url = format!("{}/api/simulation/deck-input/{}", api_base, deck_id);
+    let deck_resp = match client.get(&deck_input_url)
+        .bearer_auth(&auth_token)
+        .send()
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => return CommandResult::Error(format!("Failed to fetch deck input: {}", e)),
+    };
+
+    if !deck_resp.status().is_success() {
+        return CommandResult::Error(format!("Backend returned {} for deck input", deck_resp.status()));
+    }
+
+    let deck_input: serde_json::Value = match deck_resp.json().await {
+        Ok(v) => v,
+        Err(e) => return CommandResult::Error(format!("Failed to parse deck input: {}", e)),
+    };
+
+    // ── 2. Encode wire format ─────────────────────────────────────────────────
+    log("Encoding deck for simulation…");
+    let (encoded, mech_keys) = match encode_deck_input(&deck_input) {
+        Ok(v) => v,
+        Err(e) => return CommandResult::Error(format!("Failed to encode deck: {}", e)),
+    };
+
+    // ── 3. Run simulation natively ────────────────────────────────────────────
+    let games: u32 = get_parameter(&deeplink.params, "games")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(500);
+    let max_turns: u8 = get_parameter(&deeplink.params, "max_turns")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(30);
+    let seed: u32 = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u32)
+        .unwrap_or(42);
+
+    log(&format!("Running {} games natively (mamo-sim)…", games));
+    let json_str = mamo_sim::run_batch_native(&encoded, mech_keys, games, max_turns, seed);
+
+    let report: serde_json::Value = match serde_json::from_str(&json_str) {
+        Ok(v) => v,
+        Err(e) => return CommandResult::Error(format!("Simulation output parse failed: {}", e)),
+    };
+
+    if report.get("error").is_some() {
+        return CommandResult::Error(format!("Simulation error: {}", report["error"]));
+    }
+
+    // ── 4. POST result to backend ─────────────────────────────────────────────
+    log("Uploading simulation report…");
+    if let Err(e) = crate::simulation::post_simulation_report(&deck_id, &report, Some(&auth_token)).await {
+        warn!("Failed to upload simulation report: {}", e);
+        return CommandResult::SimulationCompleted(crate::simulation::SimulationResult {
+            success: true,
+            message: format!("Simulation complete, but upload failed: {}", e),
+            report: Some(report),
+        });
+    }
+
+    log("Done — results available in MaMo.");
+    CommandResult::SimulationCompleted(crate::simulation::SimulationResult::success(report))
+}
+
+/// Encode backend deck-input JSON into the binary wire format expected by mamo-sim.
+/// Wire layout matches codec.ts exactly:
+///   [4 bytes card_count] [4 bytes mechanic_count]
+///   [card_count × 16 bytes] [mechanic_count × 12 bytes]
+fn encode_deck_input(input: &serde_json::Value) -> anyhow::Result<(Vec<u8>, Vec<String>)> {
+    let main_cards   = input["mainCards"].as_array().ok_or_else(|| anyhow::anyhow!("missing mainCards"))?;
+    let commanders   = input["commanders"].as_array().ok_or_else(|| anyhow::anyhow!("missing commanders"))?;
+    let mech_groups  = input["mechanicGroups"].as_array().ok_or_else(|| anyhow::anyhow!("missing mechanicGroups"))?;
+
+    // Build expanded card list (one entry per copy, commanders first)
+    let mut all_cards: Vec<&serde_json::Value> = Vec::new();
+    let mut is_commander: Vec<bool> = Vec::new();
+
+    for c in commanders {
+        all_cards.push(c);
+        is_commander.push(true);
+    }
+    for c in main_cards {
+        let copies = c["amount_in_deck"].as_u64().unwrap_or(1) as usize;
+        for _ in 0..copies {
+            all_cards.push(c);
+            is_commander.push(false);
+        }
+    }
+
+    // Build mechanic card masks: for each mechanic group, which card indices are required
+    let commander_oracle_ids: Vec<String> = commanders.iter()
+        .filter_map(|c| c["oracle_id"].as_str().map(str::to_string))
+        .collect();
+
+    // oracle_id → indices in all_cards
+    let mut oracle_to_indices: std::collections::HashMap<String, Vec<u32>> = std::collections::HashMap::new();
+    for (idx, card) in all_cards.iter().enumerate() {
+        if let Some(oid) = card["oracle_id"].as_str() {
+            oracle_to_indices.entry(oid.to_string()).or_default().push(idx as u32);
+        }
+    }
+
+    let card_count = all_cards.len() as u32;
+    let mechanic_count = mech_groups.len() as u32;
+
+    let mut buf = Vec::with_capacity((8 + card_count as usize * 16 + mechanic_count as usize * 12) as usize);
+    buf.extend_from_slice(&card_count.to_le_bytes());
+    buf.extend_from_slice(&mechanic_count.to_le_bytes());
+
+    // Encode each card (16 bytes)
+    for (i, card) in all_cards.iter().enumerate() {
+        let is_land = card["type_line"].as_str().map(|t| t.contains("Land")).unwrap_or(false);
+        let is_creature = card["type_line"].as_str().map(|t| t.contains("Creature")).unwrap_or(false);
+        let is_artifact = card["type_line"].as_str().map(|t| t.contains("Artifact")).unwrap_or(false);
+        let is_mana = card["is_manaproducing"].as_bool().unwrap_or(false) || is_land;
+        let is_cmd = is_commander[i];
+
+        let flags: u8 = (is_land as u8)
+            | ((is_creature as u8) << 1)
+            | ((is_artifact as u8) << 2)
+            | ((is_mana as u8) << 3)
+            | ((is_cmd as u8) << 4);
+
+        let cmc = card["cmc"].as_f64().unwrap_or(0.0) as u8;
+        let power = parse_pt(card["power"].as_str().unwrap_or("0"));
+        let toughness = parse_pt(card["toughness"].as_str().unwrap_or("0"));
+
+        // Color mask from color_identity (mana produced by lands/producers)
+        let color_mask = color_mask_from_identity(if is_mana {
+            card["color_identity"].as_array()
+        } else {
+            None
+        });
+
+        // Mana cost parsing
+        let mana_cost = card["mana_cost"].as_str().unwrap_or("");
+        let (cost_w, cost_u, cost_b, cost_r, cost_g, cost_generic) = parse_mana_cost(mana_cost);
+
+        // mechanic_mask: bit i = card is in mechanic group i (up to 32)
+        let card_oracle_id = card["oracle_id"].as_str().unwrap_or("");
+        let mut mechanic_mask: u32 = 0;
+        for (mi, mg) in mech_groups.iter().enumerate().take(32) {
+            if let Some(card_ids) = mg["card_oracle_ids"].as_array() {
+                if card_ids.iter().any(|id| id.as_str() == Some(card_oracle_id)) {
+                    mechanic_mask |= 1 << mi;
+                }
+            }
+        }
+
+        buf.push(flags);
+        buf.push(cmc);
+        buf.push(power);
+        buf.push(toughness);
+        buf.push(color_mask);
+        buf.push(cost_w);
+        buf.push(cost_u);
+        buf.push(cost_b);
+        buf.push(cost_r);
+        buf.push(cost_g);
+        buf.push(cost_generic);
+        buf.push(0); // formation_role (unused for now)
+        buf.extend_from_slice(&mechanic_mask.to_le_bytes());
+    }
+
+    // Encode each mechanic group (12 bytes)
+    let mut mech_keys: Vec<String> = Vec::new();
+    for mg in mech_groups {
+        let key = mg["deckmechanickey"].as_str().unwrap_or("").to_string();
+        mech_keys.push(key);
+
+        let activation = mg["activationcondition"].as_u64().unwrap_or(0) as u8;
+        let advantage  = mg["advantageoutput"].as_u64().unwrap_or(0) as u8;
+        let dimension  = mg["dimensioncategory"].as_u64().unwrap_or(0) as u8;
+
+        // card_mask: bit i = card index i is required for this mechanic
+        let mut card_mask: u32 = 0;
+        if let Some(oracle_ids) = mg["card_oracle_ids"].as_array() {
+            for oid in oracle_ids {
+                if let Some(s) = oid.as_str() {
+                    if let Some(indices) = oracle_to_indices.get(s) {
+                        for &idx in indices {
+                            if idx < 32 { card_mask |= 1 << idx; }
+                        }
+                    }
+                }
+            }
+        }
+
+        buf.push(activation);
+        buf.push(advantage);
+        buf.push(dimension);
+        buf.push(0); // reserved
+        buf.extend_from_slice(&card_mask.to_le_bytes());
+        buf.extend_from_slice(&0u32.to_le_bytes()); // prereq_mask (unused)
+    }
+
+    Ok((buf, mech_keys))
+}
+
+fn parse_pt(s: &str) -> u8 {
+    s.parse::<f32>().map(|v| v as u8).unwrap_or(0)
+}
+
+fn color_mask_from_identity(identity: Option<&Vec<serde_json::Value>>) -> u8 {
+    let mut mask: u8 = 0;
+    if let Some(arr) = identity {
+        for c in arr {
+            match c.as_str() {
+                Some("W") => mask |= 0x01,
+                Some("U") => mask |= 0x02,
+                Some("B") => mask |= 0x04,
+                Some("R") => mask |= 0x08,
+                Some("G") => mask |= 0x10,
+                _ => {}
+            }
+        }
+        if mask == 0 { mask = 0x20; } // colorless
+    }
+    mask
+}
+
+fn parse_mana_cost(cost: &str) -> (u8, u8, u8, u8, u8, u8) {
+    let (mut w, mut u, mut b, mut r, mut g, mut generic) = (0u8, 0u8, 0u8, 0u8, 0u8, 0u8);
+    // Format: {W}{U}{2}{R} etc.
+    let mut i = 0;
+    let chars: Vec<char> = cost.chars().collect();
+    while i < chars.len() {
+        if chars[i] == '{' {
+            let end = chars[i..].iter().position(|&c| c == '}').map(|p| i + p).unwrap_or(i);
+            let sym: String = chars[i+1..end].iter().collect();
+            match sym.as_str() {
+                "W" => w += 1,
+                "U" => u += 1,
+                "B" => b += 1,
+                "R" => r += 1,
+                "G" => g += 1,
+                s => { generic = generic.saturating_add(s.parse::<u8>().unwrap_or(0)); }
+            }
+            i = end + 1;
+        } else {
+            i += 1;
+        }
+    }
+    (w, u, b, r, g, generic)
 }
 
 #[cfg(test)]
