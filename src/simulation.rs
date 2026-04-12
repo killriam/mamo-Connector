@@ -95,14 +95,16 @@ pub async fn run_simulation_for_deck(
         // deck_name already comes from the actual saved .dck file stem — do NOT sanitize it,
         // as that would produce a different name than the file on disk.
         deck1_name: deck_name.to_string(),
-        deck2_name: None, // mirror match by default
+        deck2_name: settings.simulation_opponent_deck.clone(),
         games: settings.simulation_games,
         timeout_secs: 180,
     };
 
     log(&format!(
-        "Starting simulation: {} games of '{}' (mirror match)",
-        config.games, config.deck1_name
+        "Starting simulation: {} games of '{}' vs '{}'",
+        config.games,
+        config.deck1_name,
+        config.deck2_name.as_deref().unwrap_or("mirror match")
     ));
 
     // Step 1: Run simulation scripts
@@ -116,11 +118,28 @@ pub async fn run_simulation_for_deck(
         return SimulationResult::failure(format!("Analysis script failed: {}", e));
     }
 
-    // Step 3: Read report
-    let report = match read_report(&report_path) {
+    // Step 3: Read report and annotate with deck names so the frontend can
+    // label which player is the deck under test vs. the opponent.
+    let mut report = match read_report(&report_path) {
         Ok(r) => r,
         Err(e) => return SimulationResult::failure(format!("Failed to read report: {}", e)),
     };
+
+    // Inject deck_names and deck_under_test into meta (P1 = deck under test, P2 = opponent).
+    if let Some(meta) = report.get_mut("meta").and_then(|m| m.as_object_mut()) {
+        let deck2_label = config
+            .deck2_name
+            .clone()
+            .unwrap_or_else(|| config.deck1_name.clone());
+        meta.insert(
+            "deck_names".to_string(),
+            serde_json::json!({ "P1": config.deck1_name, "P2": deck2_label }),
+        );
+        meta.insert(
+            "deck_under_test".to_string(),
+            serde_json::Value::String("P1".to_string()),
+        );
+    }
 
     log("Uploading simulation report to MaMo backend…");
 

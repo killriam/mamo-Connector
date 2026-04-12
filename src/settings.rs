@@ -60,6 +60,10 @@ fn default_simulation_games() -> u32 {
     100
 }
 
+fn default_simulation_opponent_deck() -> Option<String> {
+    Some("killriam - dummy defender (2026-04-09)".to_string())
+}
+
 impl SavedLink {
     /// Create a new saved link
     pub fn new(name: String, link_type: SavedLinkType, url: String) -> Self {
@@ -122,6 +126,10 @@ pub struct Settings {
     /// Default number of games to run in AI simulations
     #[serde(default = "default_simulation_games")]
     pub simulation_games: u32,
+    /// Standard opponent deck for AI simulations (deck stem without .dck).
+    /// Defaults to the bundled dummy defender deck.
+    #[serde(default = "default_simulation_opponent_deck")]
+    pub simulation_opponent_deck: Option<String>,
 }
 
 impl Settings {

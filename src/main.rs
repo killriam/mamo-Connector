@@ -124,6 +124,11 @@ async fn run() -> Result<()> {
         }
     };
 
+    // Ensure the bundled standard AI opponent deck exists in Forge's deck directory.
+    if let Err(e) = deck::ensure_dummy_defender_deck() {
+        warn!("Could not deploy bundled dummy defender deck: {}", e);
+    }
+
     // Don't process the command here - let the UI handle it with progress logging
     // The UI will switch to Activity tab and show real-time progress
     let command_result: Option<commands::CommandResult> = None;

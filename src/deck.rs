@@ -2011,7 +2011,36 @@ pub fn get_deck_directory_display() -> String {
     }
 }
 
-#[cfg(test)]
+/// Name (stem, without .dck) of the bundled standard AI opponent deck.
+pub const DUMMY_DEFENDER_DECK_NAME: &str = "killriam - dummy defender (2026-04-09)";
+
+/// Embedded content of the bundled dummy-defender deck.
+const DUMMY_DEFENDER_DECK_CONTENT: &str =
+    include_str!("../res/decks/killriam - dummy defender (2026-04-09).dck");
+
+/// Ensure the bundled dummy-defender deck exists in the Forge commander decks directory.
+/// Creates it from the embedded content when not present; never overwrites an existing file.
+pub fn ensure_dummy_defender_deck() -> Result<()> {
+    let deck_dir = get_deck_directory()?;
+
+    if !deck_dir.exists() {
+        fs::create_dir_all(&deck_dir)
+            .with_context(|| format!("Failed to create deck directory: {:?}", deck_dir))?;
+    }
+
+    let sanitized = sanitize_filename(DUMMY_DEFENDER_DECK_NAME);
+    let deck_path = deck_dir.join(format!("{}.dck", sanitized));
+
+    if !deck_path.exists() {
+        fs::write(&deck_path, DUMMY_DEFENDER_DECK_CONTENT)
+            .with_context(|| format!("Failed to write dummy defender deck: {:?}", deck_path))?;
+        info!("Created bundled dummy defender deck at {:?}", deck_path);
+    }
+
+    Ok(())
+}
+
+
 mod tests {
     use super::*;
 
