@@ -177,6 +177,8 @@ impl DeckCreationResult {
     }
 }
 
+const MAX_FORGE_SIDEBOARD_CARDS: usize = 10;
+
 // ==================== Common Helpers ====================
 
 /// Generic fetch using curl (handles Cloudflare and user agent)
@@ -421,9 +423,14 @@ fn convert_moxfield_to_forge(deck_name: &str, raw_json: &str) -> Result<String> 
     // Sideboard section
     lines.push("[Sideboard]".to_string());
     if let Some(sideboard) = parsed.get("sideboard").and_then(|c| c.as_object()) {
+        let mut sideboard_count = 0;
         for (_, card_entry) in sideboard {
+            if sideboard_count >= MAX_FORGE_SIDEBOARD_CARDS {
+                break;
+            }
             if let Some(card_line) = format_moxfield_card(card_entry) {
                 lines.push(card_line);
+                sideboard_count += 1;
             }
         }
     }
@@ -1582,32 +1589,73 @@ fn front_face_name(full_name: &str) -> &str {
 /// Replaces "Qty Front Face // Back Face|SET|CN" with "Qty Front Face|SET|CN"
 /// and "Qty Front Face // Back Face" with "Qty Front Face"
 fn post_process_forge_content(content: &str) -> String {
-    content.lines().map(|line| {
-        let trimmed = line.trim();
-        // Skip non-card lines (sections, metadata, empty)
-        if trimmed.is_empty() || trimmed.starts_with('[') || trimmed.contains('=') {
-            return line.to_string();
+    let mut trimmed = Vec::new();
+    let mut in_sideboard = false;
+    let mut sideboard_seen = 0;
+
+    for line in content.lines() {
+        let line_str = line.to_string();
+        let stripped = line.trim();
+
+        if stripped.eq_ignore_ascii_case("[sideboard]") {
+            in_sideboard = true;
+            sideboard_seen = 0;
+            trimmed.push(line_str);
+            continue;
         }
-        // Try to parse as a card line: "Qty CardName..." 
-        if let Some(space_idx) = trimmed.find(' ') {
-            let qty_str = &trimmed[..space_idx];
+
+        if in_sideboard {
+            if stripped.starts_with('[') {
+                in_sideboard = false;
+                trimmed.push(line_str);
+                continue;
+            }
+
+            if stripped.is_empty() {
+                trimmed.push(line_str);
+                continue;
+            }
+
+            if sideboard_seen >= MAX_FORGE_SIDEBOARD_CARDS {
+                continue;
+            }
+
+            sideboard_seen += 1;
+            trimmed.push(line_str);
+            continue;
+        }
+
+        // Skip non-card lines (sections, metadata, empty)
+        if stripped.is_empty() || stripped.starts_with('[') || stripped.contains('=') {
+            trimmed.push(line_str);
+            continue;
+        }
+
+        // Try to parse as a card line: "Qty CardName..."
+        if let Some(space_idx) = stripped.find(' ') {
+            let qty_str = &stripped[..space_idx];
             if qty_str.chars().all(|c| c.is_ascii_digit()) {
-                let rest = &trimmed[space_idx + 1..];
+                let rest = &stripped[space_idx + 1..];
                 // Split off set info (pipe-separated): "CardName|SET|CN"
                 if let Some(pipe_idx) = rest.find('|') {
                     let card_name = &rest[..pipe_idx];
                     let set_info = &rest[pipe_idx..]; // includes leading '|'
                     let front = front_face_name(card_name);
-                    return format!("{} {}{}", qty_str, front, set_info);
+                    trimmed.push(format!("{} {}{}", qty_str, front, set_info));
+                    continue;
                 } else {
                     // No set info, just "Qty CardName"
                     let front = front_face_name(rest);
-                    return format!("{} {}", qty_str, front);
+                    trimmed.push(format!("{} {}", qty_str, front));
+                    continue;
                 }
             }
         }
-        line.to_string()
-    }).collect::<Vec<_>>().join("\n")
+
+        trimmed.push(line_str);
+    }
+
+    trimmed.join("\n")
 }
 
 fn format_deck_file(deck_data: &DeckData) -> String {
@@ -1634,7 +1682,7 @@ fn format_deck_file(deck_data: &DeckData) -> String {
     
     // Sideboard section
     content.push_str("[Sideboard]\n");
-    for card in &deck_data.sideboard {
+    for card in deck_data.sideboard.iter().take(MAX_FORGE_SIDEBOARD_CARDS) {
         content.push_str(&format_card_line(card));
     }
     content.push('\n');
@@ -2555,6 +2603,72 @@ Name=ashes 0511
         assert!(response.content.contains("[Attractions]"));
         assert!(response.content.contains("Ashling, Flame Dancer"));
         assert!(response.content.contains("31 Snow-Covered Mountain"));
+    }
+
+    #[test]
+    fn test_post_process_forge_content_trims_sideboard_to_ten_cards() {
+        let input = r#"[metadata]
+Name=Test
+
+[Main]
+1 Lightning Bolt|M20|1
+
+[Sideboard]
+1 Card One|SET|1
+1 Card Two|SET|1
+1 Card Three|SET|1
+1 Card Four|SET|1
+1 Card Five|SET|1
+1 Card Six|SET|1
+1 Card Seven|SET|1
+1 Card Eight|SET|1
+1 Card Nine|SET|1
+1 Card Ten|SET|1
+1 Card Eleven|SET|1
+1 Card Twelve|SET|1
+
+[Attractions]
+"#;
+        let output = post_process_forge_content(input);
+        let sideboard_lines: Vec<_> = output
+            .lines()
+            .skip_while(|line| !line.trim().eq_ignore_ascii_case("[Sideboard]"))
+            .skip(1)
+            .take_while(|line| !line.trim().starts_with('['))
+            .filter(|line| !line.trim().is_empty())
+            .collect();
+
+        assert_eq!(sideboard_lines.len(), 10);
+        assert!(sideboard_lines.contains(&"1 Card Ten|SET|1"));
+        assert!(!sideboard_lines.contains(&"1 Card Eleven|SET|1"));
+        assert!(!sideboard_lines.contains(&"1 Card Twelve|SET|1"));
+    }
+
+    #[test]
+    fn test_format_deck_file_limits_sideboard_to_ten_cards() {
+        let deck = DeckData {
+            name: "Sideboard Cap Test".to_string(),
+            commander: vec![Card { name: "Commander".to_string(), set: "CMD".to_string(), quantity: 1, collector_number: Some("1".to_string()) }],
+            main: vec![Card { name: "Island".to_string(), set: "M20".to_string(), quantity: 1, collector_number: Some("1".to_string()) }],
+            sideboard: (1..=12)
+                .map(|i| Card { name: format!("Card {}", i), set: "SET".to_string(), quantity: 1, collector_number: Some("1".to_string()) })
+                .collect(),
+            attractions: vec![],
+        };
+
+        let content = format_deck_file(&deck);
+        let sideboard_lines: Vec<_> = content
+            .lines()
+            .skip_while(|line| !line.trim().eq_ignore_ascii_case("[Sideboard]"))
+            .skip(1)
+            .take_while(|line| !line.trim().starts_with('['))
+            .filter(|line| !line.trim().is_empty())
+            .collect();
+
+        assert_eq!(sideboard_lines.len(), 10);
+        assert!(sideboard_lines.contains(&"1 Card 10|SET|1"));
+        assert!(!sideboard_lines.contains(&"1 Card 11|SET|1"));
+        assert!(!sideboard_lines.contains(&"1 Card 12|SET|1"));
     }
 
     // ==================== URL-based Deck Download Tests ====================
