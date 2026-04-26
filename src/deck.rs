@@ -462,7 +462,8 @@ pub async fn create_deck_from_id(deck_id: &str, api_base_url: &str) -> Result<De
         .context("Failed to fetch deck data from API")?;
 
     // Create deck file with the content from API
-    let (deck_path, _archived) = write_deck_file(&export_response.name, &export_response.content).await
+    let content = post_process_forge_content(&export_response.content);
+    let (deck_path, _archived) = write_deck_file(&export_response.name, &content).await
         .context("Failed to create deck file")?;
 
     Ok(DeckCreationResult::success(
