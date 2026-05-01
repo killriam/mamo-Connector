@@ -95,6 +95,7 @@ pub async fn handle_command_with_logger(deeplink: &Deeplink, log_collector: Opti
         "createdeck" => handle_create_deck(deeplink).await, // Alternative format
         "deck" => handle_deck_download(deeplink).await, // New: mamoConnector://deck/DECK_ID
         "mamo" => handle_mamo_deck_download(deeplink).await, // MaMo backend: mamoConnector://mamo/DECK_UUID
+        "download-deck" => handle_download_deck_only(deeplink).await, // Save .dck to Forge dir without launching Forge
         "launch-forge" | "launchforge" | "playtest" => handle_launch_forge_with_logger(deeplink, log_collector).await, // Launch Forge with deck
         "replay-game" | "replaygame" => handle_replay_game_with_logger(deeplink, log_collector).await, // Replay a game in Forge
         "import-user-decks" | "importuserdecks" => handle_import_user_decks(deeplink).await,
@@ -164,6 +165,41 @@ async fn handle_mamo_deck_download(deeplink: &Deeplink) -> CommandResult {
         Err(err) => {
             error!("Failed to download MaMo deck: {:?}", err);
             CommandResult::Error(format!("Failed to download MaMo deck: {}", err))
+        }
+    }
+}
+
+/// Handle mamoConnector://download-deck/DECK_UUID
+/// Downloads the deck from the MaMo backend and saves it to the Forge deck directory.
+/// Does NOT launch Forge — only saves the .dck file.
+async fn handle_download_deck_only(deeplink: &Deeplink) -> CommandResult {
+    let deck_id = deeplink.deck_id.clone()
+        .or_else(|| get_parameter(&deeplink.params, "id"))
+        .or_else(|| get_parameter(&deeplink.params, "deck_id"))
+        .or_else(|| get_parameter(&deeplink.params, "deckId"));
+
+    let deck_id = match deck_id {
+        Some(id) if !id.is_empty() => id,
+        _ => {
+            error!("No deck UUID provided in download-deck command");
+            return CommandResult::MissingParameters(
+                "Deck UUID is required. Use mamoConnector://download-deck/DECK_UUID".to_string()
+            );
+        }
+    };
+
+    info!("Downloading deck from MaMo (no Forge launch): {}", deck_id);
+
+    match create_deck_from_mamo(&deck_id).await {
+        Ok(result) => {
+            if result.success {
+                info!("Deck saved to Forge directory: {:?}", result.deck_path);
+            }
+            CommandResult::DeckCreated(result)
+        }
+        Err(err) => {
+            error!("Failed to download deck for Forge: {:?}", err);
+            CommandResult::Error(format!("Failed to download deck: {}", err))
         }
     }
 }

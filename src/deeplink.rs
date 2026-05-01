@@ -57,7 +57,7 @@ pub fn parse_deeplink_url(raw: &str) -> Option<Deeplink> {
                 let path_parts: Vec<&str> = path.trim_start_matches('/').split('/').collect();
                 if !path_parts.is_empty() && !path_parts[0].is_empty() {
                     // If action refers to a deck operation, the first path segment is the deck ID
-                    if (action == "deck" || action == "mamo" || action == "playtest" || action == "launch-forge" || action == "launchforge" || action == "replay-game" || action == "replaygame" || action == "simulate") && deck_id.is_none() {
+                    if (action == "deck" || action == "mamo" || action == "download-deck" || action == "playtest" || action == "launch-forge" || action == "launchforge" || action == "replay-game" || action == "replaygame" || action == "simulate") && deck_id.is_none() {
                         deck_id = Some(path_parts[0].to_string());
                     } else if action == "user" && username.is_none() {
                         username = Some(path_parts[0].to_string());
