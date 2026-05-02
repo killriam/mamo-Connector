@@ -1,7 +1,7 @@
 use log::{error, info, warn};
 use std::sync::{Arc, Mutex};
 use crate::deeplink::Deeplink;
-use crate::deck::{create_deck_from_id, create_deck_from_moxfield, create_deck_from_mamo, create_deck_from_mamo_with_progress, DeckCreationResult, UserDecksImportResult, import_user_decks, list_moxfield_user_decks, MoxfieldDeckEntry, ProgressCallback};
+use crate::deck::{create_deck_from_id, create_deck_from_moxfield, create_deck_from_mamo, create_deck_from_mamo_with_progress, create_deck_and_scenario_for_forge, DeckCreationResult, UserDecksImportResult, import_user_decks, list_moxfield_user_decks, MoxfieldDeckEntry, ProgressCallback};
 use crate::forge::{launch_forge_from_settings, launch_forge_replay, ForgeLaunchResult};
 use crate::gamelog::{download_replay_content, save_replay_to_forge_dir};
 use crate::settings::Settings;
@@ -96,6 +96,7 @@ pub async fn handle_command_with_logger(deeplink: &Deeplink, log_collector: Opti
         "deck" => handle_deck_download(deeplink).await, // New: mamoConnector://deck/DECK_ID
         "mamo" => handle_mamo_deck_download(deeplink).await, // MaMo backend: mamoConnector://mamo/DECK_UUID
         "download-deck" => handle_download_deck_only(deeplink).await, // Save .dck to Forge dir without launching Forge
+        "playtest-scenario" => handle_playtest_with_scenario(deeplink, log_collector).await, // Scenario-ordered deck + JSON + launch Forge
         "launch-forge" | "launchforge" | "playtest" => handle_launch_forge_with_logger(deeplink, log_collector).await, // Launch Forge with deck
         "replay-game" | "replaygame" => handle_replay_game_with_logger(deeplink, log_collector).await, // Replay a game in Forge
         "import-user-decks" | "importuserdecks" => handle_import_user_decks(deeplink).await,
@@ -200,6 +201,59 @@ async fn handle_download_deck_only(deeplink: &Deeplink) -> CommandResult {
         Err(err) => {
             error!("Failed to download deck for Forge: {:?}", err);
             CommandResult::Error(format!("Failed to download deck: {}", err))
+        }
+    }
+}
+
+/// Handle mamoConnector://playtest-scenario/DECK_UUID?scenarioId=SCENARIO_UUID
+/// Downloads the scenario-ordered .dck and writes the Forge scenario JSON, then launches Forge.
+async fn handle_playtest_with_scenario(deeplink: &Deeplink, log_collector: Option<SharedLogCollector>) -> CommandResult {
+    let log = |msg: &str| {
+        info!("{}", msg);
+        if let Some(ref collector) = log_collector {
+            if let Ok(mut logs) = collector.lock() {
+                logs.push(msg.to_string());
+            }
+        }
+    };
+
+    let deck_id = deeplink.deck_id.clone()
+        .or_else(|| get_parameter(&deeplink.params, "deckId"))
+        .or_else(|| get_parameter(&deeplink.params, "deck_id"));
+    let scenario_id = get_parameter(&deeplink.params, "scenarioId")
+        .or_else(|| get_parameter(&deeplink.params, "scenario_id"));
+
+    let (deck_id, scenario_id) = match (deck_id, scenario_id) {
+        (Some(d), Some(s)) if !d.is_empty() && !s.is_empty() => (d, s),
+        _ => {
+            error!("playtest-scenario requires both deck UUID in path and scenarioId query param");
+            return CommandResult::MissingParameters(
+                "Usage: mamoConnector://playtest-scenario/DECK_UUID?scenarioId=SCENARIO_UUID".to_string()
+            );
+        }
+    };
+
+    log(&format!("Preparing scenario playtest — deck: {}, scenario: {}", deck_id, scenario_id));
+
+    let result = match create_deck_and_scenario_for_forge(&deck_id, &scenario_id).await {
+        Ok(r) => r,
+        Err(e) => {
+            error!("Failed to create scenario files: {:?}", e);
+            return CommandResult::Error(format!("Failed to prepare scenario: {}", e));
+        }
+    };
+
+    if !result.success {
+        return CommandResult::DeckCreated(result);
+    }
+
+    let deck_path_str = result.deck_path.as_ref().map(|p| p.to_string_lossy().to_string());
+    log("Launching Forge with scenario deck...");
+    match launch_forge_from_settings(deck_path_str.as_deref()) {
+        Ok(forge_res) => CommandResult::DeckCreatedAndLaunched(result, forge_res),
+        Err(e) => {
+            error!("Forge launch failed: {}", e);
+            CommandResult::Error(format!("Deck and scenario ready but Forge launch failed: {}", e))
         }
     }
 }

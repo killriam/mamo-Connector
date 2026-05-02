@@ -1123,6 +1123,83 @@ pub async fn create_deck_from_mamo(deck_id: &str) -> Result<DeckCreationResult> 
     create_deck_from_mamo_with_progress(deck_id, None).await
 }
 
+// ==================== Forge Scenario Export ====================
+
+/// Returns the Forge game-log directory where scenario JSON files are placed.
+/// Forge's CSubmenuScenario scans this directory for `*.json` scenario files.
+/// Windows: %APPDATA%\Forge\games\gamelogs\
+/// macOS/Linux: ~/.forge/games/gamelogs/
+fn get_game_log_directory() -> Result<PathBuf> {
+    let base = if cfg!(windows) {
+        if let Some(appdata) = std::env::var_os("APPDATA") {
+            PathBuf::from(appdata)
+        } else {
+            return Err(anyhow::anyhow!("APPDATA environment variable not found"));
+        }
+    } else {
+        let home = std::env::var_os("HOME")
+            .ok_or_else(|| anyhow::anyhow!("HOME environment variable not found"))?;
+        PathBuf::from(home).join(".forge")
+    };
+    Ok(base.join("Forge").join("games").join("gamelogs"))
+}
+
+/// Bundle returned by the backend forge-scenario export endpoint.
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ForgeScenarioBundle {
+    deck_name: String,
+    dck: String,
+    scenario_json: serde_json::Value,
+}
+
+/// Fetch the scenario bundle from the MaMo backend.
+async fn fetch_forge_scenario_bundle(deck_id: &str, scenario_id: &str) -> Result<ForgeScenarioBundle> {
+    let url = format!("{}/api/deck/{}/forge-scenario/{}", MAMO_API_URL, deck_id, scenario_id);
+    let body = fetch_with_curl_custom(&url, &[
+        "-H", "User-Agent: MaMo-Connector/1.0",
+        "-H", "Accept: application/json",
+    ])?;
+
+    let bundle: ForgeScenarioBundle = serde_json::from_str(&body)
+        .with_context(|| format!("Failed to parse forge-scenario bundle: {}", &body[..body.len().min(200)]))?;
+    Ok(bundle)
+}
+
+/// Download the scenario-ordered .dck to the Forge commander deck directory and
+/// write the Forge scenario JSON to the game-log directory.
+/// Returns the deck file path (used to open Forge on that deck).
+pub async fn create_deck_and_scenario_for_forge(deck_id: &str, scenario_id: &str) -> Result<DeckCreationResult> {
+    info!("Fetching Forge scenario bundle — deck: {}, scenario: {}", deck_id, scenario_id);
+
+    let bundle = fetch_forge_scenario_bundle(deck_id, scenario_id).await
+        .context("Failed to fetch Forge scenario bundle from MaMo API")?;
+
+    // Write ordered .dck file
+    let (deck_path, _) = write_deck_file(&bundle.deck_name, &bundle.dck).await
+        .context("Failed to write scenario .dck file")?;
+    info!("Scenario deck written: {:?}", deck_path);
+
+    // Write Forge scenario JSON to the game-log directory
+    let log_dir = get_game_log_directory()?;
+    if !log_dir.exists() {
+        fs::create_dir_all(&log_dir)
+            .with_context(|| format!("Failed to create game-log directory: {:?}", log_dir))?;
+    }
+    let scenario_file_name = format!("Scenario_{}.json", sanitize_filename(&bundle.deck_name));
+    let scenario_path = log_dir.join(&scenario_file_name);
+    let scenario_json_str = serde_json::to_string_pretty(&bundle.scenario_json)
+        .context("Failed to serialise scenario JSON")?;
+    fs::write(&scenario_path, &scenario_json_str)
+        .with_context(|| format!("Failed to write scenario JSON to {:?}", scenario_path))?;
+    info!("Scenario JSON written: {:?}", scenario_path);
+
+    Ok(DeckCreationResult::success(
+        format!("Scenario deck '{}' and scenario file written for Forge", bundle.deck_name),
+        deck_path,
+    ))
+}
+
 /// Parse a MaMo URL and extract the deck UUID
 /// Supported URL formats:
 /// - https://ma-mo-frontend.vercel.app/deck/UUID
