@@ -108,6 +108,10 @@ struct GameLogState {
     preview_results: Vec<FilePreviewInfo>,
     /// Is preview scan running
     is_previewing: bool,
+    /// Is a reparse-failed request currently in flight
+    is_retrying_failed: bool,
+    /// Status message from the last reparse-failed call
+    reparse_status: Option<String>,
 }
 
 /// State for the settings tab (includes Forge configuration)
@@ -282,6 +286,10 @@ struct LauncherApp {
     /// Whether the Forge window has been observed open at least once during this monitoring session.
     /// Used to distinguish "window not yet open" from "window was open and now closed".
     forge_window_seen: bool,
+    /// When the launcher PID first exited during this monitoring session.
+    /// Used to debounce forge_window_seen: a window that appears for <10 s right after the
+    /// launcher exits is treated as the launcher's own UI, not the real Java Forge window.
+    forge_launcher_exited_at: Option<Instant>,
     /// Timestamp of last automatic gamelog scan
     last_auto_gamelog_scan: Option<Instant>,
     /// Whether the bottom activity panel is collapsed
@@ -428,6 +436,7 @@ impl LauncherApp {
             forge_pid: Arc::new(Mutex::new(None)),
             forge_monitoring_since: Arc::new(Mutex::new(None)),
             forge_window_seen: false,
+            forge_launcher_exited_at: None,
             last_auto_gamelog_scan: None,
             activity_panel_collapsed: !started_with_deeplink,
             last_seen_entry_count: 0,
@@ -454,6 +463,17 @@ impl eframe::App for LauncherApp {
         // detection since forge.exe is a launcher that spawns java.exe and exits.
         let monitoring_since = *self.forge_monitoring_since.lock().unwrap();
         if let Some(start_time) = monitoring_since {
+            // Guard against stale fields left by a previous session (e.g. when monitoring
+            // was started by a spawned thread that cannot reset self fields directly).
+            // forge_launcher_exited_at always predates start_time if it belongs to the
+            // previous session, so we reset both fields when that is detected.
+            if let Some(exited_at) = self.forge_launcher_exited_at {
+                if exited_at < start_time {
+                    self.forge_launcher_exited_at = None;
+                    self.forge_window_seen = false;
+                }
+            }
+
             let forge_pid_value = *self.forge_pid.lock().unwrap();
             let pid_alive = forge_pid_value.map(|p| crate::forge::is_process_running(p)).unwrap_or(false);
             let window_open = crate::forge::is_forge_window_open();
@@ -464,15 +484,27 @@ impl eframe::App for LauncherApp {
             // Clear launcher PID once it exits (launcher is just a wrapper)
             if !pid_alive && forge_pid_value.is_some() {
                 *self.forge_pid.lock().unwrap() = None;
+                // Record the moment the launcher PID died so we can debounce the
+                // forge_window_seen flag below.
+                if self.forge_launcher_exited_at.is_none() {
+                    self.forge_launcher_exited_at = Some(now);
+                }
             }
-            
-            // Track if we've ever seen the Forge window open.
-            // Only count it after the launcher PID has exited — while the launcher is
-            // still alive, any "Forge" window belongs to the launcher itself (not the
-            // real Java game), so counting it would incorrectly reduce close_threshold
-            // from 120 s to 20 s before Java has had a chance to start.
-            if window_open && !pid_alive {
-                self.forge_window_seen = true;
+
+            // Track if we've ever seen the REAL Forge game window.
+            // The launcher (forge.exe) and any separate "Game Launcher" app may also
+            // have a window titled "Forge …" that closes shortly after the launcher PID
+            // exits. Only count a window as the real Forge game window if it is still
+            // visible at least 10 s after the launcher PID exited — transient launcher
+            // UIs disappear within 1-3 s, while the real Java Forge session stays open
+            // for the entire game.
+            if !self.forge_window_seen && window_open && !pid_alive {
+                let secs_since_pid_exit = self.forge_launcher_exited_at
+                    .map(|t| now.duration_since(t).as_secs())
+                    .unwrap_or(0);
+                if secs_since_pid_exit >= 10 {
+                    self.forge_window_seen = true;
+                }
             }
             
             if !forge_alive {
@@ -494,6 +526,7 @@ impl eframe::App for LauncherApp {
                     }
                     *self.forge_monitoring_since.lock().unwrap() = None;
                     self.forge_window_seen = false;
+                    self.forge_launcher_exited_at = None;
                     self.last_auto_gamelog_scan = None;
                 }
             } else if !is_scanning {
@@ -1152,6 +1185,7 @@ impl LauncherApp {
                                         *self.forge_pid.lock().unwrap() = Some(pid);
                                         *self.forge_monitoring_since.lock().unwrap() = Some(Instant::now());
                                         self.forge_window_seen = false;
+                                        self.forge_launcher_exited_at = None;
                                     }
                                 }
                                 Err(e) => {
@@ -1169,9 +1203,9 @@ impl LauncherApp {
                     }
 
                     // Upload Logs button
-                    let (is_scanning, directory_valid) = {
+                    let (is_scanning, directory_valid, is_retrying_failed) = {
                         let state = self.gamelog_state.lock().unwrap();
-                        (state.is_scanning, state.directory_valid)
+                        (state.is_scanning, state.directory_valid, state.is_retrying_failed)
                     };
                     if ui.add_enabled(!is_scanning && directory_valid, egui::Button::new("📋 Upload Logs")).clicked() {
                         self.start_gamelog_scan(ctx);
@@ -1179,6 +1213,25 @@ impl LauncherApp {
                     if is_scanning {
                         ui.spinner();
                         ui.label("Uploading...");
+                    }
+
+                    // Retry Failed button — triggers backend re-parse of parse_failed logs
+                    if ui.add_enabled(!is_retrying_failed, egui::Button::new("🔄 Retry Failed")).clicked() {
+                        self.start_reparse_failed(ctx);
+                    }
+                    if is_retrying_failed {
+                        ui.spinner();
+                        ui.label("Re-parsing...");
+                    }
+                    // Show result of last reparse
+                    let reparse_status = self.gamelog_state.lock().unwrap().reparse_status.clone();
+                    if let Some(ref msg) = reparse_status {
+                        let color = if msg.starts_with("Error") {
+                            egui::Color32::from_rgb(176, 0, 32)
+                        } else {
+                            egui::Color32::from_rgb(0, 128, 0)
+                        };
+                        ui.label(egui::RichText::new(msg).small().color(color));
                     }
                 });
             });
@@ -1231,9 +1284,9 @@ impl LauncherApp {
                     }
 
                     if let Some(ref msg) = status_message {
-                        let color = if msg.contains("Error") || msg.contains("failed") {
+                        let color = if msg.starts_with("Error") || (msg.contains("failed") && !msg.contains("0 failed")) {
                             egui::Color32::from_rgb(176, 0, 32)
-                        } else if msg.contains("uploaded") || msg.contains("Success") {
+                        } else if msg.contains("uploaded") || msg.contains("complete") || msg.contains("Success") {
                             egui::Color32::from_rgb(0, 128, 0)
                         } else {
                             egui::Color32::DARK_GRAY
@@ -2464,6 +2517,54 @@ impl LauncherApp {
             }
             
             ctx_clone.request_repaint();
+        });
+    }
+
+    /// Trigger backend re-parse of all parse_failed game logs for the current user.
+    fn start_reparse_failed(&mut self, ctx: &egui::Context) {
+        let gamelog_state = Arc::clone(&self.gamelog_state);
+        let settings = Arc::clone(&self.settings);
+        let ctx_clone = ctx.clone();
+
+        {
+            let mut state = gamelog_state.lock().unwrap();
+            state.is_retrying_failed = true;
+            state.reparse_status = None;
+        }
+
+        let rt = tokio::runtime::Handle::current();
+        std::thread::spawn(move || {
+            rt.block_on(async move {
+                let (api_url, auth_token) = {
+                    let settings = settings.lock().unwrap();
+                    (
+                        settings.gamelog_config.api_url.clone(),
+                        settings.gamelog_config.auth_token.clone(),
+                    )
+                };
+
+                let result = match auth_token {
+                    Some(token) => crate::gamelog::reparse_failed_logs(&api_url, &token).await,
+                    None => Err(anyhow::anyhow!("No auth token configured")),
+                };
+
+                {
+                    let mut state = gamelog_state.lock().unwrap();
+                    state.is_retrying_failed = false;
+                    state.reparse_status = Some(match result {
+                        Ok((reparsed, still_failed, total)) => {
+                            if total == 0 {
+                                "No failed logs found".to_string()
+                            } else {
+                                format!("Re-parsed {}/{} logs ({} still failed)", reparsed, total, still_failed)
+                            }
+                        }
+                        Err(e) => format!("Error: {}", e),
+                    });
+                }
+
+                ctx_clone.request_repaint();
+            });
         });
     }
 

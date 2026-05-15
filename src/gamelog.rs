@@ -20,12 +20,14 @@ use anyhow::{Context, Result};
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use base64::Engine;
 use flate2::write::GzEncoder;
+use flate2::read::GzDecoder;
 use flate2::Compression;
 use serde::{Deserialize, Serialize};
 use sha2::{Sha256, Digest};
 use std::collections::HashSet;
 use std::fs;
 use std::io::Write;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::UNIX_EPOCH;
@@ -311,8 +313,28 @@ pub fn preview_scan(
 
 /// Read and parse a game log file
 pub fn read_game_log(path: &Path) -> Result<GameLogContent> {
-    let content = fs::read_to_string(path)
+    let raw = fs::read_to_string(path)
         .with_context(|| format!("Failed to read file: {:?}", path))?;
+    
+    // Forge (and other Java apps) sometimes write replay files as base64(gzip(JSON)).
+    // The base64-encoded gzip header always starts with "H4sI". Detect and unwrap
+    // transparently so the rest of the pipeline always sees plain JSON.
+    let content = if raw.trim_start().starts_with("H4sI") {
+        let trimmed = raw.trim();
+        match BASE64_STANDARD.decode(trimmed) {
+            Ok(compressed) => {
+                let mut decoder = GzDecoder::new(compressed.as_slice());
+                let mut decompressed = String::new();
+                match decoder.read_to_string(&mut decompressed) {
+                    Ok(_) => decompressed,
+                    Err(_) => raw, // not valid gzip — pass through as-is
+                }
+            }
+            Err(_) => raw, // not valid base64 — pass through as-is
+        }
+    } else {
+        raw
+    };
     
     let metadata = fs::metadata(path)
         .with_context(|| format!("Failed to get file metadata: {:?}", path))?;
@@ -654,6 +676,39 @@ pub struct ReplayContentResponse {
     pub content: Option<String>,
     pub filename: Option<String>,
     pub error: Option<String>,
+}
+
+/// Trigger re-parsing of all parse_failed game logs on the backend.
+///
+/// Calls `POST /api/gamelog/reparse-failed`. The backend re-runs the parser
+/// on stored raw_content for every failed record owned by this user. Returns
+/// how many were successfully re-parsed.
+pub async fn reparse_failed_logs(
+    api_url: &str,
+    auth_token: &str,
+) -> Result<(u32, u32, u32)> {
+    let client = reqwest::Client::new();
+    let url = format!("{}/api/gamelog/reparse-failed", api_url);
+
+    let response = client
+        .post(&url)
+        .header("Authorization", format!("Bearer {}", auth_token))
+        .header("Content-Length", "0")
+        .send()
+        .await
+        .context("Failed to connect to backend for re-parse")?;
+
+    if response.status().is_success() {
+        let body: serde_json::Value = response.json().await.context("Failed to parse reparse response")?;
+        let reparsed = body["reparsed"].as_u64().unwrap_or(0) as u32;
+        let still_failed = body["stillFailed"].as_u64().unwrap_or(0) as u32;
+        let total = body["total"].as_u64().unwrap_or(0) as u32;
+        Ok((reparsed, still_failed, total))
+    } else {
+        let status = response.status();
+        let error_text = response.text().await.unwrap_or_else(|_| "Unknown error".to_string());
+        Err(anyhow::anyhow!("Re-parse failed with status {}: {}", status, error_text))
+    }
 }
 
 /// Download replay content from the backend for a specific game log
