@@ -24,6 +24,8 @@ chrono = { version = "0.4", features = ["serde"] }
 notify = "6.0"
 rfd = "0.14"
 sha2 = "0.10"
+flate2 = "1"
+base64 = "0.22"
 mamo-sim = { path = "../mamo-sim" }
 
 [target.'cfg(windows)'.dependencies]

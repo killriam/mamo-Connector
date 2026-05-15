@@ -17,10 +17,15 @@
 //! game metadata, card index, event logs (L1), and learning views (L2).
 
 use anyhow::{Context, Result};
+use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
+use base64::Engine;
+use flate2::write::GzEncoder;
+use flate2::Compression;
 use serde::{Deserialize, Serialize};
 use sha2::{Sha256, Digest};
 use std::collections::HashSet;
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::UNIX_EPOCH;
@@ -353,14 +358,25 @@ pub async fn upload_game_log(
     let deck_identifier = extract_deck_identifier(&log_content.filename, &log_content.content);
     let deck_link = extract_deck_link(&log_content.content);
     
-    // Calculate SHA256 checksum of the content
+    // Calculate SHA256 checksum of the original content (before compression)
     let mut hasher = Sha256::new();
     hasher.update(log_content.content.as_bytes());
     let checksum = format!("{:x}", hasher.finalize());
-    
+
+    // Gzip-compress the content to stay within Vercel's 4.5 MB serverless body limit.
+    // Large replay files (8+ MB) would be rejected before Express sees them.
+    let compressed_content = {
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(log_content.content.as_bytes())
+            .context("Failed to gzip-compress game log content")?;
+        let compressed = encoder.finish().context("Failed to finalise gzip stream")?;
+        BASE64_STANDARD.encode(&compressed)
+    };
+
     let upload_payload = GameLogUploadPayload {
         filename: log_content.filename.clone(),
-        content: log_content.content.clone(),
+        content: compressed_content,
+        content_encoding: Some("gzip".to_string()),
         file_size: log_content.file_size,
         modified_timestamp: log_content.modified_timestamp,
         user_id: config.user_id.clone(),
@@ -605,12 +621,17 @@ fn extract_deck_from_filename(filename: &str) -> Option<String> {
 #[derive(Debug, Serialize)]
 pub struct GameLogUploadPayload {
     pub filename: String,
+    /// File content, optionally compressed. When `content_encoding` is `"gzip"`,
+    /// this is the base64-encoded gzip of the original UTF-8 content.
     pub content: String,
+    /// Encoding applied to `content`. `None` / absent → raw UTF-8. `"gzip"` → base64(gzip).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub content_encoding: Option<String>,
     pub file_size: u64,
     pub modified_timestamp: Option<u64>,
     pub user_id: Option<String>,
     pub uploaded_at: String,
-    /// SHA256 checksum of the content
+    /// SHA256 checksum of the original (pre-compression) content
     pub checksum: String,
     /// Deck identifier extracted from filename or content
     pub deck_identifier: Option<String>,
