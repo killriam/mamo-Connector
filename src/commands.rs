@@ -249,7 +249,7 @@ async fn handle_playtest_with_scenario(deeplink: &Deeplink, log_collector: Optio
 
     let deck_path_str = result.deck_path.as_ref().map(|p| p.to_string_lossy().to_string());
     log("Launching Forge with scenario deck...");
-    match launch_forge_from_settings(deck_path_str.as_deref()) {
+    match launch_forge_from_settings(deck_path_str.as_deref(), None) {
         Ok(forge_res) => CommandResult::DeckCreatedAndLaunched(result, forge_res),
         Err(e) => {
             error!("Forge launch failed: {}", e);
@@ -292,7 +292,7 @@ async fn handle_launch_forge(deeplink: &Deeplink) -> CommandResult {
                         // Convert PathBuf to string for launch_forge_from_settings
                         let deck_path_str = result.deck_path.as_ref()
                             .map(|p| p.to_string_lossy().to_string());
-                        let forge_result = launch_forge_from_settings(deck_path_str.as_deref());
+                        let forge_result = launch_forge_from_settings(deck_path_str.as_deref(), None);
                         match forge_result {
                             Ok(forge_res) => {
                                 return CommandResult::DeckCreatedAndLaunched(result, forge_res);
@@ -320,7 +320,7 @@ async fn handle_launch_forge(deeplink: &Deeplink) -> CommandResult {
     };
 
     // Launch Forge (without deck download, or deck already exists)
-    match launch_forge_from_settings(deck_path.as_deref()) {
+    match launch_forge_from_settings(deck_path.as_deref(), None) {
         Ok(result) => CommandResult::ForgeLaunched(result),
         Err(e) => {
             error!("Failed to launch Forge: {}", e);
@@ -347,6 +347,12 @@ async fn handle_launch_forge_with_logger(deeplink: &Deeplink, log_collector: Opt
         .or_else(|| get_parameter(&deeplink.params, "deck_id"))
         .or_else(|| get_parameter(&deeplink.params, "deckId"));
 
+    // Optional second deck: by MaMo UUID or by direct Forge deck name
+    let deck2_id   = get_parameter(&deeplink.params, "deck2Id")
+        .or_else(|| get_parameter(&deeplink.params, "deck2_id"));
+    let deck2_name_direct = get_parameter(&deeplink.params, "deck2Name")
+        .or_else(|| get_parameter(&deeplink.params, "deck2name"));
+
     // Check if we should skip download (deck already exists locally)
     let skip_download = get_parameter(&deeplink.params, "skip_download")
         .map(|s| s == "true" || s == "1")
@@ -357,6 +363,32 @@ async fn handle_launch_forge_with_logger(deeplink: &Deeplink, log_collector: Opt
 
     log(&format!("Launch Forge command - deck_id: {:?}", deck_id));
 
+    // Resolve deck2 path: download by UUID if provided, otherwise use direct name
+    let deck2_path: Option<String> = if let Some(direct) = deck2_name_direct {
+        log(&format!("Using deck2 by name: {}", direct));
+        Some(direct)
+    } else if let Some(ref id2) = deck2_id {
+        log(&format!("Downloading deck2 from MaMo: {}", id2));
+        match create_deck_from_mamo(id2).await {
+            Ok(result) if result.success => {
+                let path = result.deck_path.as_ref()
+                    .map(|p| p.to_string_lossy().to_string());
+                log(&format!("Deck2 ready: {:?}", path));
+                path
+            }
+            Ok(result) => {
+                log(&format!("Deck2 download failed: {}", result.message));
+                None
+            }
+            Err(e) => {
+                log(&format!("Error downloading deck2: {}", e));
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     // If we have a deck ID and shouldn't skip download, download it first
     let deck_path: Option<String> = if let Some(ref id) = deck_id {
         if skip_download {
@@ -365,7 +397,7 @@ async fn handle_launch_forge_with_logger(deeplink: &Deeplink, log_collector: Opt
         } else {
             // Download the deck from MaMo with progress logging
             log(&format!("Downloading deck from MaMo: {}", id));
-            
+
             // Create progress callback that uses the log collector
             let progress_callback: Option<crate::deck::ProgressCallback> = log_collector.clone().map(|collector| {
                 Box::new(move |msg: &str| {
@@ -374,17 +406,16 @@ async fn handle_launch_forge_with_logger(deeplink: &Deeplink, log_collector: Opt
                     }
                 }) as crate::deck::ProgressCallback
             });
-            
+
             match create_deck_from_mamo_with_progress(id, progress_callback.as_ref()).await {
                 Ok(result) => {
                     if result.success {
                         log(&format!("Deck ready: {:?}", result.deck_path));
-                        // Convert PathBuf to string for launch_forge_from_settings
                         let deck_path_str = result.deck_path.as_ref()
                             .map(|p| p.to_string_lossy().to_string());
-                        
+
                         log("Launching Forge with deck...");
-                        let forge_result = launch_forge_from_settings(deck_path_str.as_deref());
+                        let forge_result = launch_forge_from_settings(deck_path_str.as_deref(), deck2_path.as_deref());
                         match forge_result {
                             Ok(forge_res) => {
                                 if forge_res.success {
@@ -402,10 +433,9 @@ async fn handle_launch_forge_with_logger(deeplink: &Deeplink, log_collector: Opt
                             }
                         }
                     } else {
-                        // Deck download failed, but still launch Forge without deck
                         log(&format!("Deck download failed: {}", result.message));
                         log("Launching Forge without deck...");
-                        match launch_forge_from_settings(None) {
+                        match launch_forge_from_settings(None, None) {
                             Ok(forge_res) => {
                                 if forge_res.success {
                                     log("Forge launched (without deck due to download error)");
@@ -422,10 +452,9 @@ async fn handle_launch_forge_with_logger(deeplink: &Deeplink, log_collector: Opt
                     }
                 }
                 Err(e) => {
-                    // Error during deck download, but still try to launch Forge
                     log(&format!("Error downloading deck: {}", e));
                     log("Launching Forge without deck...");
-                    match launch_forge_from_settings(None) {
+                    match launch_forge_from_settings(None, None) {
                         Ok(forge_res) => {
                             if forge_res.success {
                                 log("Forge launched (without deck due to error)");
@@ -447,7 +476,7 @@ async fn handle_launch_forge_with_logger(deeplink: &Deeplink, log_collector: Opt
 
     // Launch Forge (without deck download, or deck already exists)
     log("Launching Forge...");
-    match launch_forge_from_settings(deck_path.as_deref()) {
+    match launch_forge_from_settings(deck_path.as_deref(), deck2_path.as_deref()) {
         Ok(result) => {
             if result.success {
                 log("Forge launched successfully!");

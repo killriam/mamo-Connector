@@ -127,6 +127,8 @@ struct SettingsState {
     forge_scripts_path_input: String,
     /// MaMo API authentication token
     auth_token_input: String,
+    /// Moxfield Bearer token for user deck sync
+    moxfield_token_input: String,
     /// Status message
     status_message: Option<String>,
 }
@@ -337,6 +339,7 @@ impl LauncherApp {
             forge_auto_launch: settings.forge_auto_launch,
             forge_scripts_path_input: settings.forge_scripts_path.clone().unwrap_or_default(),
             auth_token_input: settings.auth_token.clone().unwrap_or_default(),
+            moxfield_token_input: settings.moxfield_auth_token.clone().unwrap_or_default(),
             status_message: None,
         };
         
@@ -1171,7 +1174,7 @@ impl LauncherApp {
                     };
                     if forge_configured {
                         if ui.button("🎮 Launch Forge").clicked() {
-                            match launch_forge_from_settings(None) {
+                            match launch_forge_from_settings(None, None) {
                                 Ok(result) => {
                                     if let Ok(mut log) = self.activity_log.lock() {
                                         if result.success {
@@ -3092,7 +3095,7 @@ impl LauncherApp {
             
             // Test launch button
             if ui.add_enabled(forge_path_valid, egui::Button::new("🚀 Test Launch Forge")).clicked() {
-                match launch_forge_from_settings(None) {
+                match launch_forge_from_settings(None, None) {
                     Ok(result) => {
                         let mut state = self.settings_state.lock().unwrap();
                         state.status_message = Some(result.message);

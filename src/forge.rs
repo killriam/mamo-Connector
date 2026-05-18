@@ -214,11 +214,15 @@ fn is_executable(path: &PathBuf) -> bool {
 }
 
 use log::debug;
-/// Launch Forge with an optional deck file
-pub fn launch_forge(forge_path: &str, deck_path: Option<&str>) -> Result<ForgeLaunchResult> {
+/// Launch Forge with an optional deck name and optional second deck name.
+///
+/// For JAR builds the command becomes:
+///   java ... -jar <forge.jar> gui --format commander [--deck <name>] [--deck2 <name2>]
+pub fn launch_forge(forge_path: &str, deck_name: Option<&str>, deck2_name: Option<&str>) -> Result<ForgeLaunchResult> {
     let forge_path_buf = PathBuf::from(forge_path);
     debug!("[launch_forge] Input forge_path: {}", forge_path);
-    debug!("[launch_forge] Input deck_path: {:?}", deck_path);
+    debug!("[launch_forge] Input deck_name: {:?}", deck_name);
+    debug!("[launch_forge] Input deck2_name: {:?}", deck2_name);
 
     if !forge_path_buf.exists() {
         error!("[launch_forge] Forge path does not exist: {}", forge_path);
@@ -248,8 +252,11 @@ pub fn launch_forge(forge_path: &str, deck_path: Option<&str>) -> Result<ForgeLa
 
     let resolved_path_str = forge_path_buf.to_string_lossy().to_string();
     info!("Launching Forge from: {}", resolved_path_str);
-    if let Some(deck) = deck_path {
+    if let Some(deck) = deck_name {
         info!("With deck: {}", deck);
+    }
+    if let Some(deck2) = deck2_name {
+        info!("With deck2: {}", deck2);
     }
 
     // Get the directory containing Forge - important for finding dependencies
@@ -270,15 +277,22 @@ pub fn launch_forge(forge_path: &str, deck_path: Option<&str>) -> Result<ForgeLa
                .arg("-Dio.netty.tryReflectionSetAccessible=true")
                .arg("-Dfile.encoding=UTF-8")
                .arg("-jar")
-               .arg(&forge_path_buf);
-            debug!("[launch_forge] Java command: java -Xmx4096m -Dio.netty.tryReflectionSetAccessible=true -Dfile.encoding=UTF-8 -jar {}", resolved_path_str);
+               .arg(&forge_path_buf)
+               .arg("gui")
+               .arg("--format")
+               .arg("commander");
+            debug!("[launch_forge] Java command: java -Xmx4096m ... -jar {} gui --format commander", resolved_path_str);
             if let Some(dir) = &forge_dir {
                 debug!("[launch_forge] Setting working directory: {}", dir.display());
                 cmd.current_dir(dir);
             }
-            if let Some(deck) = deck_path {
-                debug!("[launch_forge] Adding deck argument: {}", deck);
+            if let Some(deck) = deck_name {
+                debug!("[launch_forge] Adding --deck argument: {}", deck);
                 cmd.arg("--deck").arg(deck);
+            }
+            if let Some(deck2) = deck2_name {
+                debug!("[launch_forge] Adding --deck2 argument: {}", deck2);
+                cmd.arg("--deck2").arg(deck2);
             }
             cmd.spawn()
         }
@@ -306,9 +320,13 @@ pub fn launch_forge(forge_path: &str, deck_path: Option<&str>) -> Result<ForgeLa
                     debug!("[launch_forge] Setting working directory: {}", dir.display());
                     cmd.current_dir(dir);
                 }
-                if let Some(deck) = deck_path {
-                    debug!("[launch_forge] Adding deck argument: {}", deck);
+                if let Some(deck) = deck_name {
+                    debug!("[launch_forge] Adding --deck argument: {}", deck);
                     cmd.arg("--deck").arg(deck);
+                }
+                if let Some(deck2) = deck2_name {
+                    debug!("[launch_forge] Adding --deck2 argument: {}", deck2);
+                    cmd.arg("--deck2").arg(deck2);
                 }
                 cmd.spawn()
             }
@@ -317,9 +335,16 @@ pub fn launch_forge(forge_path: &str, deck_path: Option<&str>) -> Result<ForgeLa
             debug!("[launch_forge] Launching as macOS app bundle");
             let mut cmd = Command::new("open");
             cmd.arg(&forge_path_buf);
-            if let Some(deck) = deck_path {
-                debug!("[launch_forge] Adding deck argument for macOS: {}", deck);
-                cmd.arg("--args").arg("--deck").arg(deck);
+            if deck_name.is_some() || deck2_name.is_some() {
+                cmd.arg("--args");
+                if let Some(deck) = deck_name {
+                    debug!("[launch_forge] Adding --deck argument for macOS: {}", deck);
+                    cmd.arg("--deck").arg(deck);
+                }
+                if let Some(deck2) = deck2_name {
+                    debug!("[launch_forge] Adding --deck2 argument for macOS: {}", deck2);
+                    cmd.arg("--deck2").arg(deck2);
+                }
             }
             cmd.spawn()
         }
@@ -330,9 +355,13 @@ pub fn launch_forge(forge_path: &str, deck_path: Option<&str>) -> Result<ForgeLa
                 debug!("[launch_forge] Setting working directory: {}", dir.display());
                 cmd.current_dir(dir);
             }
-            if let Some(deck) = deck_path {
-                debug!("[launch_forge] Adding deck argument: {}", deck);
+            if let Some(deck) = deck_name {
+                debug!("[launch_forge] Adding --deck argument: {}", deck);
                 cmd.arg("--deck").arg(deck);
+            }
+            if let Some(deck2) = deck2_name {
+                debug!("[launch_forge] Adding --deck2 argument: {}", deck2);
+                cmd.arg("--deck2").arg(deck2);
             }
             cmd.spawn()
         }
@@ -343,9 +372,13 @@ pub fn launch_forge(forge_path: &str, deck_path: Option<&str>) -> Result<ForgeLa
                 debug!("[launch_forge] Setting working directory: {}", dir.display());
                 cmd.current_dir(dir);
             }
-            if let Some(deck) = deck_path {
-                debug!("[launch_forge] Adding deck argument: {}", deck);
+            if let Some(deck) = deck_name {
+                debug!("[launch_forge] Adding --deck argument: {}", deck);
                 cmd.arg("--deck").arg(deck);
+            }
+            if let Some(deck2) = deck2_name {
+                debug!("[launch_forge] Adding --deck2 argument: {}", deck2);
+                cmd.arg("--deck2").arg(deck2);
             }
             cmd.spawn()
         }
@@ -358,7 +391,7 @@ pub fn launch_forge(forge_path: &str, deck_path: Option<&str>) -> Result<ForgeLa
             debug!("[launch_forge] Child process PID: {:?}", pid);
             Ok(ForgeLaunchResult::success(
                 format!("Forge launched successfully"),
-                deck_path.map(|s| s.to_string()),
+                deck_name.map(|s| s.to_string()),
                 Some(resolved_path_str.clone()),
                 Some(pid),
             ))
@@ -530,19 +563,21 @@ pub fn launch_forge_replay(replay_path: &str) -> Result<ForgeLaunchResult> {
     }
 }
 
-/// Launch Forge using the path from settings
-pub fn launch_forge_from_settings(deck_path: Option<&str>) -> Result<ForgeLaunchResult> {
+/// Launch Forge using the path from settings.
+///
+/// `deck_path` and `deck2_path` may be full file-system paths (e.g. `.../decks/MyDeck.dck`)
+/// or plain deck names. The file stem is extracted and passed to Forge as `--deck` / `--deck2`.
+pub fn launch_forge_from_settings(deck_path: Option<&str>, deck2_path: Option<&str>) -> Result<ForgeLaunchResult> {
     // Log if Forge is already running, but do not skip launch
     if is_forge_window_open() {
         info!("Forge is already running (window detected), but will attempt to launch again.");
     }
 
     let settings = Settings::load()?;
-    
+
     let forge_path = match &settings.forge_path {
         Some(path) if !path.is_empty() => path.clone(),
         _ => {
-            // Try to find Forge automatically
             match get_default_forge_path() {
                 Some(path) => path.to_string_lossy().to_string(),
                 None => {
@@ -554,7 +589,21 @@ pub fn launch_forge_from_settings(deck_path: Option<&str>) -> Result<ForgeLaunch
         }
     };
 
-    launch_forge(&forge_path, deck_path)
+    // Extract deck names (file stems) from paths so Forge receives the display name.
+    let deck_name = deck_path.map(|p| {
+        PathBuf::from(p)
+            .file_stem()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_else(|| p.to_string())
+    });
+    let deck2_name = deck2_path.map(|p| {
+        PathBuf::from(p)
+            .file_stem()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_else(|| p.to_string())
+    });
+
+    launch_forge(&forge_path, deck_name.as_deref(), deck2_name.as_deref())
 }
 
 /// Get the Forge deck directory (where decks should be saved)
