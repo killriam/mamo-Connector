@@ -9,7 +9,7 @@ use crate::commands::CommandResult;
 use crate::deck::{create_deck_from_moxfield, MoxfieldDeckEntry, MamoDeckEntry, DeckStatus, fetch_user_decks_direct, create_deck_from_archidekt, create_deck_from_deckstats, create_deck_from_mamo, parse_archidekt_url, parse_deckstats_url, parse_mamo_url, parse_mamo_user_url, fetch_mamo_user_decks, sync_moxfield_deck, sync_moxfield_user_decks, sync_archidekt_deck, sync_deckstats_deck, sync_mamo_deck, DeckSyncResult, SyncStatus, get_deck_directory_display};
 use rfd::FileDialog;
 use crate::deeplink::Deeplink;
-use crate::forge::{get_default_forge_path, resolve_latest_forge_jar, validate_forge_path, launch_forge_from_settings};
+use crate::forge::{get_default_forge_path, resolve_latest_forge_jar, validate_forge_path, launch_forge_from_settings, list_forge_decks};
 use crate::gamelog::{GameLogConfig, GameLogProcessResult, ScanSummary, get_default_forge_log_directory, validate_directory, scan_directory, load_processed_files, save_processed_files, DeckMappings, fetch_my_decks, suggest_deck_matches, load_cached_decks, save_cached_decks, process_new_logs_with_filter, GameLogFilterOptions, FilePreviewInfo};
 use crate::registration::{RegistrationOutcome, RegistrationStatus};
 use crate::settings::{Settings, SavedLink, SavedLinkType};
@@ -298,6 +298,10 @@ struct LauncherApp {
     activity_panel_collapsed: bool,
     /// Track entry count to auto-expand on new errors
     last_seen_entry_count: usize,
+    /// Deck name (file stem) to pre-select when launching Forge
+    selected_forge_deck: Option<String>,
+    /// Local `.dck` file names available in the Forge deck directory
+    forge_local_decks: Vec<String>,
 }
 
 impl LauncherApp {
@@ -443,6 +447,8 @@ impl LauncherApp {
             last_auto_gamelog_scan: None,
             activity_panel_collapsed: !started_with_deeplink,
             last_seen_entry_count: 0,
+            selected_forge_deck: None,
+            forge_local_decks: Vec::new(),
         }
     }
 }
@@ -1166,6 +1172,11 @@ impl LauncherApp {
                 ui.label(egui::RichText::new("Quick Actions").strong());
                 ui.add_space(5.0);
 
+                // Lazy-load local Forge decks on first render
+                if self.forge_local_decks.is_empty() {
+                    self.forge_local_decks = list_forge_decks();
+                }
+
                 ui.horizontal(|ui| {
                     // Launch Forge button
                     let forge_configured = {
@@ -1173,8 +1184,9 @@ impl LauncherApp {
                         state.forge_path_valid
                     };
                     if forge_configured {
+                        let deck_arg = self.selected_forge_deck.as_deref();
                         if ui.button("🎮 Launch Forge").clicked() {
-                            match launch_forge_from_settings(None, None) {
+                            match launch_forge_from_settings(deck_arg, None) {
                                 Ok(result) => {
                                     if let Ok(mut log) = self.activity_log.lock() {
                                         if result.success {
@@ -1237,6 +1249,42 @@ impl LauncherApp {
                         ui.label(egui::RichText::new(msg).small().color(color));
                     }
                 });
+
+                // Deck pre-selection for Forge launch
+                let forge_configured = {
+                    let state = self.settings_state.lock().unwrap();
+                    state.forge_path_valid
+                };
+                if forge_configured {
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new("Deck:").small());
+                        let decks_snapshot = self.forge_local_decks.clone();
+                        let selected_label = self.selected_forge_deck
+                            .as_deref()
+                            .unwrap_or("— none —")
+                            .to_string();
+                        egui::ComboBox::from_id_source("forge_launch_deck")
+                            .width(220.0)
+                            .selected_text(selected_label)
+                            .show_ui(ui, |ui: &mut egui::Ui| {
+                                ui.selectable_value(
+                                    &mut self.selected_forge_deck,
+                                    None,
+                                    "— none —",
+                                );
+                                for deck in &decks_snapshot {
+                                    ui.selectable_value(
+                                        &mut self.selected_forge_deck,
+                                        Some(deck.clone()),
+                                        deck.as_str(),
+                                    );
+                                }
+                            });
+                        if ui.small_button("↺").on_hover_text("Refresh deck list").clicked() {
+                            self.forge_local_decks = list_forge_decks();
+                        }
+                    });
+                }
             });
 
             ui.add_space(10.0);

@@ -607,7 +607,6 @@ pub fn launch_forge_from_settings(deck_path: Option<&str>, deck2_path: Option<&s
 }
 
 /// Get the Forge deck directory (where decks should be saved)
-#[allow(dead_code)]
 pub fn get_forge_deck_directory() -> Option<PathBuf> {
     let settings = Settings::load().ok()?;
     
@@ -628,6 +627,27 @@ pub fn get_forge_deck_directory() -> Option<PathBuf> {
     }
     
     None
+}
+
+/// List deck names (file stems of `.dck` files) available in the Forge deck directory.
+pub fn list_forge_decks() -> Vec<String> {
+    let Some(dir) = get_forge_deck_directory() else {
+        return Vec::new();
+    };
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return Vec::new();
+    };
+    let mut decks: Vec<String> = entries
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().extension().map(|x| x == "dck").unwrap_or(false))
+        .filter_map(|e| {
+            e.path()
+                .file_stem()
+                .map(|s| s.to_string_lossy().to_string())
+        })
+        .collect();
+    decks.sort_unstable();
+    decks
 }
 
 /// Check if a process with the given PID is still running
