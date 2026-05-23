@@ -120,6 +120,9 @@ pub struct Settings {
     /// Authentication token for MaMo API (JWT)
     #[serde(default)]
     pub auth_token: Option<String>,
+    /// Moxfield API Bearer token (for syncing user decks — copy from browser dev tools)
+    #[serde(default)]
+    pub moxfield_auth_token: Option<String>,
     /// Path to the Forge scripts directory (contains run_commander_simulation.ps1 etc.)
     #[serde(default)]
     pub forge_scripts_path: Option<String>,

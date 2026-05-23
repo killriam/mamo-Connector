@@ -1,10 +1,22 @@
 use anyhow::{Context, Result};
 use log::{info, warn};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use sha2::{Sha256, Digest};
 use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
+use crate::settings::Settings;
+
+// Deserializes a JSON number-or-null field as u32, treating null as 0.
+// Required because #[serde(default)] only handles *missing* keys, not explicit null values.
+fn deserialize_null_as_zero<'de, D: Deserializer<'de>>(d: D) -> Result<u32, D::Error> {
+    Option::<u32>::deserialize(d).map(|o| o.unwrap_or(0))
+}
+
+// Deserializes a JSON array-or-null field as Vec<String>, treating null as empty vec.
+fn deserialize_null_as_empty_vec<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<String>, D::Error> {
+    Option::<Vec<String>>::deserialize(d).map(|o| o.unwrap_or_default())
+}
 
 // ==================== Moxfield API Types ====================
 
@@ -32,17 +44,17 @@ pub struct MoxfieldDeckEntry {
     pub public_id: String,
     pub name: String,
     pub format: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_null_as_empty_vec")]
     pub colors: Vec<String>,
     #[serde(default)]
     pub color_percentages: serde_json::Value,
     pub main_card_id: Option<String>,
     pub has_primer: Option<bool>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_null_as_zero")]
     pub view_count: u32,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_null_as_zero")]
     pub like_count: u32,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_null_as_zero")]
     pub comment_count: u32,
     pub are_comments_enabled: Option<bool>,
     pub is_shared: Option<bool>,
@@ -63,9 +75,13 @@ pub struct MoxfieldDeckEntry {
 #[serde(rename_all = "camelCase")]
 #[allow(dead_code)]
 pub struct MoxfieldUserDecksResponse {
+    #[serde(default, deserialize_with = "deserialize_null_as_zero")]
     pub page_number: u32,
+    #[serde(default, deserialize_with = "deserialize_null_as_zero")]
     pub page_size: u32,
+    #[serde(default, deserialize_with = "deserialize_null_as_zero")]
     pub total_results: u32,
+    #[serde(default, deserialize_with = "deserialize_null_as_zero")]
     pub total_pages: u32,
     pub data: Vec<MoxfieldDeckEntry>,
 }
@@ -193,35 +209,56 @@ fn fetch_with_curl(url: &str) -> Result<String> {
 /// Fetch URL with custom headers using curl
 fn fetch_with_curl_custom(url: &str, extra_args: &[&str]) -> Result<String> {
     info!("Fetching via curl: {}", url);
-    
-    let mut args = vec!["-s"];
+
+    // Append the HTTP status code as the last line of stdout so we can check it
+    // without a separate request. The sentinel keeps body and code unambiguous.
+    const STATUS_SENTINEL: &str = "\n__HTTP_STATUS__";
+    let write_out = format!("{}%{{http_code}}", STATUS_SENTINEL);
+
+    let mut args = vec!["-s", "-w", write_out.as_str()];
     args.extend(extra_args);
     args.push(url);
-    
+
     let output = Command::new("curl")
         .args(&args)
         .output()
         .context("Failed to execute curl command")?;
-    
+
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         return Err(anyhow::anyhow!("curl failed: {}", stderr));
     }
-    
-    let body = String::from_utf8(output.stdout)
+
+    let raw = String::from_utf8(output.stdout)
         .context("Invalid UTF-8 in curl response")?;
-    
+
+    // Split body from the appended status code
+    let (body, http_status) = if let Some(idx) = raw.rfind(STATUS_SENTINEL) {
+        let code: u16 = raw[idx + STATUS_SENTINEL.len()..].trim().parse().unwrap_or(0);
+        (&raw[..idx], code)
+    } else {
+        (raw.as_str(), 0u16)
+    };
+
     // Check for Cloudflare block (HTML response)
     if body.contains("<!DOCTYPE html>") && body.contains("Cloudflare") {
-        return Err(anyhow::anyhow!("Cloudflare blocked the request"));
+        return Err(anyhow::anyhow!("Cloudflare blocked the request (HTTP {})", http_status));
     }
-    
-    Ok(body)
+
+    if http_status != 0 && !(200..300).contains(&http_status) {
+        let snippet = &body[..body.len().min(300)];
+        return Err(anyhow::anyhow!(
+            "HTTP {} from {}: {}",
+            http_status, url, snippet
+        ));
+    }
+
+    Ok(body.to_string())
 }
 
 // ==================== Direct Moxfield Access ====================
 
-const MOXFIELD_API_URL: &str = "https://api2.moxfield.com/v2";
+const MOXFIELD_API_URL: &str = "https://api2.moxfield.com/v3";
 
 /// Moxfield full deck response structure
 #[derive(Debug, Deserialize)]
@@ -286,22 +323,40 @@ pub async fn create_deck_from_moxfield(deck_id: &str) -> Result<DeckCreationResu
 /// Fetch user decks directly from Moxfield using curl (bypasses Cloudflare)
 /// Also checks local deck directory and sets status for each deck
 pub fn fetch_user_decks_direct(username: &str) -> Result<Vec<MoxfieldDeckEntry>> {
+    fetch_user_decks_direct_with_token(username, None)
+}
+
+/// Like `fetch_user_decks_direct` but accepts an optional Moxfield Bearer token.
+pub fn fetch_user_decks_direct_with_token(username: &str, token: Option<&str>) -> Result<Vec<MoxfieldDeckEntry>> {
     info!("Fetching decks for user '{}' directly via curl", username);
-    
+
     let mut all_decks = Vec::new();
     let mut page = 1;
     let page_size = 100;
-    
+
     loop {
         let url = format!(
             "{}/users/{}/decks?pageNumber={}&pageSize={}",
             MOXFIELD_API_URL, username, page, page_size
         );
-        
-        let body = fetch_with_curl(&url)?;
-        
+
+        let body = if let Some(tok) = token {
+            let auth_header = format!("Authorization: Bearer {}", tok);
+            fetch_with_curl_custom(&url, &[
+                "-H", "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                "-H", "Accept: application/json",
+                "-H", "Referer: https://www.moxfield.com/",
+                "-H", auth_header.as_str(),
+            ])?
+        } else {
+            fetch_with_curl(&url)?
+        };
+
         let page_response: MoxfieldUserDecksResponse = serde_json::from_str(&body)
-            .context("Failed to parse Moxfield user decks response")?;
+            .with_context(|| format!(
+                "Failed to parse Moxfield user decks response: {}",
+                &body[..body.len().min(500)]
+            ))?;
         
         info!("Fetched {} decks (page {}/{})", 
               page_response.data.len(), 
@@ -517,10 +572,12 @@ pub async fn fetch_moxfield_user_decks(username: &str) -> Result<Vec<MoxfieldDec
             ));
         }
         
-        let page_response: MoxfieldUserDecksResponse = response
-            .json()
-            .await
-            .context("Failed to parse Moxfield user decks response")?;
+        let body = response.text().await.context("Failed to read Moxfield API response body")?;
+        let page_response: MoxfieldUserDecksResponse = serde_json::from_str(&body)
+            .with_context(|| format!(
+                "Failed to parse Moxfield user decks response: {}",
+                &body[..body.len().min(500)]
+            ))?;
         
         info!("Fetched {} decks (page {}/{})", 
               page_response.data.len(), 
@@ -1938,9 +1995,9 @@ pub async fn sync_moxfield_deck(deck_id: &str) -> Result<DeckSyncResult> {
 /// Sync all decks from a Moxfield user
 pub async fn sync_moxfield_user_decks(username: &str) -> Result<Vec<DeckSyncResult>> {
     info!("Syncing all decks for Moxfield user: {}", username);
-    
-    // Fetch all user decks
-    let decks = fetch_user_decks_direct(username)?;
+
+    let token = Settings::load().ok().and_then(|s| s.moxfield_auth_token);
+    let decks = fetch_user_decks_direct_with_token(username, token.as_deref())?;
     let mut results = Vec::new();
     
     for deck in decks {
