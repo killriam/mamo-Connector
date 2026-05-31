@@ -3,6 +3,7 @@ use chrono::Local;
 use eframe::{NativeOptions, egui};
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 use crate::commands::CommandResult;
@@ -68,6 +69,45 @@ struct UpdateCheckState {
     /// Some(version_string) when a newer release is available
     available_version: Option<String>,
     dismissed: bool,
+}
+
+/// Steps of the first-run setup wizard
+#[derive(Clone, PartialEq, Eq, Default)]
+enum WizardStep {
+    #[default]
+    Welcome,
+    ConfigureForge,
+    Done,
+}
+
+/// Status of the in-wizard Forge test launch
+#[derive(Clone)]
+enum WizardTestStatus {
+    Testing,
+    Ok,
+    Err(String),
+}
+
+/// State for the setup wizard (first run / forge misconfigured)
+struct SetupWizardState {
+    step: WizardStep,
+    forge_path_input: String,
+    forge_path_valid: bool,
+    test_status: Option<WizardTestStatus>,
+    /// Written by the test-launch background thread; polled in update()
+    pending_test_result: Option<Arc<Mutex<Option<WizardTestStatus>>>>,
+}
+
+impl Default for SetupWizardState {
+    fn default() -> Self {
+        Self {
+            step: WizardStep::default(),
+            forge_path_input: String::new(),
+            forge_path_valid: false,
+            test_status: None,
+            pending_test_result: None,
+        }
+    }
 }
 
 /// Fetch the tag_name of the latest GitHub release (strips leading 'v')
@@ -341,6 +381,12 @@ struct LauncherApp {
     forge_local_decks: Vec<String>,
     /// Background version check result
     update_check: Arc<Mutex<UpdateCheckState>>,
+    /// Whether the setup wizard is currently visible
+    show_setup_wizard: bool,
+    /// State for the setup wizard
+    wizard: SetupWizardState,
+    /// Set by background threads when a Forge launch fails — checked in update()
+    wizard_requested: Arc<AtomicBool>,
 }
 
 impl LauncherApp {
@@ -467,6 +513,17 @@ impl LauncherApp {
         // Switch to Home tab (activity panel will auto-expand for deeplink progress)
         let initial_tab = Tab::Home;
 
+        // Wizard: show on first run or when Forge is not configured
+        let forge_not_configured = settings.forge_path.is_none();
+        let wizard_requested = Arc::new(AtomicBool::new(false));
+        let wizard = SetupWizardState {
+            step: WizardStep::Welcome,
+            forge_path_input: settings.forge_path.clone().unwrap_or_default(),
+            forge_path_valid: settings.forge_path.as_ref().map(|p| validate_forge_path(p)).unwrap_or(false),
+            test_status: None,
+            pending_test_result: None,
+        };
+
         // Kick off background update check — doesn't block startup
         let update_check = Arc::new(Mutex::new(UpdateCheckState::default()));
         {
@@ -508,6 +565,9 @@ impl LauncherApp {
             selected_forge_deck: None,
             forge_local_decks: Vec::new(),
             update_check,
+            show_setup_wizard: forge_not_configured,
+            wizard,
+            wizard_requested,
         }
     }
 }
@@ -517,6 +577,24 @@ impl eframe::App for LauncherApp {
         // Process initial deeplink on first frame (with progress logging)
         if let Some(deeplink) = self.pending_initial_deeplink.take() {
             self.process_deeplink_with_progress(deeplink, ctx);
+        }
+
+        // Pick up wizard requests from background threads (e.g. forge launch failure)
+        if self.wizard_requested.load(Ordering::Relaxed) {
+            self.wizard_requested.store(false, Ordering::Relaxed);
+            self.show_setup_wizard = true;
+            self.wizard.step = WizardStep::ConfigureForge;
+        }
+
+        // Poll wizard test-launch result from background thread
+        let wizard_test_done = if let Some(ref chan) = self.wizard.pending_test_result {
+            chan.try_lock().ok().and_then(|mut g| g.take())
+        } else {
+            None
+        };
+        if let Some(result) = wizard_test_done {
+            self.wizard.test_status = Some(result);
+            self.wizard.pending_test_result = None;
         }
         
         // Check for pending commands from secondary instances every 500ms
@@ -647,7 +725,12 @@ impl eframe::App for LauncherApp {
             .show(ctx, |ui| {
                 ui.visuals_mut().override_text_color = Some(egui::Color32::BLACK);
                 ui.visuals_mut().panel_fill = egui::Color32::WHITE;
-                
+
+                if self.show_setup_wizard {
+                    self.render_setup_wizard(ui, ctx);
+                    return;
+                }
+
                 // Title with version info
                 ui.horizontal(|ui| {
                     ui.heading("Mamo Connector");
@@ -748,6 +831,7 @@ impl LauncherApp {
         let forge_monitoring_since = self.forge_monitoring_since.clone();
         let ctx_clone = ctx.clone();
         let ctx_for_polling = ctx.clone();
+        let wizard_requested = Arc::clone(&self.wizard_requested);
         
         // Create a log collector for the command handler
         let log_collector: SharedLogCollector = Arc::new(Mutex::new(Vec::new()));
@@ -808,6 +892,7 @@ impl LauncherApp {
                             log.log_success(&forge_result.message);
                         } else {
                             log.log_error(&forge_result.message);
+                            wizard_requested.store(true, Ordering::Relaxed);
                         }
                     }
                     commands::CommandResult::ForgeLaunched(forge_result) => {
@@ -817,6 +902,7 @@ impl LauncherApp {
                             log.log_success(&forge_result.message);
                         } else {
                             log.log_error(&forge_result.message);
+                            wizard_requested.store(true, Ordering::Relaxed);
                         }
                     }
                     commands::CommandResult::AuthTokenSaved(msg) => {
@@ -844,6 +930,7 @@ impl LauncherApp {
                             log.log_success(&forge_result.message);
                         } else {
                             log.log_error(&forge_result.message);
+                            wizard_requested.store(true, Ordering::Relaxed);
                         }
                     }
                     commands::CommandResult::SimulationCompleted(sim_result) => {
@@ -1220,6 +1307,212 @@ impl LauncherApp {
     }
 
     // ==================== Home Tab ====================
+
+    fn render_setup_wizard(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        ui.vertical_centered(|ui| {
+            ui.add_space(20.0);
+
+            match self.wizard.step.clone() {
+                // ── Step 1: Welcome ───────────────────────────────────────────
+                WizardStep::Welcome => {
+                    ui.label(egui::RichText::new("🔌").size(48.0));
+                    ui.add_space(8.0);
+                    ui.label(egui::RichText::new("Welcome to MaMo Connector").size(22.0).strong());
+                    ui.add_space(12.0);
+                    ui.label(
+                        egui::RichText::new(
+                            "Before you can playtest in Forge, we need to find your\n\
+                             Forge MTG installation. This only takes a moment."
+                        )
+                        .color(egui::Color32::from_rgb(80, 80, 80)),
+                    );
+                    ui.add_space(24.0);
+                    if ui.add(egui::Button::new(
+                        egui::RichText::new("Get Started →").size(16.0)
+                    ).min_size(egui::vec2(160.0, 36.0))).clicked() {
+                        self.wizard.step = WizardStep::ConfigureForge;
+                        // Try auto-detect on entry
+                        if self.wizard.forge_path_input.is_empty() {
+                            if let Some(p) = get_default_forge_path() {
+                                let s = p.to_string_lossy().to_string();
+                                self.wizard.forge_path_valid = validate_forge_path(&s);
+                                self.wizard.forge_path_input = s;
+                            }
+                        }
+                    }
+                    ui.add_space(8.0);
+                    if ui.small_button("Skip for now").clicked() {
+                        self.show_setup_wizard = false;
+                    }
+                }
+
+                // ── Step 2: Configure Forge path ─────────────────────────────
+                WizardStep::ConfigureForge => {
+                    ui.label(egui::RichText::new("🎮 Configure Forge").size(20.0).strong());
+                    ui.add_space(4.0);
+                    ui.label(
+                        egui::RichText::new("Point MaMo Connector to your Forge installation.")
+                            .color(egui::Color32::from_rgb(80, 80, 80)),
+                    );
+                    ui.add_space(16.0);
+
+                    // Path input row
+                    ui.horizontal(|ui| {
+                        let mut path = self.wizard.forge_path_input.clone();
+                        let resp = ui.add(
+                            egui::TextEdit::singleline(&mut path)
+                                .desired_width(380.0)
+                                .hint_text("Path to forge.exe, .jar, or Forge directory"),
+                        );
+                        if resp.changed() {
+                            self.wizard.forge_path_valid = validate_forge_path(&path);
+                            self.wizard.forge_path_input = path;
+                            self.wizard.test_status = None;
+                        }
+                        if self.wizard.forge_path_input.is_empty() {
+                            ui.label(egui::RichText::new("  ").weak());
+                        } else if self.wizard.forge_path_valid {
+                            ui.label(egui::RichText::new("✓").color(egui::Color32::from_rgb(0, 150, 0)).strong());
+                        } else {
+                            ui.label(egui::RichText::new("✗").color(egui::Color32::from_rgb(200, 0, 0)).strong());
+                        }
+                    });
+                    ui.add_space(8.0);
+
+                    // Helper buttons
+                    ui.horizontal(|ui| {
+                        if ui.button("🔍 Auto-detect").clicked() {
+                            if let Some(p) = get_default_forge_path() {
+                                let s = p.to_string_lossy().to_string();
+                                self.wizard.forge_path_valid = validate_forge_path(&s);
+                                self.wizard.forge_path_input = s;
+                                self.wizard.test_status = None;
+                            }
+                        }
+                        if ui.button("📁 Browse…").clicked() {
+                            let dialog = rfd::FileDialog::new()
+                                .add_filter("Forge Executable", &["exe", "jar", "bat"])
+                                .add_filter("All Files", &["*"])
+                                .set_title("Select Forge Executable or Directory");
+                            if let Some(path) = dialog.pick_file() {
+                                let s = path.to_string_lossy().to_string();
+                                self.wizard.forge_path_valid = validate_forge_path(&s);
+                                self.wizard.forge_path_input = s;
+                                self.wizard.test_status = None;
+                            }
+                        }
+                        if ui.button("📂 Folder…").clicked() {
+                            if let Some(folder) = rfd::FileDialog::new()
+                                .set_title("Select Forge Directory")
+                                .pick_folder()
+                            {
+                                let s = folder.to_string_lossy().to_string();
+                                self.wizard.forge_path_valid = validate_forge_path(&s);
+                                self.wizard.forge_path_input = s;
+                                self.wizard.test_status = None;
+                            }
+                        }
+                    });
+                    ui.add_space(12.0);
+
+                    // Test launch row
+                    ui.horizontal(|ui| {
+                        let can_test = self.wizard.forge_path_valid
+                            && !matches!(self.wizard.test_status, Some(WizardTestStatus::Testing));
+                        if ui.add_enabled(can_test, egui::Button::new("▶ Test Launch")).clicked() {
+                            self.wizard.test_status = Some(WizardTestStatus::Testing);
+                            let path = self.wizard.forge_path_input.clone();
+                            let settings_arc = self.settings.clone();
+                            let ctx2 = ctx.clone();
+                            let chan: Arc<Mutex<Option<WizardTestStatus>>> = Arc::new(Mutex::new(None));
+                            self.wizard.pending_test_result = Some(Arc::clone(&chan));
+                            std::thread::spawn(move || {
+                                // Persist path temporarily so launch_forge_from_settings can read it
+                                {
+                                    let mut s = settings_arc.lock().unwrap();
+                                    s.forge_path = Some(path);
+                                    let _ = s.save();
+                                }
+                                let status = match launch_forge_from_settings(None, None) {
+                                    Ok(r) if r.success || r.already_running => WizardTestStatus::Ok,
+                                    Ok(r) => WizardTestStatus::Err(r.message),
+                                    Err(e) => WizardTestStatus::Err(e.to_string()),
+                                };
+                                *chan.lock().unwrap() = Some(status);
+                                ctx2.request_repaint();
+                            });
+                        }
+                        match &self.wizard.test_status {
+                            Some(WizardTestStatus::Testing) => {
+                                ui.spinner();
+                                ui.label(egui::RichText::new("Launching Forge…").weak());
+                            }
+                            Some(WizardTestStatus::Ok) => {
+                                ui.label(egui::RichText::new("✓ Forge launched successfully").color(egui::Color32::from_rgb(0, 150, 0)));
+                            }
+                            Some(WizardTestStatus::Err(msg)) => {
+                                ui.label(egui::RichText::new(format!("✗ {msg}")).color(egui::Color32::from_rgb(200, 0, 0)));
+                            }
+                            None => {}
+                        }
+                    });
+                    ui.add_space(20.0);
+
+                    // Navigation
+                    ui.horizontal(|ui| {
+                        if ui.button("← Back").clicked() {
+                            self.wizard.step = WizardStep::Welcome;
+                        }
+                        let can_finish = self.wizard.forge_path_valid;
+                        if ui.add_enabled(
+                            can_finish,
+                            egui::Button::new(egui::RichText::new("Save & Finish ✓").strong())
+                                .min_size(egui::vec2(130.0, 28.0)),
+                        ).clicked() {
+                            // Persist the path
+                            let path = self.wizard.forge_path_input.clone();
+                            {
+                                let mut settings = self.settings.lock().unwrap();
+                                settings.forge_path = Some(path.clone());
+                                let _ = settings.save();
+                            }
+                            // Sync into settings_state so the Settings tab shows it too
+                            {
+                                let mut ss = self.settings_state.lock().unwrap();
+                                ss.forge_path_input = path;
+                                ss.forge_path_valid = true;
+                            }
+                            self.wizard.step = WizardStep::Done;
+                        }
+                        if ui.small_button("Skip for now").clicked() {
+                            self.show_setup_wizard = false;
+                        }
+                    });
+                }
+
+                // ── Step 3: Done ─────────────────────────────────────────────
+                WizardStep::Done => {
+                    ui.label(egui::RichText::new("✅").size(48.0));
+                    ui.add_space(8.0);
+                    ui.label(egui::RichText::new("You're all set!").size(22.0).strong());
+                    ui.add_space(12.0);
+                    ui.label(
+                        egui::RichText::new(
+                            "Forge is configured. Click any playtest button in MaMo\n\
+                             to launch Forge with your deck loaded."
+                        )
+                        .color(egui::Color32::from_rgb(80, 80, 80)),
+                    );
+                    ui.add_space(24.0);
+                    if ui.add(egui::Button::new(
+                        egui::RichText::new("Close").size(15.0)
+                    ).min_size(egui::vec2(100.0, 32.0))).clicked() {
+                        self.show_setup_wizard = false;
+                    }
+                }
+            }
+        });
+    }
 
     fn render_home_tab(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         egui::ScrollArea::vertical().show(ui, |ui| {
