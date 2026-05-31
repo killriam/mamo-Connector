@@ -638,6 +638,10 @@ impl eframe::App for LauncherApp {
             self.wizard_requested.store(false, Ordering::Relaxed);
             self.show_setup_wizard = true;
             self.wizard.step = WizardStep::ConfigureForge;
+            // Clear any stale download state so DownloadForge doesn't show leftover errors
+            self.wizard.download_progress = None;
+            self.wizard.download_result = None;
+            self.wizard.download_cancelled = None;
         }
 
         // Poll wizard test-launch result from background thread
@@ -1534,16 +1538,17 @@ impl LauncherApp {
 
                 // ── Step 1b: Download MaMo Forge ─────────────────────────────
                 WizardStep::DownloadForge => {
+                    ui.set_max_width(500.0);
                     ui.label(egui::RichText::new("⬇ Download MaMo Forge").size(20.0).strong());
                     ui.add_space(4.0);
-                    ui.label(
+                    ui.add(egui::Label::new(
                         egui::RichText::new(
-                            "MaMo uses a custom Forge build with replay recording,\n\
-                             commander simulation, and MaMo integration.\n\
+                            "MaMo uses a custom Forge build with replay recording, \
+                             commander simulation, and MaMo integration. \
                              Download it automatically (~100-300 MB)."
                         )
                         .color(egui::Color32::from_rgb(80, 80, 80)),
-                    );
+                    ).wrap());
                     ui.add_space(16.0);
 
                     // Read current progress state
