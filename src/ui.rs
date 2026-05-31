@@ -71,6 +71,13 @@ struct UpdateCheckState {
     dismissed: bool,
 }
 
+/// Destructive actions that require a confirmation dialog
+#[derive(Clone, PartialEq, Eq)]
+enum ConfirmAction {
+    ResetFirstRun,
+    Uninstall,
+}
+
 /// Steps of the first-run setup wizard
 #[derive(Clone, PartialEq, Eq, Default)]
 enum WizardStep {
@@ -387,6 +394,8 @@ struct LauncherApp {
     wizard: SetupWizardState,
     /// Set by background threads when a Forge launch fails — checked in update()
     wizard_requested: Arc<AtomicBool>,
+    /// Which destructive action is pending confirmation (None = no dialog showing)
+    confirm_action: Option<ConfirmAction>,
 }
 
 impl LauncherApp {
@@ -568,6 +577,7 @@ impl LauncherApp {
             show_setup_wizard: forge_not_configured,
             wizard,
             wizard_requested,
+            confirm_action: None,
         }
     }
 }
@@ -717,6 +727,11 @@ impl eframe::App for LauncherApp {
             }
         }
         
+        // Confirm dialog for destructive actions (rendered as a floating window)
+        if self.confirm_action.is_some() {
+            self.render_confirm_dialog(ctx);
+        }
+
         // Bottom panel: Activity Log (rendered BEFORE CentralPanel per egui rules)
         self.render_activity_panel(ctx);
         
@@ -1307,6 +1322,107 @@ impl LauncherApp {
     }
 
     // ==================== Home Tab ====================
+
+    fn render_confirm_dialog(&mut self, ctx: &egui::Context) {
+        let action = match &self.confirm_action {
+            Some(a) => a.clone(),
+            None => return,
+        };
+        let (title, body, confirm_label, confirm_color) = match action {
+            ConfirmAction::ResetFirstRun => (
+                "Reset to First Run?",
+                "This will:\n• De-register the mamoConnector:// URL scheme\n• Delete all settings (Forge path, auth token, saved links)\n\nThe app will show the setup wizard on next launch.",
+                "Reset",
+                egui::Color32::from_rgb(230, 130, 0),
+            ),
+            ConfirmAction::Uninstall => (
+                "Uninstall MaMo Connector?",
+                "This will:\n• De-register the mamoConnector:// URL scheme\n• Delete all settings and data\n• Delete the application executable\n\nThis cannot be undone.",
+                "Uninstall",
+                egui::Color32::from_rgb(200, 0, 0),
+            ),
+        };
+
+        egui::Window::new(title)
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                ui.set_min_width(340.0);
+                ui.label(egui::RichText::new(body).color(egui::Color32::from_rgb(60, 60, 60)));
+                ui.add_space(16.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Cancel").clicked() {
+                        self.confirm_action = None;
+                    }
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.add(
+                            egui::Button::new(egui::RichText::new(confirm_label).color(egui::Color32::WHITE))
+                                .fill(confirm_color),
+                        ).clicked() {
+                            let action = self.confirm_action.take().unwrap();
+                            match action {
+                                ConfirmAction::ResetFirstRun => self.do_reset(),
+                                ConfirmAction::Uninstall => self.do_uninstall(ctx),
+                            }
+                        }
+                    });
+                });
+            });
+    }
+
+    fn do_reset(&mut self) {
+        use crate::registration::unregister;
+        use crate::settings::get_settings_dir;
+
+        let _ = unregister(crate::SCHEME);
+
+        if let Ok(dir) = get_settings_dir() {
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        // Reset in-memory state so the wizard shows immediately
+        *self.settings.lock().unwrap() = crate::settings::Settings::default();
+        {
+            let mut ss = self.settings_state.lock().unwrap();
+            ss.forge_path_input = String::new();
+            ss.forge_path_valid = false;
+            ss.auth_token_input = String::new();
+            ss.status_message = Some("Reset complete. Setup wizard will appear on next launch.".to_string());
+        }
+        self.wizard = SetupWizardState::default();
+        self.show_setup_wizard = true;
+    }
+
+    fn do_uninstall(&mut self, ctx: &egui::Context) {
+        use crate::registration::unregister;
+        use crate::settings::get_settings_dir;
+
+        let _ = unregister(crate::SCHEME);
+
+        if let Ok(dir) = get_settings_dir() {
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        // Self-delete: spawn a script that waits for this process to exit, then deletes the exe
+        #[cfg(windows)]
+        {
+            if let Ok(exe) = std::env::current_exe() {
+                let exe_str = exe.to_string_lossy();
+                let bat = format!(
+                    "@echo off\r\nping -n 3 127.0.0.1 >nul\r\ndel /f /q \"{exe_str}\"\r\ndel /f /q \"%~f0\"\r\n"
+                );
+                let bat_path = std::env::temp_dir().join("mamo_uninstall.bat");
+                if std::fs::write(&bat_path, bat).is_ok() {
+                    let _ = std::process::Command::new("cmd")
+                        .args(["/c", "start", "/min", &bat_path.to_string_lossy()])
+                        .spawn();
+                }
+            }
+        }
+
+        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+    }
 
     fn render_setup_wizard(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         ui.vertical_centered(|ui| {
@@ -3807,6 +3923,36 @@ impl LauncherApp {
             };
             ui.label(egui::RichText::new(msg).color(color));
         }
+
+        ui.add_space(20.0);
+
+        // ── Advanced / Uninstall ──────────────────────────────────────────
+        ui.group(|ui| {
+            ui.label(egui::RichText::new("⚠ Advanced").strong().color(egui::Color32::from_rgb(160, 60, 0)));
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                if ui.add(
+                    egui::Button::new("🔄 Reset to First Run")
+                        .fill(egui::Color32::from_rgb(255, 243, 220)),
+                ).on_hover_text("De-registers URL scheme, deletes all settings, shows setup wizard on next launch")
+                .clicked() {
+                    self.confirm_action = Some(ConfirmAction::ResetFirstRun);
+                }
+                ui.label(egui::RichText::new("Re-run the setup wizard and clear all settings").weak().small());
+            });
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                if ui.add(
+                    egui::Button::new("🗑 Uninstall")
+                        .fill(egui::Color32::from_rgb(255, 220, 220)),
+                ).on_hover_text("De-registers URL scheme, deletes all data, then deletes the executable")
+                .clicked() {
+                    self.confirm_action = Some(ConfirmAction::Uninstall);
+                }
+                ui.label(egui::RichText::new("Remove MaMo Connector from this machine").weak().small());
+            });
+        });
+
         }); // end ScrollArea
     }
 

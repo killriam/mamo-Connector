@@ -222,6 +222,26 @@ impl Settings {
     }
 }
 
+/// Get the directory that holds all MaMo Connector data (settings, lock file, etc.)
+pub fn get_settings_dir() -> Result<PathBuf> {
+    let dir = if cfg!(windows) {
+        dirs::config_dir()
+            .ok_or_else(|| anyhow::anyhow!("Could not find config directory"))?
+            .join("MamoConnector")
+    } else if cfg!(target_os = "macos") {
+        dirs::home_dir()
+            .ok_or_else(|| anyhow::anyhow!("Could not find home directory"))?
+            .join("Library")
+            .join("Application Support")
+            .join("MamoConnector")
+    } else {
+        dirs::config_dir()
+            .ok_or_else(|| anyhow::anyhow!("Could not find config directory"))?
+            .join("mamo-connector")
+    };
+    Ok(dir)
+}
+
 /// Get the path to the settings file
 fn get_settings_path() -> Result<PathBuf> {
     let config_dir = if cfg!(windows) {

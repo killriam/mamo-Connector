@@ -39,6 +39,21 @@ impl RegistrationOutcome {
     }
 }
 
+/// Remove the custom URL scheme registration created by `ensure_registered`.
+pub fn unregister(scheme: &str) -> Result<()> {
+    cfg_if! {
+        if #[cfg(windows)] {
+            unregister_windows(scheme)
+        } else if #[cfg(target_os = "linux")] {
+            unregister_linux(scheme)
+        } else {
+            // macOS: LaunchServices has no public removal API; nothing to do
+            let _ = scheme;
+            Ok(())
+        }
+    }
+}
+
 pub fn ensure_registered(scheme: &str) -> Result<RegistrationOutcome> {
     cfg_if! {
         if #[cfg(windows)] {
@@ -203,4 +218,44 @@ fn register_linux(scheme: &str) -> Result<RegistrationOutcome> {
         "Registered custom scheme '{scheme}' via {:?}",
         desktop_file_path
     )))
+}
+
+#[cfg(windows)]
+fn unregister_windows(scheme: &str) -> Result<()> {
+    use winreg::RegKey;
+    use winreg::enums::HKEY_CURRENT_USER;
+
+    let hkcu = RegKey::predef(HKEY_CURRENT_USER);
+    let classes = hkcu
+        .open_subkey("Software\\Classes")
+        .context("unable to open HKCU\\Software\\Classes")?;
+
+    // delete_subkey_all removes the key and all its children
+    match classes.delete_subkey_all(scheme) {
+        Ok(_) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()), // already gone
+        Err(e) => Err(e).context(format!("unable to remove registry key for scheme {scheme}")),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn unregister_linux(scheme: &str) -> Result<()> {
+    use directories::BaseDirs;
+    use std::fs;
+    use std::process::Command;
+
+    let base_dirs = BaseDirs::new().context("unable to locate home directory")?;
+    let desktop_file_path = base_dirs
+        .data_local_dir()
+        .join("applications")
+        .join(format!("{scheme}.desktop"));
+
+    if desktop_file_path.exists() {
+        fs::remove_file(&desktop_file_path)
+            .with_context(|| format!("unable to remove {:?}", desktop_file_path))?;
+        let _ = Command::new("update-desktop-database")
+            .arg(desktop_file_path.parent().unwrap())
+            .status();
+    }
+    Ok(())
 }

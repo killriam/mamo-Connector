@@ -15,7 +15,7 @@ use registration::RegistrationOutcome;
 use std::fs;
 use std::path::PathBuf;
 
-const SCHEME: &str = "mamoConnector";
+pub const SCHEME: &str = "mamoConnector";
 const SCHEME_PREFIX: &str = "mamoConnector://";
 
 /// Get the path to the pending command file
