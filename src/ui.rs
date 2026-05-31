@@ -62,6 +62,43 @@ struct SyncState {
     add_name_input: String,
 }
 
+/// State for the background version check
+#[derive(Clone, Default)]
+struct UpdateCheckState {
+    /// Some(version_string) when a newer release is available
+    available_version: Option<String>,
+    dismissed: bool,
+}
+
+/// Fetch the tag_name of the latest GitHub release (strips leading 'v')
+async fn fetch_latest_release_version() -> anyhow::Result<String> {
+    let client = reqwest::Client::builder()
+        .user_agent("mamo-connector-update-check")
+        .timeout(std::time::Duration::from_secs(10))
+        .build()?;
+    let resp: serde_json::Value = client
+        .get("https://api.github.com/repos/killriam/mamo-Connector/releases/latest")
+        .send()
+        .await?
+        .json()
+        .await?;
+    let tag = resp["tag_name"]
+        .as_str()
+        .ok_or_else(|| anyhow::anyhow!("no tag_name in response"))?
+        .trim_start_matches('v')
+        .to_string();
+    Ok(tag)
+}
+
+/// Returns true if `remote` is a higher semver than `current` (both "X.Y.Z" strings)
+fn is_newer_version(remote: &str, current: &str) -> bool {
+    let parse = |s: &str| -> (u32, u32, u32) {
+        let mut parts = s.splitn(3, '.').map(|p| p.parse::<u32>().unwrap_or(0));
+        (parts.next().unwrap_or(0), parts.next().unwrap_or(0), parts.next().unwrap_or(0))
+    };
+    parse(remote) > parse(current)
+}
+
 /// State for the game log tab
 #[derive(Clone, Default)]
 #[allow(dead_code)]
@@ -302,6 +339,8 @@ struct LauncherApp {
     selected_forge_deck: Option<String>,
     /// Local `.dck` file names available in the Forge deck directory
     forge_local_decks: Vec<String>,
+    /// Background version check result
+    update_check: Arc<Mutex<UpdateCheckState>>,
 }
 
 impl LauncherApp {
@@ -427,7 +466,26 @@ impl LauncherApp {
 
         // Switch to Home tab (activity panel will auto-expand for deeplink progress)
         let initial_tab = Tab::Home;
-        
+
+        // Kick off background update check — doesn't block startup
+        let update_check = Arc::new(Mutex::new(UpdateCheckState::default()));
+        {
+            let update_check_bg = Arc::clone(&update_check);
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_secs(5));
+                let runtime = tokio::runtime::Runtime::new().unwrap();
+                runtime.block_on(async {
+                    if let Ok(ver) = fetch_latest_release_version().await {
+                        if is_newer_version(&ver, env!("CARGO_PKG_VERSION")) {
+                            if let Ok(mut s) = update_check_bg.lock() {
+                                s.available_version = Some(ver);
+                            }
+                        }
+                    }
+                });
+            });
+        }
+
         Self {
             state,
             url_input: String::new(),
@@ -449,6 +507,7 @@ impl LauncherApp {
             last_seen_entry_count: 0,
             selected_forge_deck: None,
             forge_local_decks: Vec::new(),
+            update_check,
         }
     }
 }
@@ -598,7 +657,40 @@ impl eframe::App for LauncherApp {
                     });
                 });
                 ui.separator();
-                
+
+                // Update available banner
+                let (update_ver, already_dismissed) = {
+                    let s = self.update_check.lock().unwrap();
+                    (s.available_version.clone(), s.dismissed)
+                };
+                if !already_dismissed {
+                    if let Some(ref ver) = update_ver {
+                        egui::Frame::default()
+                            .fill(egui::Color32::from_rgb(255, 243, 205))
+                            .inner_margin(egui::Margin::symmetric(8.0, 4.0))
+                            .show(ui, |ui| {
+                                ui.horizontal(|ui| {
+                                    ui.label(
+                                        egui::RichText::new(format!("⬆ Update available: v{ver}"))
+                                            .color(egui::Color32::from_rgb(133, 100, 4))
+                                            .small(),
+                                    );
+                                    if ui.small_button("Download").clicked() {
+                                        let _ = std::process::Command::new("cmd")
+                                            .args(["/c", "start", "https://github.com/killriam/mamo-Connector/releases/latest"])
+                                            .spawn();
+                                    }
+                                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                        if ui.small_button("✕").clicked() {
+                                            self.update_check.lock().unwrap().dismissed = true;
+                                        }
+                                    });
+                                });
+                            });
+                        ui.add_space(2.0);
+                    }
+                }
+
                 // Tab bar — 3 tabs: Home, Decks, Settings
                 ui.horizontal(|ui| {
                     if ui.selectable_label(self.current_tab == Tab::Home, "🏠 Home").clicked() {
