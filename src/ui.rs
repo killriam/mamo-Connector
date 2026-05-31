@@ -1413,7 +1413,7 @@ impl LauncherApp {
         let (title, body, confirm_label, confirm_color) = match action {
             ConfirmAction::ResetFirstRun => (
                 "Reset to First Run?",
-                "This will:\n• De-register the mamoConnector:// URL scheme\n• Delete all settings (Forge path, auth token, saved links)\n\nThe app will show the setup wizard on next launch.",
+                "This will:\n• Delete all settings (Forge path, auth token, saved links)\n• Show the setup wizard immediately\n\nThe mamoConnector:// URL scheme stays registered so deeplinks keep working.",
                 "Reset",
                 egui::Color32::from_rgb(230, 130, 0),
             ),
@@ -1454,10 +1454,11 @@ impl LauncherApp {
     }
 
     fn do_reset(&mut self) {
-        use crate::registration::unregister;
         use crate::settings::get_settings_dir;
 
-        let _ = unregister(crate::SCHEME);
+        // Do NOT unregister the URL scheme — the connector is still running and deeplinks
+        // must keep working so new playtest requests trigger the setup wizard.
+        // Only do_uninstall() removes the OS registration.
 
         if let Ok(dir) = get_settings_dir() {
             let _ = std::fs::remove_dir_all(&dir);
