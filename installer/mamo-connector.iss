@@ -61,7 +61,7 @@ Root: HKCU; Subkey: "Software\Classes\mamoConnector\shell\open\command"; ValueTy
 
 [Run]
 ; Option to run after installation
-Filename: "{app}\{#MyAppExeName}"; Description: "{cm:LaunchProgram,{#StringChange(MyAppName, '&', '&&')}}"; Flags: nowait postinstall skipifsilent
+Filename: "{app}\{#MyAppExeName}"; Description: "Launch MaMo Connector and set up Forge (recommended)"; Flags: nowait postinstall skipifsilent
 
 [Code]
 // Custom code to show installation success message

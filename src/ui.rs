@@ -83,6 +83,7 @@ enum ConfirmAction {
 enum WizardStep {
     #[default]
     Welcome,
+    DownloadForge,
     ConfigureForge,
     Done,
 }
@@ -95,6 +96,24 @@ enum WizardTestStatus {
     Err(String),
 }
 
+/// Live download progress shared between the download thread and the UI
+#[derive(Clone, Default)]
+struct DownloadProgress {
+    bytes_done: u64,
+    total_bytes: Option<u64>,
+    status_text: String,
+    finished: bool,
+    error: Option<String>,
+}
+
+/// Terminal result from the Forge download background thread
+#[derive(Clone)]
+enum DownloadResult {
+    Success { jar_dir: String },
+    Failed(String),
+    Cancelled,
+}
+
 /// State for the setup wizard (first run / forge misconfigured)
 struct SetupWizardState {
     step: WizardStep,
@@ -103,6 +122,12 @@ struct SetupWizardState {
     test_status: Option<WizardTestStatus>,
     /// Written by the test-launch background thread; polled in update()
     pending_test_result: Option<Arc<Mutex<Option<WizardTestStatus>>>>,
+    /// Live progress written by the download thread; polled every frame
+    download_progress: Option<Arc<Mutex<DownloadProgress>>>,
+    /// Terminal download result written by the download thread; polled in update()
+    download_result: Option<Arc<Mutex<Option<DownloadResult>>>>,
+    /// Set by the UI Cancel button; read by the download thread
+    download_cancelled: Option<Arc<std::sync::atomic::AtomicBool>>,
 }
 
 impl Default for SetupWizardState {
@@ -113,6 +138,9 @@ impl Default for SetupWizardState {
             forge_path_valid: false,
             test_status: None,
             pending_test_result: None,
+            download_progress: None,
+            download_result: None,
+            download_cancelled: None,
         }
     }
 }
@@ -135,6 +163,19 @@ async fn fetch_latest_release_version() -> anyhow::Result<String> {
         .trim_start_matches('v')
         .to_string();
     Ok(tag)
+}
+
+/// Human-readable download progress string: "42.3 MB / 156.0 MB (27%)" or "42.3 MB"
+fn format_download_status(done: u64, total: Option<u64>) -> String {
+    let done_mb = done as f64 / (1024.0 * 1024.0);
+    match total {
+        Some(t) if t > 0 => {
+            let total_mb = t as f64 / (1024.0 * 1024.0);
+            let pct = (done as f64 / t as f64 * 100.0) as u32;
+            format!("Downloading… {done_mb:.1} MB / {total_mb:.1} MB ({pct}%)")
+        }
+        _ => format!("Downloading… {done_mb:.1} MB"),
+    }
 }
 
 /// Returns true if `remote` is a higher semver than `current` (both "X.Y.Z" strings)
@@ -531,6 +572,9 @@ impl LauncherApp {
             forge_path_valid: settings.forge_path.as_ref().map(|p| validate_forge_path(p)).unwrap_or(false),
             test_status: None,
             pending_test_result: None,
+            download_progress: None,
+            download_result: None,
+            download_cancelled: None,
         };
 
         // Kick off background update check — doesn't block startup
@@ -605,6 +649,40 @@ impl eframe::App for LauncherApp {
         if let Some(result) = wizard_test_done {
             self.wizard.test_status = Some(result);
             self.wizard.pending_test_result = None;
+        }
+
+        // Poll Forge download result from background thread
+        let download_done = if let Some(ref arc) = self.wizard.download_result {
+            arc.try_lock().ok().and_then(|mut g| g.take())
+        } else {
+            None
+        };
+        if let Some(result) = download_done {
+            self.wizard.download_result = None;
+            match result {
+                DownloadResult::Success { ref jar_dir } => {
+                    let dir = jar_dir.clone();
+                    self.wizard.forge_path_input = dir.clone();
+                    self.wizard.forge_path_valid = validate_forge_path(&dir);
+                    // Mark progress as finished cleanly
+                    if let Some(ref p) = self.wizard.download_progress {
+                        if let Ok(mut g) = p.lock() { g.finished = true; }
+                    }
+                    self.wizard.step = WizardStep::ConfigureForge;
+                }
+                DownloadResult::Failed(msg) => {
+                    if let Some(ref p) = self.wizard.download_progress {
+                        if let Ok(mut g) = p.lock() {
+                            g.finished = true;
+                            g.error = Some(msg);
+                        }
+                    }
+                }
+                DownloadResult::Cancelled => {
+                    self.wizard.download_progress = None;
+                    self.wizard.download_cancelled = None;
+                }
+            }
         }
         
         // Check for pending commands from secondary instances every 500ms
@@ -1446,20 +1524,195 @@ impl LauncherApp {
                     if ui.add(egui::Button::new(
                         egui::RichText::new("Get Started →").size(16.0)
                     ).min_size(egui::vec2(160.0, 36.0))).clicked() {
-                        self.wizard.step = WizardStep::ConfigureForge;
-                        // Try auto-detect on entry
-                        if self.wizard.forge_path_input.is_empty() {
-                            if let Some(p) = get_default_forge_path() {
-                                let s = p.to_string_lossy().to_string();
-                                self.wizard.forge_path_valid = validate_forge_path(&s);
-                                self.wizard.forge_path_input = s;
-                            }
-                        }
+                        self.wizard.step = WizardStep::DownloadForge;
                     }
                     ui.add_space(8.0);
                     if ui.small_button("Skip for now").clicked() {
                         self.show_setup_wizard = false;
                     }
+                }
+
+                // ── Step 1b: Download MaMo Forge ─────────────────────────────
+                WizardStep::DownloadForge => {
+                    ui.label(egui::RichText::new("⬇ Download MaMo Forge").size(20.0).strong());
+                    ui.add_space(4.0);
+                    ui.label(
+                        egui::RichText::new(
+                            "MaMo uses a custom Forge build with replay recording,\n\
+                             commander simulation, and MaMo integration.\n\
+                             Download it automatically (~100-300 MB)."
+                        )
+                        .color(egui::Color32::from_rgb(80, 80, 80)),
+                    );
+                    ui.add_space(16.0);
+
+                    // Read current progress state
+                    let (prog_done, prog_total, prog_text, prog_finished, prog_error) = self
+                        .wizard
+                        .download_progress
+                        .as_ref()
+                        .and_then(|a| a.try_lock().ok())
+                        .map(|p| (p.bytes_done, p.total_bytes, p.status_text.clone(), p.finished, p.error.clone()))
+                        .unwrap_or_default();
+
+                    let is_downloading = self.wizard.download_progress.is_some() && !prog_finished;
+
+                    if is_downloading {
+                        // ── Downloading ──────────────────────────────────────
+                        ui.label(egui::RichText::new(&prog_text).color(egui::Color32::from_rgb(0, 100, 180)));
+                        ui.add_space(6.0);
+                        match prog_total {
+                            Some(total) if total > 0 => {
+                                ui.add(
+                                    egui::ProgressBar::new(prog_done as f32 / total as f32)
+                                        .show_percentage()
+                                        .desired_width(380.0),
+                                );
+                            }
+                            _ => {
+                                ui.add(egui::ProgressBar::new(0.0).animate(true).desired_width(380.0));
+                            }
+                        }
+                        ui.add_space(10.0);
+                        if ui.button("Cancel").clicked() {
+                            if let Some(ref c) = self.wizard.download_cancelled {
+                                c.store(true, Ordering::Relaxed);
+                            }
+                        }
+                    } else {
+                        // ── Idle / error / already downloaded ────────────────
+                        let forge_dir = crate::settings::get_settings_dir()
+                            .map(|d| d.join("forge"))
+                            .unwrap_or_else(|_| std::path::PathBuf::from("forge"));
+
+                        // Check if a JAR is already present in the download dir
+                        let already_downloaded = forge_dir.exists() && std::fs::read_dir(&forge_dir)
+                            .map(|mut d| d.any(|e| e.ok().map(|e| {
+                                let n = e.file_name();
+                                let s = n.to_string_lossy();
+                                s.starts_with("forge-gui-desktop-") && s.ends_with("-jar-with-dependencies.jar")
+                            }).unwrap_or(false)))
+                            .unwrap_or(false);
+
+                        if already_downloaded && prog_error.is_none() {
+                            // Already downloaded — offer to reuse or re-download
+                            ui.label(
+                                egui::RichText::new("✓ MaMo Forge already downloaded")
+                                    .color(egui::Color32::from_rgb(0, 140, 0))
+                                    .strong(),
+                            );
+                            ui.add_space(10.0);
+                            ui.horizontal(|ui| {
+                                if ui.add(
+                                    egui::Button::new(egui::RichText::new("Use Existing →").strong())
+                                        .min_size(egui::vec2(130.0, 30.0)),
+                                ).clicked() {
+                                    let s = forge_dir.to_string_lossy().to_string();
+                                    self.wizard.forge_path_valid = validate_forge_path(&s);
+                                    self.wizard.forge_path_input = s;
+                                    self.wizard.step = WizardStep::ConfigureForge;
+                                }
+                                if ui.button("Re-download").clicked() {
+                                    // Fall through to download (cleared below by spawning thread)
+                                    self.wizard.download_progress = None; // triggers the download button below
+                                }
+                            });
+                            ui.add_space(6.0);
+                        } else {
+                            // Show any previous error
+                            if let Some(ref err) = prog_error {
+                                ui.label(
+                                    egui::RichText::new(format!("✗ {err}"))
+                                        .color(egui::Color32::from_rgb(200, 0, 0))
+                                        .small(),
+                                );
+                                ui.add_space(6.0);
+                            }
+
+                            if ui.add(
+                                egui::Button::new(egui::RichText::new("⬇ Download MaMo Forge").size(15.0))
+                                    .min_size(egui::vec2(210.0, 36.0)),
+                            ).clicked() {
+                                let progress_arc: Arc<Mutex<DownloadProgress>> =
+                                    Arc::new(Mutex::new(DownloadProgress::default()));
+                                let result_arc: Arc<Mutex<Option<DownloadResult>>> =
+                                    Arc::new(Mutex::new(None));
+                                let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+                                self.wizard.download_progress = Some(Arc::clone(&progress_arc));
+                                self.wizard.download_result = Some(Arc::clone(&result_arc));
+                                self.wizard.download_cancelled = Some(Arc::clone(&cancelled));
+
+                                let ctx_progress = ctx.clone();
+                                let ctx_end = ctx.clone();
+                                let progress_bg = Arc::clone(&progress_arc);
+                                let result_bg = Arc::clone(&result_arc);
+                                let cancelled_bg = Arc::clone(&cancelled);
+
+                                std::thread::spawn(move || {
+                                    let runtime = tokio::runtime::Runtime::new().unwrap();
+                                    let outcome = runtime.block_on(async {
+                                        crate::download::download_forge_jar(
+                                            &forge_dir,
+                                            move |update| {
+                                                if let Ok(mut p) = progress_bg.lock() {
+                                                    p.bytes_done = update.bytes_done;
+                                                    p.total_bytes = update.total_bytes;
+                                                    p.status_text = format_download_status(
+                                                        update.bytes_done,
+                                                        update.total_bytes,
+                                                    );
+                                                }
+                                                ctx_progress.request_repaint();
+                                            },
+                                            cancelled_bg,
+                                        )
+                                        .await
+                                    });
+
+                                    let terminal = match outcome {
+                                        Ok(jar_path) => {
+                                            let dir = jar_path
+                                                .parent()
+                                                .map(|p| p.to_string_lossy().to_string())
+                                                .unwrap_or_default();
+                                            DownloadResult::Success { jar_dir: dir }
+                                        }
+                                        Err(e) if e.to_string().contains("cancelled") => {
+                                            DownloadResult::Cancelled
+                                        }
+                                        Err(e) => DownloadResult::Failed(e.to_string()),
+                                    };
+                                    *result_bg.lock().unwrap() = Some(terminal);
+                                    ctx_end.request_repaint();
+                                });
+                            }
+                        }
+                    }
+
+                    ui.add_space(16.0);
+                    ui.separator();
+                    ui.add_space(8.0);
+
+                    ui.horizontal(|ui| {
+                        if ui.button("← Back").clicked() {
+                            self.wizard.step = WizardStep::Welcome;
+                            self.wizard.download_progress = None;
+                            self.wizard.download_result = None;
+                            self.wizard.download_cancelled = None;
+                        }
+                        if ui.add(egui::Button::new("I already have Forge →").frame(false)).clicked() {
+                            // Auto-detect on skip
+                            if self.wizard.forge_path_input.is_empty() {
+                                if let Some(p) = get_default_forge_path() {
+                                    let s = p.to_string_lossy().to_string();
+                                    self.wizard.forge_path_valid = validate_forge_path(&s);
+                                    self.wizard.forge_path_input = s;
+                                }
+                            }
+                            self.wizard.step = WizardStep::ConfigureForge;
+                        }
+                    });
                 }
 
                 // ── Step 2: Configure Forge path ─────────────────────────────
