@@ -56,7 +56,6 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           name: MaMo Connector ${{ github.ref_name }}
-          generate_release_notes: true
           files: mamo-connector-${{ github.ref_name }}-windows-x64.exe
           body: |
             ## MaMo Connector ${{ github.ref_name }}
