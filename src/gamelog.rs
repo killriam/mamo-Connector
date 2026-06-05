@@ -379,7 +379,24 @@ pub async fn upload_game_log(
     // Extract deck identifier and deck link from filename or content
     let deck_identifier = extract_deck_identifier(&log_content.filename, &log_content.content);
     let deck_link = extract_deck_link(&log_content.content);
-    
+
+    // Resolve the authoritative MaMo deck id from the local deck mappings
+    // (log deck name -> MaMo deck id). This lets the backend associate the log
+    // directly instead of relying on fuzzy name matching (see backend F-014).
+    // Best-effort: missing/unreadable mappings simply fall back to name matching.
+    let deck_id = deck_identifier.as_deref().and_then(|name| {
+        match DeckMappings::load() {
+            Ok(m) => m.get_mapping(name).cloned(),
+            Err(e) => {
+                log::warn!("Could not load deck mappings for association: {}", e);
+                None
+            }
+        }
+    });
+    if let Some(ref id) = deck_id {
+        log::info!("Resolved deck_id {} for log deck name {:?}", id, deck_identifier);
+    }
+
     // Calculate SHA256 checksum of the original content (before compression)
     let mut hasher = Sha256::new();
     hasher.update(log_content.content.as_bytes());
@@ -405,6 +422,7 @@ pub async fn upload_game_log(
         uploaded_at: chrono::Utc::now().to_rfc3339(),
         checksum,
         deck_identifier,
+        deck_id,
         deck_link,
     };
     
@@ -657,6 +675,11 @@ pub struct GameLogUploadPayload {
     pub checksum: String,
     /// Deck identifier extracted from filename or content
     pub deck_identifier: Option<String>,
+    /// Authoritative MaMo deck id, resolved from the local deck mappings
+    /// (log deck name -> MaMo deck id). When present the backend associates the
+    /// log to this deck directly instead of relying on fuzzy name matching.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub deck_id: Option<String>,
     /// Deck link/URL extracted from content (e.g. MaMo deck page URL)
     pub deck_link: Option<String>,
 }
