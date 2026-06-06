@@ -89,6 +89,9 @@ pub struct ScanSummary {
     pub successfully_uploaded: usize,
     pub failed_uploads: usize,
     pub results: Vec<GameLogProcessResult>,
+    /// True when the scan was skipped because no MaMo auth token is configured.
+    /// This is a "not connected yet" state, NOT an upload failure.
+    pub auth_missing: bool,
 }
 
 /// State for the game log watcher
@@ -867,13 +870,24 @@ pub async fn process_new_logs_with_filter(
 ) -> Result<ScanSummary> {
     let mut summary = ScanSummary::default();
     
-    // Pre-flight: check auth token before scanning files
+    // Pre-flight: if no auth token, this is a "not connected" state — not a failure.
+    // Report how many new files are waiting (so the user knows uploads are pending)
+    // but do NOT fabricate a failed upload or scan/parse anything.
     if config.auth_token.is_none() {
-        summary.failed_uploads = 1;
-        summary.results.push(GameLogProcessResult::failed(
-            "(all)".to_string(),
-            "No authentication token configured. Please add your MaMo token in Settings.".to_string(),
-        ));
+        summary.auth_missing = true;
+        // Count new (unprocessed) files so the UI can say "N waiting to upload"
+        if let Ok(files) = scan_directory(config) {
+            let processed = processed_files.lock().unwrap();
+            summary.total_files_found = files.len();
+            summary.new_files = files
+                .iter()
+                .filter(|f| {
+                    f.file_name()
+                        .map(|n| !processed.contains(&n.to_string_lossy().to_string()))
+                        .unwrap_or(false)
+                })
+                .count();
+        }
         return Ok(summary);
     }
     

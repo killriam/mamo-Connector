@@ -772,23 +772,36 @@ impl eframe::App for LauncherApp {
                     self.last_auto_gamelog_scan = None;
                 }
             } else if !is_scanning {
-                // Forge is running - handle periodic scans
+                // Forge is running - handle periodic scans.
+                // Only scan if the user has connected their MaMo account; otherwise
+                // there's nothing to upload to, so don't spam the log with failures.
+                let has_token = {
+                    let s = self.settings.lock().unwrap();
+                    s.auth_token.is_some() || s.gamelog_config.auth_token.is_some()
+                };
                 let should_scan = match self.last_auto_gamelog_scan {
                     None => {
                         self.last_auto_gamelog_scan = Some(now);
                         if let Ok(mut log) = self.activity_log.lock() {
-                            log.log_info("\u{1F3AE} Forge running - auto gamelog scanning active (every 5 min)");
+                            if has_token {
+                                log.log_info("\u{1F3AE} Forge running - auto gamelog scanning active (every 5 min)");
+                            } else {
+                                log.log_info("\u{1F3AE} Forge running - connect your MaMo account in Settings to auto-upload game logs");
+                            }
                         }
                         false
                     }
                     Some(last) => now.duration_since(last).as_secs() >= 300,
                 };
-                
-                if should_scan {
+
+                if should_scan && has_token {
                     if let Ok(mut log) = self.activity_log.lock() {
                         log.log_info("\u{1F504} Auto gamelog scan (periodic 5 min)");
                     }
                     self.start_auto_gamelog_scan(ctx);
+                    self.last_auto_gamelog_scan = Some(now);
+                } else if should_scan {
+                    // No token — defer silently so we don't re-check every frame.
                     self.last_auto_gamelog_scan = Some(now);
                 }
             }
@@ -3511,7 +3524,17 @@ impl LauncherApp {
                         let _ = save_processed_files(&new_processed);
                         
                         // Log to activity
-                        if summary.new_files > 0 || summary.failed_uploads > 0 {
+                        if summary.auth_missing {
+                            // Not connected — gentle hint, not a red error
+                            if summary.new_files > 0 {
+                                if let Ok(mut log) = activity_log.lock() {
+                                    log.log_info(format!(
+                                        "\u{1F4CB} {} game log(s) waiting — connect your MaMo account in Settings to upload",
+                                        summary.new_files
+                                    ));
+                                }
+                            }
+                        } else if summary.new_files > 0 || summary.failed_uploads > 0 {
                             if let Ok(mut log) = activity_log.lock() {
                                 if summary.failed_uploads > 0 && summary.successfully_uploaded == 0 {
                                     // All failed — find first distinct error message
