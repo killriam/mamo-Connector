@@ -128,6 +128,8 @@ struct SetupWizardState {
     download_result: Option<Arc<Mutex<Option<DownloadResult>>>>,
     /// Set by the UI Cancel button; read by the download thread
     download_cancelled: Option<Arc<std::sync::atomic::AtomicBool>>,
+    /// Cached Java detection result; None = not checked yet this session
+    java_status: Option<crate::forge::JavaStatus>,
 }
 
 impl Default for SetupWizardState {
@@ -141,6 +143,7 @@ impl Default for SetupWizardState {
             download_progress: None,
             download_result: None,
             download_cancelled: None,
+            java_status: None,
         }
     }
 }
@@ -575,6 +578,7 @@ impl LauncherApp {
             download_progress: None,
             download_result: None,
             download_cancelled: None,
+            java_status: None,
         };
 
         // Kick off background update check — doesn't block startup
@@ -1134,7 +1138,8 @@ impl LauncherApp {
                         let log_collector_for_command = log_collector.clone();
                         let ctx_clone = ctx.clone();
                         let ctx_for_polling = ctx.clone();
-                        
+                        let wizard_requested = Arc::clone(&self.wizard_requested);
+
                         std::thread::spawn(move || {
                             let runtime = tokio::runtime::Runtime::new().unwrap();
                             
@@ -1190,6 +1195,7 @@ impl LauncherApp {
                                             log.log_success(&forge_result.message);
                                         } else {
                                             log.log_error(&forge_result.message);
+                                            wizard_requested.store(true, Ordering::Relaxed);
                                         }
                                     }
                                     commands::CommandResult::ForgeLaunched(forge_result) => {
@@ -1199,6 +1205,7 @@ impl LauncherApp {
                                             log.log_success(&forge_result.message);
                                         } else {
                                             log.log_error(&forge_result.message);
+                                            wizard_requested.store(true, Ordering::Relaxed);
                                         }
                                     }
                                     commands::CommandResult::AuthTokenSaved(msg) => {
@@ -1226,6 +1233,7 @@ impl LauncherApp {
                                             log.log_success(&forge_result.message);
                                         } else {
                                             log.log_error(&forge_result.message);
+                                            wizard_requested.store(true, Ordering::Relaxed);
                                         }
                                     }
                                     commands::CommandResult::SimulationCompleted(sim_result) => {
@@ -1831,7 +1839,53 @@ impl LauncherApp {
                             None => {}
                         }
                     });
-                    ui.add_space(20.0);
+                    ui.add_space(16.0);
+
+                    // Java runtime status — Forge needs Java 17+
+                    if self.wizard.java_status.is_none() {
+                        self.wizard.java_status = Some(crate::forge::detect_java());
+                    }
+                    match self.wizard.java_status.clone() {
+                        Some(crate::forge::JavaStatus::Ok(major)) => {
+                            ui.label(
+                                egui::RichText::new(format!("✓ Java {major} detected"))
+                                    .color(egui::Color32::from_rgb(0, 150, 0))
+                                    .small(),
+                            );
+                        }
+                        Some(status) => {
+                            let msg = match status {
+                                crate::forge::JavaStatus::TooOld(m) => format!(
+                                    "⚠ Java {m} found, but Forge needs Java 17 or newer."
+                                ),
+                                _ => "⚠ Java 17 is required to run Forge, but none was found.".to_string(),
+                            };
+                            egui::Frame::default()
+                                .fill(egui::Color32::from_rgb(255, 244, 224))
+                                .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(230, 160, 60)))
+                                .inner_margin(egui::Margin::same(10.0))
+                                .rounding(6.0)
+                                .show(ui, |ui| {
+                                    ui.label(
+                                        egui::RichText::new(msg)
+                                            .color(egui::Color32::from_rgb(150, 80, 0)),
+                                    );
+                                    ui.add_space(6.0);
+                                    ui.horizontal(|ui| {
+                                        if ui.button("📥 Download Java 17").clicked() {
+                                            let _ = std::process::Command::new("cmd")
+                                                .args(["/c", "start", crate::forge::JAVA_DOWNLOAD_URL])
+                                                .spawn();
+                                        }
+                                        if ui.button("🔄 Re-check").clicked() {
+                                            self.wizard.java_status = Some(crate::forge::detect_java());
+                                        }
+                                    });
+                                });
+                        }
+                        None => {}
+                    }
+                    ui.add_space(16.0);
 
                     // Navigation
                     ui.horizontal(|ui| {

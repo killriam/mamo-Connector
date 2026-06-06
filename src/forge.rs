@@ -60,6 +60,64 @@ impl ForgeLaunchResult {
     }
 }
 
+/// Adoptium Temurin JRE 17 download page (Windows x64).
+pub const JAVA_DOWNLOAD_URL: &str =
+    "https://adoptium.net/temurin/releases/?version=17&os=windows&arch=x64&package=jre";
+
+/// Result of probing the system for a usable Java runtime.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum JavaStatus {
+    /// A Java runtime of major version >= 17 is available on PATH.
+    Ok(u32),
+    /// Java is present but its major version is too old (< 17).
+    TooOld(u32),
+    /// No `java` executable found on PATH.
+    Missing,
+}
+
+/// Run `java -version` and parse the major version from its output.
+///
+/// `java -version` prints to **stderr** in formats like:
+///   - `openjdk version "17.0.10" 2024-01-16`  -> 17
+///   - `java version "1.8.0_381"`              -> 8  (legacy 1.x scheme)
+fn parse_java_major(version_output: &str) -> Option<u32> {
+    // Find the first quoted version string
+    let start = version_output.find('"')?;
+    let rest = &version_output[start + 1..];
+    let end = rest.find('"')?;
+    let version = &rest[..end];
+
+    let mut parts = version.split('.');
+    let first: u32 = parts.next()?.parse().ok()?;
+    if first == 1 {
+        // Legacy "1.8.0_381" scheme: the major version is the second component.
+        parts.next()?.parse().ok()
+    } else {
+        Some(first)
+    }
+}
+
+/// Detect whether a usable Java 17+ runtime is available on PATH.
+pub fn detect_java() -> JavaStatus {
+    let output = Command::new("java").arg("-version").output();
+    match output {
+        Ok(out) => {
+            // `java -version` writes to stderr; some distributions use stdout.
+            let text = if !out.stderr.is_empty() {
+                String::from_utf8_lossy(&out.stderr).into_owned()
+            } else {
+                String::from_utf8_lossy(&out.stdout).into_owned()
+            };
+            match parse_java_major(&text) {
+                Some(major) if major >= 17 => JavaStatus::Ok(major),
+                Some(major) => JavaStatus::TooOld(major),
+                None => JavaStatus::Missing,
+            }
+        }
+        Err(_) => JavaStatus::Missing,
+    }
+}
+
 /// Get the default Forge installation path based on OS
 pub fn get_default_forge_path() -> Option<PathBuf> {
     #[cfg(windows)]
@@ -268,6 +326,31 @@ pub fn launch_forge(forge_path: &str, deck_name: Option<&str>, deck2_name: Optio
         .unwrap_or("")
         .to_lowercase();
     debug!("[launch_forge] Forge file extension: {}", extension);
+
+    // Forge is a Java app. Launching a .jar with a missing or too-old Java
+    // would "succeed" at spawn() but die immediately with Forge's own
+    // "requires JRE 17" dialog — a false positive. Guard against that here so
+    // Test Launch and deeplink launches report the real, actionable error.
+    if extension == "jar" {
+        match detect_java() {
+            JavaStatus::Ok(major) => {
+                debug!("[launch_forge] Detected Java {} (OK)", major);
+            }
+            JavaStatus::TooOld(major) => {
+                return Ok(ForgeLaunchResult::failure(format!(
+                    "Forge needs Java 17 or newer, but Java {} was found. \
+                     Install Java 17 (Adoptium Temurin) and try again.",
+                    major
+                )));
+            }
+            JavaStatus::Missing => {
+                return Ok(ForgeLaunchResult::failure(
+                    "Forge needs Java 17 to run, but no Java was found. \
+                     Install Java 17 (Adoptium Temurin) and try again.",
+                ));
+            }
+        }
+    }
 
     let result = match extension.as_str() {
         "jar" => {
