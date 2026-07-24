@@ -1684,7 +1684,7 @@ async fn create_deck_file(deck_data: &DeckData) -> Result<PathBuf> {
     Ok(deck_file_path)
 }
 
-fn get_deck_directory() -> Result<PathBuf> {
+pub(crate) fn get_deck_directory() -> Result<PathBuf> {
     let deck_dir = if cfg!(windows) {
         // Windows: C:\Users\[username]\AppData\Roaming\Forge\decks\commander
         if let Some(appdata) = std::env::var_os("APPDATA") {

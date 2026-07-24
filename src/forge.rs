@@ -689,27 +689,13 @@ pub fn launch_forge_from_settings(deck_path: Option<&str>, deck2_path: Option<&s
     launch_forge(&forge_path, deck_name.as_deref(), deck2_name.as_deref())
 }
 
-/// Get the Forge deck directory (where decks should be saved)
+/// Get the Forge deck directory (where decks should be saved).
+///
+/// Forge keeps its user profile (decks, preferences, saves) in the OS user-data
+/// directory, not next to the installed executable — so this must match
+/// `deck::get_deck_directory()` rather than deriving from the configured `forge_path`.
 pub fn get_forge_deck_directory() -> Option<PathBuf> {
-    let settings = Settings::load().ok()?;
-    
-    if let Some(forge_path) = &settings.forge_path {
-        let forge_dir = PathBuf::from(forge_path).parent()?.to_path_buf();
-        
-        // Forge stores decks in a 'decks' subfolder
-        let decks_dir = forge_dir.join("decks");
-        if decks_dir.exists() {
-            return Some(decks_dir);
-        }
-        
-        // Or in 'decks/constructed'
-        let constructed_dir = forge_dir.join("decks").join("constructed");
-        if constructed_dir.exists() {
-            return Some(constructed_dir);
-        }
-    }
-    
-    None
+    crate::deck::get_deck_directory().ok()
 }
 
 /// List deck names (file stems of `.dck` files) available in the Forge deck directory.
