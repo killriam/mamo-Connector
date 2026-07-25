@@ -1702,7 +1702,7 @@ pub(crate) fn get_deck_directory() -> Result<PathBuf> {
     Ok(deck_dir.join("Forge").join("decks").join("commander"))
 }
 
-fn sanitize_filename(name: &str) -> String {
+pub(crate) fn sanitize_filename(name: &str) -> String {
     // Replace invalid filename characters with underscores
     name.chars()
         .map(|c| match c {

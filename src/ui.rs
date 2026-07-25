@@ -1956,6 +1956,23 @@ impl LauncherApp {
         });
     }
 
+    /// Local Forge deck file stems that correspond to a deck in the user's MaMo
+    /// account, so the launch picker only offers decks tracked in the backend —
+    /// not every stray `.dck` file sitting in the Forge decks folder.
+    fn backend_known_decks(&self) -> Vec<String> {
+        let user_decks = self.gamelog_state.lock().unwrap().user_decks.clone();
+        self.forge_local_decks
+            .iter()
+            .filter(|stem| {
+                let stem_lower = stem.to_lowercase();
+                user_decks.iter().any(|d| {
+                    crate::deck::sanitize_filename(&d.deck_name).to_lowercase() == stem_lower
+                })
+            })
+            .cloned()
+            .collect()
+    }
+
     fn render_home_tab(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         egui::ScrollArea::vertical().show(ui, |ui| {
             // Connection status section
@@ -2085,7 +2102,7 @@ impl LauncherApp {
                 if forge_configured {
                     ui.horizontal(|ui| {
                         ui.label(egui::RichText::new("Deck:").small());
-                        let decks_snapshot = self.forge_local_decks.clone();
+                        let decks_snapshot = self.backend_known_decks();
                         let selected_label = self.selected_forge_deck
                             .as_deref()
                             .unwrap_or("— none —")
