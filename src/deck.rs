@@ -2,6 +2,7 @@ use anyhow::{Context, Result};
 use log::{info, warn};
 use serde::{Deserialize, Deserializer, Serialize};
 use sha2::{Sha256, Digest};
+use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
@@ -254,6 +255,72 @@ fn fetch_with_curl_custom(url: &str, extra_args: &[&str]) -> Result<String> {
     }
 
     Ok(body.to_string())
+}
+
+/// Fetch URL with custom headers using curl, also returning selected response headers.
+/// Used where the caller needs metadata from the response itself (e.g. the deck revision
+/// a forge export was built from) that isn't present in the body. Kept separate from
+/// `fetch_with_curl_custom` so its many other callers are unaffected.
+fn fetch_with_curl_and_headers(url: &str, extra_args: &[&str]) -> Result<(String, HashMap<String, String>)> {
+    info!("Fetching via curl (with headers): {}", url);
+
+    const STATUS_SENTINEL: &str = "\n__HTTP_STATUS__";
+    let write_out = format!("{}%{{http_code}}", STATUS_SENTINEL);
+
+    // -D - dumps response headers to stdout, ahead of the body.
+    let mut args = vec!["-s", "-D", "-", "-w", write_out.as_str()];
+    args.extend(extra_args);
+    args.push(url);
+
+    let output = Command::new("curl")
+        .args(&args)
+        .output()
+        .context("Failed to execute curl command")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(anyhow::anyhow!("curl failed: {}", stderr));
+    }
+
+    let raw = String::from_utf8(output.stdout)
+        .context("Invalid UTF-8 in curl response")?;
+
+    // The header block ends at the blank line separating it from the body.
+    let (header_block, rest) = match raw.find("\r\n\r\n").or_else(|| raw.find("\n\n")) {
+        Some(idx) => {
+            let sep_len = if raw[idx..].starts_with("\r\n\r\n") { 4 } else { 2 };
+            (&raw[..idx], &raw[idx + sep_len..])
+        }
+        None => ("", raw.as_str()),
+    };
+
+    let mut headers = HashMap::new();
+    for line in header_block.lines() {
+        if let Some((name, value)) = line.split_once(':') {
+            headers.insert(name.trim().to_lowercase(), value.trim().to_string());
+        }
+    }
+
+    let (body, http_status) = if let Some(idx) = rest.rfind(STATUS_SENTINEL) {
+        let code: u16 = rest[idx + STATUS_SENTINEL.len()..].trim().parse().unwrap_or(0);
+        (&rest[..idx], code)
+    } else {
+        (rest, 0u16)
+    };
+
+    if body.contains("<!DOCTYPE html>") && body.contains("Cloudflare") {
+        return Err(anyhow::anyhow!("Cloudflare blocked the request (HTTP {})", http_status));
+    }
+
+    if http_status != 0 && !(200..300).contains(&http_status) {
+        let snippet = &body[..body.len().min(300)];
+        return Err(anyhow::anyhow!(
+            "HTTP {} from {}: {}",
+            http_status, url, snippet
+        ));
+    }
+
+    Ok((body.to_string(), headers))
 }
 
 // ==================== Direct Moxfield Access ====================
@@ -1092,11 +1159,15 @@ pub async fn create_deck_from_mamo_with_progress(
     // MaMo backend returns plain text Forge format
     let url = format!("{}/api/deck/export/{}/forge", MAMO_API_URL, deck_id);
     log("Fetching deck from MaMo API...");
-    
-    let body = fetch_with_curl_custom(&url, &[
+
+    let (body, response_headers) = fetch_with_curl_and_headers(&url, &[
         "-H", "User-Agent: MaMo-Connector/1.0",
         "-H", "Accept: text/plain",
     ])?;
+    // The revision this export was actually built from (if the backend supports it).
+    // Round-tripped back on gamelog upload so a played game is attributed to the revision
+    // it was actually played at, not whatever is "latest" when the log is later uploaded.
+    let export_revision_id = response_headers.get("x-mamo-revision-id").cloned();
     
     // Check if response looks like an error (JSON or plain text error message)
     if body.starts_with("{") && body.contains("error") {
@@ -1138,9 +1209,23 @@ pub async fn create_deck_from_mamo_with_progress(
                 .trim()
         })
         .unwrap_or("MaMo Deck");
-    
+
     log(&format!("Deck name: {}", deck_name));
-    
+
+    // Remember which revision this export was built from, keyed by the same Forge deck
+    // name that gamelog association matches against — best-effort, never fails the launch.
+    if let Some(ref revision_id) = export_revision_id {
+        match crate::gamelog::DeckMappings::load() {
+            Ok(mut mappings) => {
+                mappings.set_revision_mapping(deck_name, revision_id);
+                if let Err(e) = mappings.save() {
+                    warn!("Could not persist deck revision mapping: {}", e);
+                }
+            }
+            Err(e) => warn!("Could not load deck mappings to record revision: {}", e),
+        }
+    }
+
     // Calculate deck hash to check if deck content changed
     log("Calculating deck hash...");
     let new_deck_hash = calculate_deck_hash(&body);

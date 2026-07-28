@@ -383,21 +383,30 @@ pub async fn upload_game_log(
     let deck_identifier = extract_deck_identifier(&log_content.filename, &log_content.content);
     let deck_link = extract_deck_link(&log_content.content);
 
-    // Resolve the authoritative MaMo deck id from the local deck mappings
-    // (log deck name -> MaMo deck id). This lets the backend associate the log
-    // directly instead of relying on fuzzy name matching (see backend F-014).
+    // Resolve the authoritative MaMo deck id (and, if known, the revision it was played
+    // at) from the local deck mappings (log deck name -> MaMo deck id / revision id).
+    // This lets the backend associate the log directly instead of relying on fuzzy name
+    // matching (see backend F-014), and attribute it to the revision actually played
+    // instead of whatever is "latest" at upload time.
     // Best-effort: missing/unreadable mappings simply fall back to name matching.
-    let deck_id = deck_identifier.as_deref().and_then(|name| {
-        match DeckMappings::load() {
-            Ok(m) => m.get_mapping(name).cloned(),
-            Err(e) => {
-                log::warn!("Could not load deck mappings for association: {}", e);
-                None
-            }
+    let loaded_mappings = match DeckMappings::load() {
+        Ok(m) => Some(m),
+        Err(e) => {
+            log::warn!("Could not load deck mappings for association: {}", e);
+            None
         }
+    };
+    let deck_id = deck_identifier.as_deref().and_then(|name| {
+        loaded_mappings.as_ref().and_then(|m| m.get_mapping(name).cloned())
+    });
+    let revision_id = deck_identifier.as_deref().and_then(|name| {
+        loaded_mappings.as_ref().and_then(|m| m.get_revision_mapping(name).cloned())
     });
     if let Some(ref id) = deck_id {
         log::info!("Resolved deck_id {} for log deck name {:?}", id, deck_identifier);
+    }
+    if let Some(ref rev) = revision_id {
+        log::info!("Resolved revision_id {} for log deck name {:?}", rev, deck_identifier);
     }
 
     // Calculate SHA256 checksum of the original content (before compression)
@@ -426,6 +435,7 @@ pub async fn upload_game_log(
         checksum,
         deck_identifier,
         deck_id,
+        revision_id,
         deck_link,
     };
     
@@ -683,6 +693,11 @@ pub struct GameLogUploadPayload {
     /// log to this deck directly instead of relying on fuzzy name matching.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub deck_id: Option<String>,
+    /// Deck revision id this log was played against, resolved from the local deck mappings
+    /// (recorded when the deck was last exported/launched). When present and it belongs to
+    /// the associated deck, the backend uses it instead of "latest revision at upload time".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub revision_id: Option<String>,
     /// Deck link/URL extracted from content (e.g. MaMo deck page URL)
     pub deck_link: Option<String>,
 }
@@ -1088,6 +1103,12 @@ pub struct MyDecksResponse {
 pub struct DeckMappings {
     /// Maps deck name from gamelog -> MaMo deck ID
     pub mappings: std::collections::HashMap<String, String>,
+    /// Maps deck name from gamelog -> the MaMo deck revision id that was last exported/
+    /// launched for it. Recorded at deck-download time (see `deck::create_deck_from_mamo_with_progress`)
+    /// so a gamelog produced from that launch can be attributed to the revision actually
+    /// played, not just whatever revision is "latest" when the log is later uploaded.
+    #[serde(default)]
+    pub revisions: std::collections::HashMap<String, String>,
     /// When mappings were last updated
     pub updated_at: Option<String>,
 }
@@ -1132,6 +1153,17 @@ impl DeckMappings {
     pub fn remove_mapping(&mut self, log_deck_name: &str) {
         self.mappings.remove(log_deck_name);
         self.updated_at = Some(chrono::Local::now().to_rfc3339());
+    }
+
+    /// Record which deck revision was last exported/launched for a deck name
+    pub fn set_revision_mapping(&mut self, log_deck_name: &str, revision_id: &str) {
+        self.revisions.insert(log_deck_name.to_string(), revision_id.to_string());
+        self.updated_at = Some(chrono::Local::now().to_rfc3339());
+    }
+
+    /// Get the last-known revision id exported/launched for a log deck name
+    pub fn get_revision_mapping(&self, log_deck_name: &str) -> Option<&String> {
+        self.revisions.get(log_deck_name)
     }
 }
 
