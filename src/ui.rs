@@ -1986,12 +1986,12 @@ impl LauncherApp {
                         ui.label(egui::RichText::new("● Connected to MaMo").color(egui::Color32::from_rgb(0, 128, 0)));
                     } else {
                         ui.label(egui::RichText::new("● Not connected").color(egui::Color32::from_rgb(176, 0, 32)));
-                        // Open browser to MaMo's Evaluation page where the user can generate
-                        // a PAT and connect — this avoids having to copy/paste a token manually.
+                        // Open browser to MaMo — the "Connect Connector" button is in the
+                        // profile dropdown (top-right person icon) on every page.
                         if ui.hyperlink_to(
                             "Connect on MaMo →",
-                            "https://ma-mo-frontend.vercel.app/DeckBuilding/playbook?tab=evaluation",
-                        ).on_hover_text("Opens MaMo in your browser — click \"Connect MaMo Connector\" on the Evaluation tab").clicked() {
+                            "https://ma-mo-frontend.vercel.app",
+                        ).on_hover_text("Opens MaMo in your browser — click the profile icon (top-right) → \"Connect Connector\"").clicked() {
                             // hyperlink_to already opens the URL; nothing extra needed here
                         }
                     }
