@@ -272,6 +272,27 @@ fn is_executable(path: &PathBuf) -> bool {
 }
 
 use log::debug;
+
+/// The CLI arguments that launch Forge straight into a commander game with the given deck(s)
+/// pre-selected: `gui --format commander [--deck <name>] [--deck2 <name2>]`.
+///
+/// Shared by every launch branch in `launch_forge` below (JAR, Windows exe/cmd/bat, Linux sh,
+/// generic fallback) so they can't drift out of sync with each other — which is exactly how the
+/// Windows exe/cmd/bat branch previously ended up launching Forge with none of these args at all,
+/// even though Forge's own launcher does forward them through to `forge.view.Main` correctly.
+fn forge_launch_args(deck_name: Option<&str>, deck2_name: Option<&str>) -> Vec<String> {
+    let mut args = vec!["gui".to_string(), "--format".to_string(), "commander".to_string()];
+    if let Some(deck) = deck_name {
+        args.push("--deck".to_string());
+        args.push(deck.to_string());
+    }
+    if let Some(deck2) = deck2_name {
+        args.push("--deck2".to_string());
+        args.push(deck2.to_string());
+    }
+    args
+}
+
 /// Launch Forge with an optional deck name and optional second deck name.
 ///
 /// For JAR builds the command becomes:
@@ -360,23 +381,13 @@ pub fn launch_forge(forge_path: &str, deck_name: Option<&str>, deck2_name: Optio
                .arg("-Dio.netty.tryReflectionSetAccessible=true")
                .arg("-Dfile.encoding=UTF-8")
                .arg("-jar")
-               .arg(&forge_path_buf)
-               .arg("gui")
-               .arg("--format")
-               .arg("commander");
+               .arg(&forge_path_buf);
             debug!("[launch_forge] Java command: java -Xmx4096m ... -jar {} gui --format commander", resolved_path_str);
             if let Some(dir) = &forge_dir {
                 debug!("[launch_forge] Setting working directory: {}", dir.display());
                 cmd.current_dir(dir);
             }
-            if let Some(deck) = deck_name {
-                debug!("[launch_forge] Adding --deck argument: {}", deck);
-                cmd.arg("--deck").arg(deck);
-            }
-            if let Some(deck2) = deck2_name {
-                debug!("[launch_forge] Adding --deck2 argument: {}", deck2);
-                cmd.arg("--deck2").arg(deck2);
-            }
+            cmd.args(forge_launch_args(deck_name, deck2_name));
             cmd.spawn()
         }
         "exe" | "cmd" | "bat" => {
@@ -391,6 +402,12 @@ pub fn launch_forge(forge_path: &str, deck_name: Option<&str>, deck2_name: Optio
                     debug!("[launch_forge] Setting working directory: {}", dir.display());
                     cmd.current_dir(dir);
                 }
+                // Forge's native launcher forwards its CLI args straight through to
+                // forge.view.Main — confirmed by inspecting the spawned java process's command
+                // line — so it needs the same args as every other launch path. This branch
+                // previously passed none at all, which is why a specific deck never got
+                // pre-selected when Forge was installed as an .exe.
+                cmd.args(forge_launch_args(deck_name, deck2_name));
                 cmd.creation_flags(DETACHED_PROCESS);
                 debug!("[launch_forge] Using DETACHED_PROCESS flag");
                 cmd.spawn()
@@ -573,8 +590,6 @@ pub fn launch_forge_replay(replay_path: &str) -> Result<ForgeLaunchResult> {
             cmd.spawn()
         }
         "exe" | "cmd" | "bat" => {
-            // Windows EXE cannot accept CLI replay argument
-            info!("Windows Forge EXE does not support replay CLI args. Replay file is in gamelogs directory — user must open Replay Mode manually.");
             #[cfg(windows)]
             {
                 use std::os::windows::process::CommandExt;
@@ -584,6 +599,10 @@ pub fn launch_forge_replay(replay_path: &str) -> Result<ForgeLaunchResult> {
                 if let Some(dir) = &forge_dir {
                     cmd.current_dir(dir);
                 }
+                // Forge's native launcher forwards CLI args straight through to forge.view.Main
+                // (confirmed empirically — see launch_forge's Windows branch), so `replay <path>`
+                // works here exactly like it does on the JAR/mac/Linux paths below.
+                cmd.arg("replay").arg(replay_path);
                 cmd.creation_flags(DETACHED_PROCESS);
                 cmd.spawn()
             }
@@ -625,13 +644,8 @@ pub fn launch_forge_replay(replay_path: &str) -> Result<ForgeLaunchResult> {
         Ok(child) => {
             let pid = child.id();
             info!("Forge launched in replay mode with PID: {:?}", pid);
-            let msg = if extension == "exe" || extension == "bat" || extension == "cmd" {
-                "Forge launched. Open Replay Mode and select the game to replay.".to_string()
-            } else {
-                "Forge launched in replay mode.".to_string()
-            };
             Ok(ForgeLaunchResult::success(
-                msg,
+                "Forge launched in replay mode.",
                 Some(replay_path.to_string()),
                 Some(resolved_path_str),
                 Some(pid),
@@ -802,5 +816,29 @@ mod tests {
     fn test_get_default_forge_path() {
         // This just tests that the function doesn't panic
         let _ = get_default_forge_path();
+    }
+
+    #[test]
+    fn forge_launch_args_no_decks() {
+        assert_eq!(
+            forge_launch_args(None, None),
+            vec!["gui", "--format", "commander"]
+        );
+    }
+
+    #[test]
+    fn forge_launch_args_one_deck() {
+        assert_eq!(
+            forge_launch_args(Some("Aggro"), None),
+            vec!["gui", "--format", "commander", "--deck", "Aggro"]
+        );
+    }
+
+    #[test]
+    fn forge_launch_args_two_decks() {
+        assert_eq!(
+            forge_launch_args(Some("Aggro"), Some("Control")),
+            vec!["gui", "--format", "commander", "--deck", "Aggro", "--deck2", "Control"]
+        );
     }
 }

@@ -804,7 +804,7 @@ async fn handle_simulate(deeplink: &Deeplink, log_collector: Option<SharedLogCol
     CommandResult::SimulationCompleted(result)
 }
 
-fn get_parameter(params: &[(String, String)], key: &str) -> Option<String> {
+pub(crate) fn get_parameter(params: &[(String, String)], key: &str) -> Option<String> {
     params.iter()
         .find(|(k, _)| k.eq_ignore_ascii_case(key))
         .map(|(_, v)| v.clone())

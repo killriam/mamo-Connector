@@ -191,10 +191,20 @@ fn is_newer_version(remote: &str, current: &str) -> bool {
 }
 
 /// True when a deeplink is an evaluation launch (playtest/launch-forge/simulate) that arrived
-/// without a deck id — the frontend didn't pin a specific deck, so Forge should not be started
-/// deck-less; the Home tab picker should be used instead.
-fn is_deckless_evaluation_action(action: &str, has_deck_id: bool) -> bool {
-    !has_deck_id && matches!(action, "playtest" | "launch-forge" | "launchforge" | "simulate")
+/// with no deck reference at all — neither a MaMo backend `deck_id` nor a power-user
+/// `deck_path` (the escape hatch `handle_launch_forge_with_logger` offers for launching an
+/// already-local deck without hitting the backend). In that case the frontend/caller genuinely
+/// didn't pin a deck, so Forge should not be started deck-less; the Home tab picker should be
+/// used instead.
+fn is_deckless_evaluation_action(action: &str, has_deck_reference: bool) -> bool {
+    !has_deck_reference && matches!(action, "playtest" | "launch-forge" | "launchforge" | "simulate")
+}
+
+/// Whether a deeplink references a deck by *any* means `handle_launch_forge_with_logger`
+/// understands — a MaMo backend `deck_id`/`id`/`deckId`, or a local `deck_path`.
+fn deeplink_has_deck_reference(deeplink: &Deeplink) -> bool {
+    deeplink.deck_id.is_some()
+        || crate::commands::get_parameter(&deeplink.params, "deck_path").is_some()
 }
 
 /// If `deck` has already been downloaded into the Forge deck directory (matched by the same
@@ -1000,7 +1010,7 @@ impl LauncherApp {
         // An evaluation launch (playtest/launch-forge/simulate) with no deck id means the
         // frontend didn't pin a deck — rather than silently starting Forge deck-less, send the
         // user to the Home tab picker (backed by their full MaMo account deck list) instead.
-        if is_deckless_evaluation_action(&deeplink.action, deeplink.deck_id.is_some()) {
+        if is_deckless_evaluation_action(&deeplink.action, deeplink_has_deck_reference(&deeplink)) {
             if let Ok(mut log) = self.activity_log.lock() {
                 log.log_info("No deck specified — pick one below to launch Forge.");
             }
@@ -1220,7 +1230,7 @@ impl LauncherApp {
                         // means the frontend didn't pin a deck — send the user to the Home tab
                         // picker (backed by their full MaMo account deck list) instead of
                         // silently starting Forge deck-less.
-                        if is_deckless_evaluation_action(&deeplink.action, deeplink.deck_id.is_some()) {
+                        if is_deckless_evaluation_action(&deeplink.action, deeplink_has_deck_reference(&deeplink)) {
                             if let Ok(mut log) = self.activity_log.lock() {
                                 log.log_info("No deck specified — pick one below to launch Forge.");
                             }
@@ -4623,6 +4633,39 @@ mod deck_picker_tests {
                 "expected {action} with a deck id to NOT be treated as deck-less"
             );
         }
+    }
+
+    fn make_deeplink(action: &str, deck_id: Option<&str>, params: Vec<(&str, &str)>) -> Deeplink {
+        Deeplink {
+            raw: format!("mamoConnector://{action}?test"),
+            action: action.to_string(),
+            params: params.into_iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(),
+            token: None,
+            doc: None,
+            deck_id: deck_id.map(|s| s.to_string()),
+            username: None,
+        }
+    }
+
+    #[test]
+    fn deeplink_has_deck_reference_true_for_deck_id() {
+        let dl = make_deeplink("launch-forge", Some("some-uuid"), vec![]);
+        assert!(deeplink_has_deck_reference(&dl));
+    }
+
+    #[test]
+    fn deeplink_has_deck_reference_true_for_deck_path_power_user_escape_hatch() {
+        // Regression test: launch-forge?deck_path=X&skip_download=true has no deck_id at all,
+        // but does specify a deck — it must NOT be routed to the Home tab picker.
+        let dl = make_deeplink("launch-forge", None, vec![("deck_path", "Aggro"), ("skip_download", "true")]);
+        assert!(deeplink_has_deck_reference(&dl));
+        assert!(!is_deckless_evaluation_action(&dl.action, deeplink_has_deck_reference(&dl)));
+    }
+
+    #[test]
+    fn deeplink_has_deck_reference_false_with_neither() {
+        let dl = make_deeplink("launch-forge", None, vec![]);
+        assert!(!deeplink_has_deck_reference(&dl));
     }
 
     #[test]
