@@ -10,7 +10,7 @@ use crate::commands::CommandResult;
 use crate::deck::{create_deck_from_moxfield, MoxfieldDeckEntry, MamoDeckEntry, DeckStatus, fetch_user_decks_direct, create_deck_from_archidekt, create_deck_from_deckstats, create_deck_from_mamo, parse_archidekt_url, parse_deckstats_url, parse_mamo_url, parse_mamo_user_url, fetch_mamo_user_decks, sync_moxfield_deck, sync_moxfield_user_decks, sync_archidekt_deck, sync_deckstats_deck, sync_mamo_deck, DeckSyncResult, SyncStatus, get_deck_directory_display};
 use rfd::FileDialog;
 use crate::deeplink::Deeplink;
-use crate::forge::{get_default_forge_path, resolve_latest_forge_jar, validate_forge_path, launch_forge_from_settings, list_forge_decks};
+use crate::forge::{get_default_forge_path, resolve_latest_forge_jar, validate_forge_path, launch_forge_from_settings, list_forge_decks, ForgeLaunchResult};
 use crate::gamelog::{GameLogConfig, GameLogProcessResult, ScanSummary, get_default_forge_log_directory, validate_directory, scan_directory, load_processed_files, save_processed_files, DeckMappings, fetch_my_decks, suggest_deck_matches, load_cached_decks, save_cached_decks, process_new_logs_with_filter, GameLogFilterOptions, FilePreviewInfo};
 use crate::registration::{RegistrationOutcome, RegistrationStatus};
 use crate::settings::{Settings, SavedLink, SavedLinkType};
@@ -188,6 +188,21 @@ fn is_newer_version(remote: &str, current: &str) -> bool {
         (parts.next().unwrap_or(0), parts.next().unwrap_or(0), parts.next().unwrap_or(0))
     };
     parse(remote) > parse(current)
+}
+
+/// True when a deeplink is an evaluation launch (playtest/launch-forge/simulate) that arrived
+/// without a deck id — the frontend didn't pin a specific deck, so Forge should not be started
+/// deck-less; the Home tab picker should be used instead.
+fn is_deckless_evaluation_action(action: &str, has_deck_id: bool) -> bool {
+    !has_deck_id && matches!(action, "playtest" | "launch-forge" | "launchforge" | "simulate")
+}
+
+/// If `deck` has already been downloaded into the Forge deck directory (matched by the same
+/// sanitized-name convention used at download time), return its file stem. Pure and testable
+/// without touching egui/tokio state.
+fn find_local_deck_path(deck: &crate::gamelog::UserDeck, local_decks: &[String]) -> Option<String> {
+    let target = crate::deck::sanitize_filename(&deck.deck_name).to_lowercase();
+    local_decks.iter().find(|stem| stem.to_lowercase() == target).cloned()
 }
 
 /// State for the game log tab
@@ -426,8 +441,8 @@ struct LauncherApp {
     activity_panel_collapsed: bool,
     /// Track entry count to auto-expand on new errors
     last_seen_entry_count: usize,
-    /// Deck name (file stem) to pre-select when launching Forge
-    selected_forge_deck: Option<String>,
+    /// Account deck (from MaMo, not necessarily downloaded yet) to pre-select when launching Forge
+    selected_account_deck: Option<crate::gamelog::UserDeck>,
     /// Local `.dck` file names available in the Forge deck directory
     forge_local_decks: Vec<String>,
     /// Background version check result
@@ -438,6 +453,14 @@ struct LauncherApp {
     wizard: SetupWizardState,
     /// Set by background threads when a Forge launch fails — checked in update()
     wizard_requested: Arc<AtomicBool>,
+    /// Set right after a successful `auth` deeplink so the user's full MaMo deck list loads
+    /// automatically — checked in update()
+    decks_fetch_requested: Arc<AtomicBool>,
+    /// Set after an account-deck download+launch completes, so the locally-known `.dck` list
+    /// picks up the newly downloaded file — checked in update()
+    forge_local_decks_refresh_requested: Arc<AtomicBool>,
+    /// True while an account deck selected in the Home tab picker is being downloaded and launched
+    is_launching_selected_deck: Arc<Mutex<bool>>,
     /// Which destructive action is pending confirmation (None = no dialog showing)
     confirm_action: Option<ConfirmAction>,
 }
@@ -569,6 +592,8 @@ impl LauncherApp {
         // Wizard: show on first run or when Forge is not configured
         let forge_not_configured = settings.forge_path.is_none();
         let wizard_requested = Arc::new(AtomicBool::new(false));
+        let decks_fetch_requested = Arc::new(AtomicBool::new(false));
+        let forge_local_decks_refresh_requested = Arc::new(AtomicBool::new(false));
         let wizard = SetupWizardState {
             step: WizardStep::Welcome,
             forge_path_input: settings.forge_path.clone().unwrap_or_default(),
@@ -619,12 +644,15 @@ impl LauncherApp {
             last_auto_gamelog_scan: None,
             activity_panel_collapsed: !started_with_deeplink,
             last_seen_entry_count: 0,
-            selected_forge_deck: None,
+            selected_account_deck: None,
             forge_local_decks: Vec::new(),
             update_check,
             show_setup_wizard: forge_not_configured,
             wizard,
             wizard_requested,
+            decks_fetch_requested,
+            forge_local_decks_refresh_requested,
+            is_launching_selected_deck: Arc::new(Mutex::new(false)),
             confirm_action: None,
         }
     }
@@ -646,6 +674,19 @@ impl eframe::App for LauncherApp {
             self.wizard.download_progress = None;
             self.wizard.download_result = None;
             self.wizard.download_cancelled = None;
+        }
+
+        // Auto-load the user's full MaMo deck list right after a successful auth deeplink,
+        // so the Home tab picker is ready without a manual "Load my decks" trip to the Decks tab
+        if self.decks_fetch_requested.load(Ordering::Relaxed) {
+            self.decks_fetch_requested.store(false, Ordering::Relaxed);
+            self.fetch_my_mamo_decks(ctx);
+        }
+
+        // Pick up the local `.dck` list refresh after an account-deck download+launch
+        if self.forge_local_decks_refresh_requested.load(Ordering::Relaxed) {
+            self.forge_local_decks_refresh_requested.store(false, Ordering::Relaxed);
+            self.forge_local_decks = list_forge_decks();
         }
 
         // Poll wizard test-launch result from background thread
@@ -932,10 +973,23 @@ impl LauncherApp {
             }
             log.log_info("Starting command execution...");
         }
-        
+
         // Request immediate repaint to show the initial logs
         ctx.request_repaint();
-        
+
+        // An evaluation launch (playtest/launch-forge/simulate) with no deck id means the
+        // frontend didn't pin a deck — rather than silently starting Forge deck-less, send the
+        // user to the Home tab picker (backed by their full MaMo account deck list) instead.
+        if is_deckless_evaluation_action(&deeplink.action, deeplink.deck_id.is_some()) {
+            if let Ok(mut log) = self.activity_log.lock() {
+                log.log_info("No deck specified — pick one below to launch Forge.");
+            }
+            self.current_tab = Tab::Home;
+            self.decks_fetch_requested.store(true, Ordering::Relaxed);
+            ctx.request_repaint();
+            return;
+        }
+
         // Handle the command in a background thread
         let settings = self.settings.clone();
         let settings_state = self.settings_state.clone();
@@ -946,11 +1000,12 @@ impl LauncherApp {
         let ctx_clone = ctx.clone();
         let ctx_for_polling = ctx.clone();
         let wizard_requested = Arc::clone(&self.wizard_requested);
-        
+        let decks_fetch_requested = Arc::clone(&self.decks_fetch_requested);
+
         // Create a log collector for the command handler
         let log_collector: SharedLogCollector = Arc::new(Mutex::new(Vec::new()));
         let log_collector_for_command = log_collector.clone();
-        
+
         std::thread::spawn(move || {
             let runtime = tokio::runtime::Runtime::new().unwrap();
             
@@ -1100,8 +1155,11 @@ impl LauncherApp {
                         }
                     }
                 }
+
+                // Load the user's full MaMo deck list automatically now that we're connected
+                decks_fetch_requested.store(true, Ordering::Relaxed);
             }
-            
+
             ctx_clone.request_repaint();
         });
     }
@@ -1137,10 +1195,22 @@ impl LauncherApp {
                             }
                             log.log_info("Starting command execution...");
                         }
-                        
+
+                        // An evaluation launch (playtest/launch-forge/simulate) with no deck id
+                        // means the frontend didn't pin a deck — send the user to the Home tab
+                        // picker (backed by their full MaMo account deck list) instead of
+                        // silently starting Forge deck-less.
+                        if is_deckless_evaluation_action(&deeplink.action, deeplink.deck_id.is_some()) {
+                            if let Ok(mut log) = self.activity_log.lock() {
+                                log.log_info("No deck specified — pick one below to launch Forge.");
+                            }
+                            self.current_tab = Tab::Home;
+                            self.decks_fetch_requested.store(true, Ordering::Relaxed);
+                            ctx.request_repaint();
+                        } else {
                         // Create a log collector for real-time progress updates
                         let log_collector: SharedLogCollector = Arc::new(Mutex::new(Vec::new()));
-                        
+
                         // Handle the command in a background thread
                         let settings = self.settings.clone();
                         let settings_state = self.settings_state.clone();
@@ -1152,6 +1222,7 @@ impl LauncherApp {
                         let ctx_clone = ctx.clone();
                         let ctx_for_polling = ctx.clone();
                         let wizard_requested = Arc::clone(&self.wizard_requested);
+                        let decks_fetch_requested = Arc::clone(&self.decks_fetch_requested);
 
                         std::thread::spawn(move || {
                             let runtime = tokio::runtime::Runtime::new().unwrap();
@@ -1305,12 +1376,16 @@ impl LauncherApp {
                                         }
                                     }
                                 }
+
+                                // Load the user's full MaMo deck list automatically now that we're connected
+                                decks_fetch_requested.store(true, Ordering::Relaxed);
                             }
-                            
+
                             ctx_clone.request_repaint();
                         });
+                        }
                     }
-                    
+
                     // Delete the pending command file
                     let _ = std::fs::remove_file(&pending_path);
                 }
@@ -1956,21 +2031,118 @@ impl LauncherApp {
         });
     }
 
-    /// Local Forge deck file stems that correspond to a deck in the user's MaMo
-    /// account, so the launch picker only offers decks tracked in the backend —
-    /// not every stray `.dck` file sitting in the Forge decks folder.
-    fn backend_known_decks(&self) -> Vec<String> {
-        let user_decks = self.gamelog_state.lock().unwrap().user_decks.clone();
-        self.forge_local_decks
-            .iter()
-            .filter(|stem| {
-                let stem_lower = stem.to_lowercase();
-                user_decks.iter().any(|d| {
-                    crate::deck::sanitize_filename(&d.deck_name).to_lowercase() == stem_lower
-                })
-            })
-            .cloned()
-            .collect()
+    /// The user's full MaMo account deck list, sorted by name — every deck the user owns is
+    /// pickable here, whether or not it has been downloaded locally yet (see
+    /// `launch_account_deck_async`, which downloads on demand).
+    fn account_decks(&self) -> Vec<crate::gamelog::UserDeck> {
+        let mut decks = self.gamelog_state.lock().unwrap().user_decks.clone();
+        decks.sort_by(|a, b| a.deck_name.to_lowercase().cmp(&b.deck_name.to_lowercase()));
+        decks
+    }
+
+    /// Apply the outcome of a synchronous Forge launch (activity log + PID tracking), shared by
+    /// every "launch with an already-local deck" code path in the Home tab.
+    fn apply_forge_launch_result(&mut self, result: anyhow::Result<ForgeLaunchResult>) {
+        match result {
+            Ok(result) => {
+                if let Ok(mut log) = self.activity_log.lock() {
+                    if result.success {
+                        log.log_success(&result.message);
+                    } else {
+                        log.log_info(&result.message);
+                    }
+                }
+                // Track Forge PID for auto gamelog scanning
+                if let Some(pid) = result.pid {
+                    *self.forge_pid.lock().unwrap() = Some(pid);
+                    *self.forge_monitoring_since.lock().unwrap() = Some(Instant::now());
+                    self.forge_window_seen = false;
+                    self.forge_launcher_exited_at = None;
+                }
+            }
+            Err(e) => {
+                if let Ok(mut log) = self.activity_log.lock() {
+                    log.log_error(format!("Failed to launch Forge: {}", e));
+                }
+            }
+        }
+    }
+
+    /// Download an account deck the user picked in the Home tab (but hasn't downloaded locally
+    /// yet) and launch Forge with it once ready. Mirrors the deeplink-driven
+    /// download-then-launch flow in `commands.rs::handle_launch_forge_with_logger`.
+    fn launch_account_deck_async(&mut self, deck: crate::gamelog::UserDeck, ctx: &egui::Context) {
+        *self.is_launching_selected_deck.lock().unwrap() = true;
+
+        let activity_log = self.activity_log.clone();
+        let forge_pid = self.forge_pid.clone();
+        let forge_monitoring_since = self.forge_monitoring_since.clone();
+        let is_launching = self.is_launching_selected_deck.clone();
+        let refresh_requested = self.forge_local_decks_refresh_requested.clone();
+        let ctx_clone = ctx.clone();
+
+        if let Ok(mut log) = self.activity_log.lock() {
+            log.log_info(format!("Downloading '{}' before launching Forge…", deck.deck_name));
+        }
+
+        tokio::spawn(async move {
+            let forge_result = match crate::deck::create_deck_from_mamo(&deck.deck_id).await {
+                Ok(deck_result) if deck_result.success => {
+                    if let Ok(mut log) = activity_log.lock() {
+                        log.log_success(&deck_result.message);
+                    }
+                    let deck_path_str = deck_result.deck_path.as_ref()
+                        .map(|p| p.to_string_lossy().to_string());
+                    launch_forge_from_settings(deck_path_str.as_deref(), None)
+                }
+                Ok(deck_result) => {
+                    if let Ok(mut log) = activity_log.lock() {
+                        log.log_error(format!("Deck download failed: {}", deck_result.message));
+                    }
+                    *is_launching.lock().unwrap() = false;
+                    ctx_clone.request_repaint();
+                    return;
+                }
+                Err(e) => {
+                    if let Ok(mut log) = activity_log.lock() {
+                        log.log_error(format!("Failed to download deck: {}", e));
+                    }
+                    *is_launching.lock().unwrap() = false;
+                    ctx_clone.request_repaint();
+                    return;
+                }
+            };
+
+            match forge_result {
+                Ok(result) => {
+                    if let Ok(mut log) = activity_log.lock() {
+                        if result.success {
+                            log.log_success(&result.message);
+                        } else {
+                            log.log_info(&result.message);
+                        }
+                    }
+                    if let Some(pid) = result.pid {
+                        *forge_pid.lock().unwrap() = Some(pid);
+                        *forge_monitoring_since.lock().unwrap() = Some(Instant::now());
+                        // ponytail: forge_window_seen/forge_launcher_exited_at aren't reset here
+                        // (they're plain, non-Arc fields owned by the UI thread) — worst case the
+                        // window-open debounce is slightly off for this launch. Upgrade path: move
+                        // those two fields behind Arc<Mutex<_>> like forge_pid if this becomes a
+                        // real problem.
+                    }
+                }
+                Err(e) => {
+                    if let Ok(mut log) = activity_log.lock() {
+                        log.log_error(format!("Failed to launch Forge: {}", e));
+                    }
+                }
+            }
+
+            refresh_requested.store(true, Ordering::Relaxed);
+            *is_launching.lock().unwrap() = false;
+            ctx_clone.request_repaint();
+        });
     }
 
     fn render_home_tab(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
@@ -2033,30 +2205,21 @@ impl LauncherApp {
                         state.forge_path_valid
                     };
                     if forge_configured {
-                        let deck_arg = self.selected_forge_deck.as_deref();
-                        if ui.button("🎮 Launch Forge").clicked() {
-                            match launch_forge_from_settings(deck_arg, None) {
-                                Ok(result) => {
-                                    if let Ok(mut log) = self.activity_log.lock() {
-                                        if result.success {
-                                            log.log_success(&result.message);
-                                        } else {
-                                            log.log_info(&result.message);
-                                        }
-                                    }
-                                    // Track Forge PID for auto gamelog scanning
-                                    if let Some(pid) = result.pid {
-                                        *self.forge_pid.lock().unwrap() = Some(pid);
-                                        *self.forge_monitoring_since.lock().unwrap() = Some(Instant::now());
-                                        self.forge_window_seen = false;
-                                        self.forge_launcher_exited_at = None;
-                                    }
+                        let is_launching = *self.is_launching_selected_deck.lock().unwrap();
+                        let label = if is_launching { "⏳ Launching…" } else { "🎮 Launch Forge" };
+                        if ui.add_enabled(!is_launching, egui::Button::new(label)).clicked() {
+                            match self.selected_account_deck.clone() {
+                                None => {
+                                    let result = launch_forge_from_settings(None, None);
+                                    self.apply_forge_launch_result(result);
                                 }
-                                Err(e) => {
-                                    if let Ok(mut log) = self.activity_log.lock() {
-                                        log.log_error(format!("Failed to launch Forge: {}", e));
+                                Some(deck) => match find_local_deck_path(&deck, &self.forge_local_decks) {
+                                    Some(local_stem) => {
+                                        let result = launch_forge_from_settings(Some(&local_stem), None);
+                                        self.apply_forge_launch_result(result);
                                     }
-                                }
+                                    None => self.launch_account_deck_async(deck, ctx),
+                                },
                             }
                         }
                     } else {
@@ -2107,30 +2270,43 @@ impl LauncherApp {
                 if forge_configured {
                     ui.horizontal(|ui| {
                         ui.label(egui::RichText::new("Deck:").small());
-                        let decks_snapshot = self.backend_known_decks();
-                        let selected_label = self.selected_forge_deck
-                            .as_deref()
-                            .unwrap_or("— none —")
-                            .to_string();
+                        let decks_snapshot = self.account_decks();
+                        let local_decks = self.forge_local_decks.clone();
+                        let label_for = |deck: &crate::gamelog::UserDeck| {
+                            if find_local_deck_path(deck, &local_decks).is_some() {
+                                deck.deck_name.clone()
+                            } else {
+                                format!("{} (download)", deck.deck_name)
+                            }
+                        };
+                        let selected_label = self.selected_account_deck
+                            .as_ref()
+                            .map(|d| label_for(d))
+                            .unwrap_or_else(|| "— none —".to_string());
                         egui::ComboBox::from_id_source("forge_launch_deck")
                             .width(220.0)
                             .selected_text(selected_label)
                             .show_ui(ui, |ui: &mut egui::Ui| {
                                 ui.selectable_value(
-                                    &mut self.selected_forge_deck,
+                                    &mut self.selected_account_deck,
                                     None,
                                     "— none —",
                                 );
                                 for deck in &decks_snapshot {
+                                    let label = label_for(deck);
                                     ui.selectable_value(
-                                        &mut self.selected_forge_deck,
+                                        &mut self.selected_account_deck,
                                         Some(deck.clone()),
-                                        deck.as_str(),
+                                        label,
                                     );
                                 }
                             });
-                        if ui.small_button("↺").on_hover_text("Refresh deck list").clicked() {
+                        if decks_snapshot.is_empty() {
+                            ui.label(egui::RichText::new("(no decks loaded yet)").small().color(egui::Color32::GRAY));
+                        }
+                        if ui.small_button("↺").on_hover_text("Refresh deck list (local files + MaMo account)").clicked() {
                             self.forge_local_decks = list_forge_decks();
+                            self.fetch_my_mamo_decks(ctx);
                         }
                     });
                 }
@@ -4381,5 +4557,62 @@ impl LauncherApp {
         } else {
             state.status_message = Some("Token saved successfully!".to_string());
         }
+    }
+}
+
+#[cfg(test)]
+mod deck_picker_tests {
+    use super::*;
+    use crate::gamelog::UserDeck;
+
+    fn make_deck(name: &str) -> UserDeck {
+        UserDeck {
+            deck_id: "deck-uuid-1".to_string(),
+            deck_name: name.to_string(),
+            user_id: "user-1".to_string(),
+            color_identity: None,
+            commander_id: None,
+            commander_partner_id: None,
+            updated_at: None,
+            created_at: None,
+        }
+    }
+
+    #[test]
+    fn find_local_deck_path_matches_case_insensitive() {
+        let deck = make_deck("My Commander Deck");
+        let local = vec!["Some Other Deck".to_string(), "my commander deck".to_string()];
+        assert_eq!(
+            find_local_deck_path(&deck, &local),
+            Some("my commander deck".to_string())
+        );
+    }
+
+    #[test]
+    fn find_local_deck_path_none_when_not_downloaded() {
+        let deck = make_deck("Never Downloaded Deck");
+        let local = vec!["Some Other Deck".to_string()];
+        assert_eq!(find_local_deck_path(&deck, &local), None);
+    }
+
+    #[test]
+    fn deckless_evaluation_detected_for_evaluation_actions_without_deck_id() {
+        for action in ["playtest", "launch-forge", "launchforge", "simulate"] {
+            assert!(
+                is_deckless_evaluation_action(action, false),
+                "expected {action} with no deck id to be treated as deck-less"
+            );
+            assert!(
+                !is_deckless_evaluation_action(action, true),
+                "expected {action} with a deck id to NOT be treated as deck-less"
+            );
+        }
+    }
+
+    #[test]
+    fn deckless_evaluation_ignores_unrelated_actions() {
+        assert!(!is_deckless_evaluation_action("auth", false));
+        assert!(!is_deckless_evaluation_action("replay-game", false));
+        assert!(!is_deckless_evaluation_action("download-deck", false));
     }
 }

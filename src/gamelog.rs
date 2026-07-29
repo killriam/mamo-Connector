@@ -1078,7 +1078,7 @@ fn get_processed_files_path() -> Result<PathBuf> {
 // ==================== DECK MAPPING ====================
 
 /// A deck from the MaMo backend
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UserDeck {
     pub deck_id: String,
