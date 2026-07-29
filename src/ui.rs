@@ -205,6 +205,26 @@ fn find_local_deck_path(deck: &crate::gamelog::UserDeck, local_decks: &[String])
     local_decks.iter().find(|stem| stem.to_lowercase() == target).cloned()
 }
 
+/// The directory MaMo Forge gets downloaded into (a `forge` subfolder of the Connector's own
+/// settings dir) — separate from wherever the user's own Forge install lives.
+fn forge_download_dir() -> std::path::PathBuf {
+    crate::settings::get_settings_dir()
+        .map(|d| d.join("forge"))
+        .unwrap_or_else(|_| std::path::PathBuf::from("forge"))
+}
+
+/// Whether a MaMo Forge jar is already sitting in the download directory from a previous run.
+fn forge_jar_already_downloaded() -> bool {
+    let dir = forge_download_dir();
+    dir.exists() && std::fs::read_dir(&dir)
+        .map(|mut d| d.any(|e| e.ok().map(|e| {
+            let n = e.file_name();
+            let s = n.to_string_lossy();
+            s.starts_with("forge-gui-desktop-") && s.ends_with("-jar-with-dependencies.jar")
+        }).unwrap_or(false)))
+        .unwrap_or(false)
+}
+
 /// State for the game log tab
 #[derive(Clone, Default)]
 #[allow(dead_code)]
@@ -1603,6 +1623,60 @@ impl LauncherApp {
         ctx.send_viewport_cmd(egui::ViewportCommand::Close);
     }
 
+    /// Start (or restart) the MaMo Forge jar download in the background, wiring up the wizard's
+    /// progress state. Shared by the Welcome step's auto-start and the DownloadForge screen's
+    /// manual "Download"/"Re-download" buttons.
+    fn start_forge_download(&mut self, ctx: &egui::Context) {
+        let forge_dir = forge_download_dir();
+
+        let progress_arc: Arc<Mutex<DownloadProgress>> = Arc::new(Mutex::new(DownloadProgress::default()));
+        let result_arc: Arc<Mutex<Option<DownloadResult>>> = Arc::new(Mutex::new(None));
+        let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        self.wizard.download_progress = Some(Arc::clone(&progress_arc));
+        self.wizard.download_result = Some(Arc::clone(&result_arc));
+        self.wizard.download_cancelled = Some(Arc::clone(&cancelled));
+
+        let ctx_progress = ctx.clone();
+        let ctx_end = ctx.clone();
+        let progress_bg = Arc::clone(&progress_arc);
+        let result_bg = Arc::clone(&result_arc);
+        let cancelled_bg = Arc::clone(&cancelled);
+
+        std::thread::spawn(move || {
+            let runtime = tokio::runtime::Runtime::new().unwrap();
+            let outcome = runtime.block_on(async {
+                crate::download::download_forge_jar(
+                    &forge_dir,
+                    move |update| {
+                        if let Ok(mut p) = progress_bg.lock() {
+                            p.bytes_done = update.bytes_done;
+                            p.total_bytes = update.total_bytes;
+                            p.status_text = format_download_status(update.bytes_done, update.total_bytes);
+                        }
+                        ctx_progress.request_repaint();
+                    },
+                    cancelled_bg,
+                )
+                .await
+            });
+
+            let terminal = match outcome {
+                Ok(jar_path) => {
+                    let dir = jar_path
+                        .parent()
+                        .map(|p| p.to_string_lossy().to_string())
+                        .unwrap_or_default();
+                    DownloadResult::Success { jar_dir: dir }
+                }
+                Err(e) if e.to_string().contains("cancelled") => DownloadResult::Cancelled,
+                Err(e) => DownloadResult::Failed(e.to_string()),
+            };
+            *result_bg.lock().unwrap() = Some(terminal);
+            ctx_end.request_repaint();
+        });
+    }
+
     fn render_setup_wizard(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         ui.vertical_centered(|ui| {
             ui.add_space(20.0);
@@ -1626,6 +1700,12 @@ impl LauncherApp {
                         egui::RichText::new("Get Started →").size(16.0)
                     ).min_size(egui::vec2(160.0, 36.0))).clicked() {
                         self.wizard.step = WizardStep::DownloadForge;
+                        // Combine setup into one flow: start fetching MaMo Forge immediately
+                        // instead of waiting for a second, separate button click — unless it's
+                        // already cached from a previous run (e.g. after Reset to First Run).
+                        if !forge_jar_already_downloaded() {
+                            self.start_forge_download(ctx);
+                        }
                     }
                     ui.add_space(8.0);
                     if ui.small_button("Skip for now").clicked() {
@@ -1683,20 +1763,9 @@ impl LauncherApp {
                         }
                     } else {
                         // ── Idle / error / already downloaded ────────────────
-                        let forge_dir = crate::settings::get_settings_dir()
-                            .map(|d| d.join("forge"))
-                            .unwrap_or_else(|_| std::path::PathBuf::from("forge"));
+                        let forge_dir = forge_download_dir();
 
-                        // Check if a JAR is already present in the download dir
-                        let already_downloaded = forge_dir.exists() && std::fs::read_dir(&forge_dir)
-                            .map(|mut d| d.any(|e| e.ok().map(|e| {
-                                let n = e.file_name();
-                                let s = n.to_string_lossy();
-                                s.starts_with("forge-gui-desktop-") && s.ends_with("-jar-with-dependencies.jar")
-                            }).unwrap_or(false)))
-                            .unwrap_or(false);
-
-                        if already_downloaded && prog_error.is_none() {
+                        if forge_jar_already_downloaded() && prog_error.is_none() {
                             // Already downloaded — offer to reuse or re-download
                             ui.label(
                                 egui::RichText::new("✓ MaMo Forge already downloaded")
@@ -1715,8 +1784,7 @@ impl LauncherApp {
                                     self.wizard.step = WizardStep::ConfigureForge;
                                 }
                                 if ui.button("Re-download").clicked() {
-                                    // Fall through to download (cleared below by spawning thread)
-                                    self.wizard.download_progress = None; // triggers the download button below
+                                    self.start_forge_download(ctx);
                                 }
                             });
                             ui.add_space(6.0);
@@ -1735,59 +1803,7 @@ impl LauncherApp {
                                 egui::Button::new(egui::RichText::new("⬇ Download MaMo Forge").size(15.0))
                                     .min_size(egui::vec2(210.0, 36.0)),
                             ).clicked() {
-                                let progress_arc: Arc<Mutex<DownloadProgress>> =
-                                    Arc::new(Mutex::new(DownloadProgress::default()));
-                                let result_arc: Arc<Mutex<Option<DownloadResult>>> =
-                                    Arc::new(Mutex::new(None));
-                                let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
-
-                                self.wizard.download_progress = Some(Arc::clone(&progress_arc));
-                                self.wizard.download_result = Some(Arc::clone(&result_arc));
-                                self.wizard.download_cancelled = Some(Arc::clone(&cancelled));
-
-                                let ctx_progress = ctx.clone();
-                                let ctx_end = ctx.clone();
-                                let progress_bg = Arc::clone(&progress_arc);
-                                let result_bg = Arc::clone(&result_arc);
-                                let cancelled_bg = Arc::clone(&cancelled);
-
-                                std::thread::spawn(move || {
-                                    let runtime = tokio::runtime::Runtime::new().unwrap();
-                                    let outcome = runtime.block_on(async {
-                                        crate::download::download_forge_jar(
-                                            &forge_dir,
-                                            move |update| {
-                                                if let Ok(mut p) = progress_bg.lock() {
-                                                    p.bytes_done = update.bytes_done;
-                                                    p.total_bytes = update.total_bytes;
-                                                    p.status_text = format_download_status(
-                                                        update.bytes_done,
-                                                        update.total_bytes,
-                                                    );
-                                                }
-                                                ctx_progress.request_repaint();
-                                            },
-                                            cancelled_bg,
-                                        )
-                                        .await
-                                    });
-
-                                    let terminal = match outcome {
-                                        Ok(jar_path) => {
-                                            let dir = jar_path
-                                                .parent()
-                                                .map(|p| p.to_string_lossy().to_string())
-                                                .unwrap_or_default();
-                                            DownloadResult::Success { jar_dir: dir }
-                                        }
-                                        Err(e) if e.to_string().contains("cancelled") => {
-                                            DownloadResult::Cancelled
-                                        }
-                                        Err(e) => DownloadResult::Failed(e.to_string()),
-                                    };
-                                    *result_bg.lock().unwrap() = Some(terminal);
-                                    ctx_end.request_repaint();
-                                });
+                                self.start_forge_download(ctx);
                             }
                         }
                     }

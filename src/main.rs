@@ -4,6 +4,7 @@ mod deeplink;
 mod download;
 mod forge;
 mod gamelog;
+mod install;
 mod registration;
 mod settings;
 mod simulation;
@@ -86,10 +87,22 @@ async fn run() -> Result<()> {
     init_logging();
 
     info!("Starting Mamo Connector launcher");
-    
+
     let args: Vec<String> = std::env::args().skip(1).collect();
+
+    // Release builds only: if we're not already running from our stable install location
+    // (e.g. this is a fresh download sitting in the user's Downloads folder), copy ourselves
+    // there and hand off to that copy instead. Must happen before the single-instance lock is
+    // taken and before registering the URL scheme, so this (soon-to-be-discarded) process never
+    // becomes "primary" — the relocated copy does that itself, from its stable path, as if it
+    // were simply starting up normally.
+    if install::relocate_to_stable_location(&args) {
+        info!("Relocated to stable install location; handing off and exiting.");
+        return Ok(());
+    }
+
     let deeplink = parse_deeplink(&args, SCHEME_PREFIX);
-    
+
     // Check for single instance
     let lock_file = check_single_instance();
     
