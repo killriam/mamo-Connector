@@ -1961,11 +1961,6 @@ impl LauncherApp {
     /// not every stray `.dck` file sitting in the Forge decks folder.
     fn backend_known_decks(&self) -> Vec<String> {
         let user_decks = self.gamelog_state.lock().unwrap().user_decks.clone();
-        // When not connected (no backend decks loaded yet), show all local .dck files
-        // so the deck picker is still useful without requiring a MaMo account to be linked.
-        if user_decks.is_empty() {
-            return self.forge_local_decks.clone();
-        }
         self.forge_local_decks
             .iter()
             .filter(|stem| {
