@@ -1961,6 +1961,11 @@ impl LauncherApp {
     /// not every stray `.dck` file sitting in the Forge decks folder.
     fn backend_known_decks(&self) -> Vec<String> {
         let user_decks = self.gamelog_state.lock().unwrap().user_decks.clone();
+        // When not connected (no backend decks loaded yet), show all local .dck files
+        // so the deck picker is still useful without requiring a MaMo account to be linked.
+        if user_decks.is_empty() {
+            return self.forge_local_decks.clone();
+        }
         self.forge_local_decks
             .iter()
             .filter(|stem| {
@@ -1986,8 +1991,13 @@ impl LauncherApp {
                         ui.label(egui::RichText::new("● Connected to MaMo").color(egui::Color32::from_rgb(0, 128, 0)));
                     } else {
                         ui.label(egui::RichText::new("● Not connected").color(egui::Color32::from_rgb(176, 0, 32)));
-                        if ui.small_button("Configure →").clicked() {
-                            self.current_tab = Tab::Settings;
+                        // Open browser to MaMo's Evaluation page where the user can generate
+                        // a PAT and connect — this avoids having to copy/paste a token manually.
+                        if ui.hyperlink_to(
+                            "Connect on MaMo →",
+                            "https://ma-mo-frontend.vercel.app/DeckBuilding/playbook?tab=evaluation",
+                        ).on_hover_text("Opens MaMo in your browser — click \"Connect MaMo Connector\" on the Evaluation tab").clicked() {
+                            // hyperlink_to already opens the URL; nothing extra needed here
                         }
                     }
 
