@@ -50,7 +50,7 @@ if (Test-Path $stableAppDir) {
 }
 
 # 4. Remove settings/cache (%APPDATA%\MamoConnector): settings.json, cached decks, lock file,
-#    pending-command file, and the downloaded MaMo Forge jar — unless -KeepForgeCache was passed,
+#    pending-command file, and the downloaded MaMo Forge jar - unless -KeepForgeCache was passed,
 #    since re-fetching a ~100-300MB jar on every test run gets old fast.
 Write-Host "`nRemoving settings and cache..." -ForegroundColor Yellow
 $settingsDir = Join-Path $env:APPDATA "MamoConnector"

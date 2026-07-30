@@ -15,11 +15,11 @@
 #   3. A deck-less playtest/launch-forge deeplink switches to the Home tab picker instead of
 #      launching Forge with nothing loaded (regression check for the deckless-routing fix)
 #   4. (If -DeckId given) A real playtest deeplink downloads the deck and launches Forge with
-#      --deck "<deck name>" actually present in the spawned java process's command line —
+#      --deck "<deck name>" actually present in the spawned java process's command line -
 #      the core fix this test exists to catch regressions in.
 #
 # This does NOT test: the first-run wizard (Get Started click, Forge auto-download), the
-# self-relocating install (release builds only), or the account-deck picker UI — those need a
+# self-relocating install (release builds only), or the account-deck picker UI - those need a
 # human clicking through the GUI. See MANUAL_TESTING.md for those.
 
 param(
@@ -60,7 +60,7 @@ Write-Host "========================================" -ForegroundColor Cyan
 
 Stop-ConnectorAndForge
 
-# ── 1. settings.json is valid JSON ──────────────────────────────────────────
+# -- 1. settings.json is valid JSON ------------------------------------------
 Test-Step "settings.json parses as valid JSON" {
     $path = Join-Path $env:APPDATA "MamoConnector\settings.json"
     if (-not (Test-Path $path)) {
@@ -71,7 +71,7 @@ Test-Step "settings.json parses as valid JSON" {
     return $true
 }
 
-# ── 2. Protocol registration points at an exe that actually exists ──────────
+# -- 2. Protocol registration points at an exe that actually exists ----------
 Test-Step "mamoConnector:// is registered and target exe exists" {
     $key = Get-ItemProperty -Path "HKCU:\Software\Classes\mamoConnector\shell\open\command" -ErrorAction Stop
     $command = $key.'(default)'
@@ -83,7 +83,7 @@ Test-Step "mamoConnector:// is registered and target exe exists" {
     return $false
 }
 
-# ── 3. Deck-less evaluation deeplink routes to the picker, not a blank Forge launch ──
+# -- 3. Deck-less evaluation deeplink routes to the picker, not a blank Forge launch --
 Test-Step "Deck-less '$Action' deeplink does not launch Forge with nothing loaded" {
     Start-Process "mamoConnector://$Action"
     Start-Sleep -Seconds 4
@@ -96,7 +96,7 @@ Test-Step "Deck-less '$Action' deeplink does not launch Forge with nothing loade
     return $true
 }
 
-# ── 4. Real deck playtest actually pre-selects the deck in Forge ────────────
+# -- 4. Real deck playtest actually pre-selects the deck in Forge ------------
 if ($DeckId) {
     Test-Step "'$Action/$DeckId' downloads the deck and passes --deck to Forge" {
         Start-Process "mamoConnector://$Action/$DeckId"
