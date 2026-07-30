@@ -67,11 +67,11 @@ pub const JAVA_DOWNLOAD_URL: &str =
 /// Result of probing the system for a usable Java runtime.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum JavaStatus {
-    /// A Java runtime of major version >= 17 is available on PATH.
+    /// A Java runtime of major version >= 17 is available (via JAVA_HOME or PATH).
     Ok(u32),
     /// Java is present but its major version is too old (< 17).
     TooOld(u32),
-    /// No `java` executable found on PATH.
+    /// No `java` executable found via JAVA_HOME or PATH.
     Missing,
 }
 
@@ -97,25 +97,61 @@ fn parse_java_major(version_output: &str) -> Option<u32> {
     }
 }
 
-/// Detect whether a usable Java 17+ runtime is available on PATH.
-pub fn detect_java() -> JavaStatus {
-    let output = Command::new("java").arg("-version").output();
-    match output {
-        Ok(out) => {
-            // `java -version` writes to stderr; some distributions use stdout.
-            let text = if !out.stderr.is_empty() {
-                String::from_utf8_lossy(&out.stderr).into_owned()
-            } else {
-                String::from_utf8_lossy(&out.stdout).into_owned()
-            };
-            match parse_java_major(&text) {
-                Some(major) if major >= 17 => JavaStatus::Ok(major),
-                Some(major) => JavaStatus::TooOld(major),
-                None => JavaStatus::Missing,
-            }
+/// Run `<java_exe> -version` and parse the major version, if it runs at all.
+fn probe_java_version(java_exe: impl AsRef<std::ffi::OsStr>) -> Option<u32> {
+    let out = Command::new(java_exe).arg("-version").output().ok()?;
+    // `java -version` writes to stderr; some distributions use stdout.
+    let text = if !out.stderr.is_empty() {
+        String::from_utf8_lossy(&out.stderr).into_owned()
+    } else {
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    };
+    parse_java_major(&text)
+}
+
+/// Pure decision logic: given the major version each probe found (if any), decide the overall
+/// `JavaStatus`. Separated from the actual process-spawning so it's testable without a real
+/// Java install or JAVA_HOME on the test machine.
+fn combine_java_probe_results(java_home_major: Option<u32>, path_major: Option<u32>) -> JavaStatus {
+    if let Some(major) = java_home_major {
+        if major >= 17 {
+            return JavaStatus::Ok(major);
         }
-        Err(_) => JavaStatus::Missing,
     }
+    match path_major {
+        Some(major) if major >= 17 => JavaStatus::Ok(major),
+        Some(major) => match java_home_major {
+            // Neither is new enough — report whichever version we found most authoritatively
+            // (JAVA_HOME, if it resolved to anything).
+            Some(home_major) => JavaStatus::TooOld(home_major.max(major)),
+            None => JavaStatus::TooOld(major),
+        },
+        None => match java_home_major {
+            Some(home_major) => JavaStatus::TooOld(home_major),
+            None => JavaStatus::Missing,
+        },
+    }
+}
+
+/// Detect whether a usable Java 17+ runtime is available, preferring `JAVA_HOME` over bare
+/// `java` on PATH.
+///
+/// A bare PATH lookup resolves to whatever happens to be *first* on PATH, which on real
+/// machines is often an unrelated, older JRE some other application installed (e.g. a stray
+/// Java 8 from a legacy tool) shadowing a perfectly good Java 17+ install later in PATH or
+/// pointed to by `JAVA_HOME`. `JAVA_HOME` is the more deliberate signal of "which Java this
+/// system's tooling is meant to use", so it's checked first; PATH is still consulted as a
+/// fallback (in both directions — if JAVA_HOME is unset, missing, or itself too old) so an
+/// otherwise-valid PATH install is never masked by opinionated env.
+pub fn detect_java() -> JavaStatus {
+    let java_home_exe = std::env::var("JAVA_HOME").ok().map(|home| {
+        std::path::Path::new(&home)
+            .join("bin")
+            .join(if cfg!(windows) { "java.exe" } else { "java" })
+    });
+    let java_home_major = java_home_exe.as_ref().and_then(|exe| probe_java_version(exe));
+    let path_major = probe_java_version("java");
+    combine_java_probe_results(java_home_major, path_major)
 }
 
 /// Get the default Forge installation path based on OS
@@ -840,5 +876,53 @@ mod tests {
             forge_launch_args(Some("Aggro"), Some("Control")),
             vec!["gui", "--format", "commander", "--deck", "Aggro", "--deck2", "Control"]
         );
+    }
+
+    #[test]
+    fn java_probe_prefers_valid_java_home_over_older_path() {
+        // The exact scenario this fix exists for: JAVA_HOME points at a valid 17+ install, but
+        // whatever's first on PATH is an unrelated, older JRE (e.g. a stray Java 8).
+        assert_eq!(
+            combine_java_probe_results(Some(17), Some(8)),
+            JavaStatus::Ok(17)
+        );
+    }
+
+    #[test]
+    fn java_probe_falls_back_to_path_when_java_home_too_old() {
+        assert_eq!(
+            combine_java_probe_results(Some(8), Some(21)),
+            JavaStatus::Ok(21)
+        );
+    }
+
+    #[test]
+    fn java_probe_falls_back_to_path_when_java_home_unset() {
+        assert_eq!(
+            combine_java_probe_results(None, Some(17)),
+            JavaStatus::Ok(17)
+        );
+    }
+
+    #[test]
+    fn java_probe_too_old_when_neither_meets_requirement() {
+        assert_eq!(
+            combine_java_probe_results(Some(8), Some(11)),
+            JavaStatus::TooOld(11)
+        );
+        assert_eq!(
+            combine_java_probe_results(Some(11), Some(8)),
+            JavaStatus::TooOld(11)
+        );
+    }
+
+    #[test]
+    fn java_probe_missing_when_neither_resolves() {
+        assert_eq!(combine_java_probe_results(None, None), JavaStatus::Missing);
+    }
+
+    #[test]
+    fn java_probe_too_old_when_only_java_home_resolves() {
+        assert_eq!(combine_java_probe_results(Some(8), None), JavaStatus::TooOld(8));
     }
 }
