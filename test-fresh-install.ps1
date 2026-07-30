@@ -1,11 +1,15 @@
-# Full fresh-install end-to-end test: MaMo Connector + Forge, from a genuinely clean machine
-# state, through to launching a real deck via the actual website.
+# Full fresh-install end-to-end test: MaMo Connector + Forge, starting from the real website's
+# download link, through to launching a real deck via the actual frontend.
 #
-# Drives everything a script can drive automatically (wipe, build, download-simulation,
-# self-relocation) and pauses at the points that need a real human click (the setup wizard,
-# Connect Connector, clicking Playtest on the site) - auto-detecting when each is done by
-# polling settings.json / running processes, so you just follow the on-screen prompts instead
-# of a script babysitting itself.
+# Drives everything a script can drive automatically (wipe, detect the download landing,
+# self-relocation) and pauses at the points that need a real human click (downloading from the
+# site, the setup wizard, Connect Connector, clicking Playtest) - auto-detecting when each is
+# done by polling settings.json / the Downloads folder / running processes, so you just follow
+# the on-screen prompts instead of a script babysitting itself.
+#
+# This tests the actual published release (whatever the frontend's Download link currently
+# resolves to) end to end - not a local rebuild. Cut and push a new tag first if you need it to
+# reflect the latest code (see release.yml).
 #
 # This WIPES your current Connector settings/connection (that's the point - testing the fresh
 # experience). A timestamped backup of settings.json is taken first; restore it yourself
@@ -69,23 +73,31 @@ if (Test-Path $settingsPath) {
 Write-Step 1 "Wiping current install (uninstall.ps1)"
 & "$PSScriptRoot\uninstall.ps1"
 
-# -- Step 2: Build the real release binary ----------------------------------
-Write-Step 2 "Building release binary"
-Push-Location $PSScriptRoot
-cargo build --release
-if ($LASTEXITCODE -ne 0) { Write-Host "Build failed." -ForegroundColor Red; exit 1 }
-Pop-Location
+# -- Step 2: Human step - download from the real website --------------------
+Write-Step 2 "DOWNLOAD FROM THE WEBSITE - your turn"
+Write-Host "  Open the real MaMo site (a deck's Evaluation tab, or the Playtest install prompt)" -ForegroundColor White
+Write-Host "  and click 'Download Connector' - it should go straight to a .exe file, not" -ForegroundColor White
+Write-Host "  GitHub's release list page (that link fix is part of what this is testing)." -ForegroundColor White
+$downloadsDir = Join-Path $env:USERPROFILE "Downloads"
+$before = @(Get-ChildItem $downloadsDir -Filter "mamo-connector*.exe" -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Name)
+$downloadedExe = $null
+$detected = Wait-ForCondition "a new mamo-connector*.exe to appear in Downloads" {
+    $current = Get-ChildItem $downloadsDir -Filter "mamo-connector*.exe" -ErrorAction SilentlyContinue
+    $new = $current | Where-Object { $before -notcontains $_.Name } | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+    if ($new) { $script:downloadedExe = $new.FullName; return $true }
+    return $false
+} 300
+if (-not $detected) { exit 1 }
+Write-Host "  Found: $downloadedExe" -ForegroundColor Gray
 
-# -- Step 3: Simulate a real download and first run --------------------------
-Write-Step 3 "Simulating a real download (copy to Downloads, run from there)"
-$downloadCopy = Join-Path $env:USERPROFILE "Downloads\mamo-connector-fresh-test.exe"
-Copy-Item "$PSScriptRoot\target\release\mamo-connector.exe" $downloadCopy -Force
-Write-Host "  Launching $downloadCopy ..." -ForegroundColor Gray
+# -- Step 3: Run the downloaded exe, exactly where the browser put it --------
+Write-Step 3 "Running the downloaded exe"
+Write-Host "  Launching $downloadedExe ..." -ForegroundColor Gray
 try {
-    Start-Process -FilePath $downloadCopy
+    Start-Process -FilePath $downloadedExe
 } catch {
     Write-Host "  Could not launch: $_" -ForegroundColor Red
-    Write-Host "  Known issue: Smart App Control can hard-block a freshly-built unsigned exe" -ForegroundColor Yellow
+    Write-Host "  Known issue: Smart App Control can hard-block a freshly-downloaded unsigned exe" -ForegroundColor Yellow
     Write-Host "  with no override at all. If that's what happened here, this is a real finding" -ForegroundColor Yellow
     Write-Host "  about distribution, not a bug in the app - see the code-signing discussion." -ForegroundColor Yellow
     exit 1
@@ -94,7 +106,7 @@ try {
 $stableExe = Join-Path $env:LOCALAPPDATA "MamoConnector\app\mamo-connector.exe"
 $relocated = Wait-ForCondition "self-relocation to $stableExe" { Test-Path $stableExe } 15
 if (-not $relocated) { exit 1 }
-Remove-Item $downloadCopy -Force -ErrorAction SilentlyContinue
+Remove-Item $downloadedExe -Force -ErrorAction SilentlyContinue
 Write-Host "  Deleted the original Downloads copy - mamoConnector:// links must keep working without it." -ForegroundColor Gray
 
 # -- Step 4: Human step - the setup wizard -----------------------------------
