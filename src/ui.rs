@@ -71,6 +71,16 @@ struct UpdateCheckState {
     dismissed: bool,
 }
 
+/// State for the background MaMo Forge update check — only meaningful when the configured
+/// Forge install is one the Connector downloaded itself (see `is_connector_managed_forge`).
+#[derive(Clone, Default)]
+struct ForgeUpdateCheckState {
+    /// Some(asset_name) when a different build is currently published than the one we have
+    /// downloaded locally.
+    available_asset_name: Option<String>,
+    dismissed: bool,
+}
+
 /// Destructive actions that require a confirmation dialog
 #[derive(Clone, PartialEq, Eq)]
 enum ConfirmAction {
@@ -221,6 +231,30 @@ fn forge_download_dir() -> std::path::PathBuf {
     crate::settings::get_settings_dir()
         .map(|d| d.join("forge"))
         .unwrap_or_else(|_| std::path::PathBuf::from("forge"))
+}
+
+/// True when `forge_path` is the Connector's own managed Forge download directory, rather than
+/// a Forge install the user pointed at manually. Only Connector-managed installs are safe to
+/// offer an "update" for — there's no "latest" baseline to compare a user-provided install
+/// against, and it isn't ours to replace.
+fn is_connector_managed_forge(forge_path: &str, forge_download_dir: &std::path::Path) -> bool {
+    !forge_path.is_empty() && std::path::Path::new(forge_path) == forge_download_dir
+}
+
+/// Compare the locally-downloaded MaMo Forge jar against whatever's currently published under
+/// the `replay-features-latest` tag. Returns `Some(asset_name)` when a different build is
+/// available, `None` when they already match or the check couldn't complete (offline, GitHub
+/// unreachable, etc. — fails silently, this is a best-effort background check).
+async fn check_forge_update_available() -> Option<String> {
+    let local_name = crate::forge::resolve_latest_forge_jar(&forge_download_dir())
+        .and_then(|p| p.file_name().map(|n| n.to_string_lossy().to_string()));
+
+    let (_, remote_name) = crate::download::resolve_forge_download_url().await.ok()?;
+
+    match local_name {
+        Some(name) if name == remote_name => None,
+        _ => Some(remote_name),
+    }
 }
 
 /// Whether a MaMo Forge jar is already sitting in the download directory from a previous run.
@@ -477,6 +511,12 @@ struct LauncherApp {
     forge_local_decks: Vec<String>,
     /// Background version check result
     update_check: Arc<Mutex<UpdateCheckState>>,
+    /// Background MaMo Forge update check result
+    forge_update_check: Arc<Mutex<ForgeUpdateCheckState>>,
+    /// Live progress while an in-place Forge update download is running (Home tab banner)
+    forge_update_progress: Arc<Mutex<Option<DownloadProgress>>>,
+    /// Set by the banner's Cancel button; read by the update download task
+    forge_update_cancelled: Arc<AtomicBool>,
     /// Whether the setup wizard is currently visible
     show_setup_wizard: bool,
     /// State for the setup wizard
@@ -655,6 +695,28 @@ impl LauncherApp {
             });
         }
 
+        // Kick off background MaMo Forge update check — only meaningful when the configured
+        // Forge install is the Connector's own managed download, not a user-provided one.
+        let forge_update_check = Arc::new(Mutex::new(ForgeUpdateCheckState::default()));
+        if is_connector_managed_forge(settings.forge_path.as_deref().unwrap_or(""), &forge_download_dir()) {
+            let forge_update_check_bg = Arc::clone(&forge_update_check);
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_secs(5));
+                let runtime = tokio::runtime::Runtime::new().unwrap();
+                runtime.block_on(async {
+                    match check_forge_update_available().await {
+                        Some(asset_name) => {
+                            log::info!("MaMo Forge update available: {asset_name}");
+                            if let Ok(mut s) = forge_update_check_bg.lock() {
+                                s.available_asset_name = Some(asset_name);
+                            }
+                        }
+                        None => log::info!("MaMo Forge is up to date (or check could not complete)"),
+                    }
+                });
+            });
+        }
+
         Self {
             state,
             url_input: String::new(),
@@ -677,6 +739,9 @@ impl LauncherApp {
             selected_account_deck: None,
             forge_local_decks: Vec::new(),
             update_check,
+            forge_update_check,
+            forge_update_progress: Arc::new(Mutex::new(None)),
+            forge_update_cancelled: Arc::new(AtomicBool::new(false)),
             show_setup_wizard: forge_not_configured,
             wizard,
             wizard_requested,
@@ -957,6 +1022,58 @@ impl eframe::App for LauncherApp {
                             });
                         ui.add_space(2.0);
                     }
+                }
+
+                // MaMo Forge update banner — only ever populated for Connector-managed installs
+                let (forge_update_asset, forge_update_dismissed) = {
+                    let s = self.forge_update_check.lock().unwrap();
+                    (s.available_asset_name.clone(), s.dismissed)
+                };
+                let forge_update_progress = self.forge_update_progress.lock().unwrap().clone();
+                if !forge_update_dismissed && (forge_update_asset.is_some() || forge_update_progress.is_some()) {
+                    egui::Frame::default()
+                        .fill(egui::Color32::from_rgb(205, 232, 255))
+                        .inner_margin(egui::Margin::symmetric(8.0, 4.0))
+                        .show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                if let Some(ref prog) = forge_update_progress {
+                                    if let Some(ref err) = prog.error {
+                                        ui.label(
+                                            egui::RichText::new(format!("✗ MaMo Forge update failed: {err}"))
+                                                .color(egui::Color32::from_rgb(176, 0, 32))
+                                                .small(),
+                                        );
+                                    } else {
+                                        ui.label(
+                                            egui::RichText::new(format!(
+                                                "⬆ Updating MaMo Forge… {}",
+                                                format_download_status(prog.bytes_done, prog.total_bytes)
+                                            ))
+                                            .color(egui::Color32::from_rgb(0, 90, 158))
+                                            .small(),
+                                        );
+                                        if !prog.finished && ui.small_button("Cancel").clicked() {
+                                            self.forge_update_cancelled.store(true, Ordering::Relaxed);
+                                        }
+                                    }
+                                } else if let Some(ref asset_name) = forge_update_asset {
+                                    ui.label(
+                                        egui::RichText::new(format!("⬆ MaMo Forge update available ({asset_name})"))
+                                            .color(egui::Color32::from_rgb(0, 90, 158))
+                                            .small(),
+                                    );
+                                    if ui.small_button("Update").clicked() {
+                                        self.start_forge_update(ctx);
+                                    }
+                                }
+                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                    if ui.small_button("✕").clicked() {
+                                        self.forge_update_check.lock().unwrap().dismissed = true;
+                                    }
+                                });
+                            });
+                        });
+                    ui.add_space(2.0);
                 }
 
                 // Tab bar — 3 tabs: Home, Decks, Settings
@@ -1683,6 +1800,78 @@ impl LauncherApp {
                 Err(e) => DownloadResult::Failed(e.to_string()),
             };
             *result_bg.lock().unwrap() = Some(terminal);
+            ctx_end.request_repaint();
+        });
+    }
+
+    /// Re-download MaMo Forge in place from the Home tab's update banner. Unlike
+    /// `start_forge_download` (wizard first-run flow), this never touches `forge_path` or the
+    /// wizard state — a Connector-managed install's `forge_path` already points at the download
+    /// directory itself, and `launch_forge`'s directory-resolution logic (`resolve_latest_forge_jar`)
+    /// automatically picks up the newest jar on the next launch, so replacing the file is enough.
+    fn start_forge_update(&mut self, ctx: &egui::Context) {
+        let forge_dir = forge_download_dir();
+
+        self.forge_update_cancelled.store(false, Ordering::Relaxed);
+        *self.forge_update_progress.lock().unwrap() = Some(DownloadProgress::default());
+
+        let progress_out = Arc::clone(&self.forge_update_progress);
+        let cancelled = Arc::clone(&self.forge_update_cancelled);
+        let forge_update_check = Arc::clone(&self.forge_update_check);
+        let activity_log = self.activity_log.clone();
+        let ctx_progress = ctx.clone();
+        let ctx_end = ctx.clone();
+
+        std::thread::spawn(move || {
+            let runtime = tokio::runtime::Runtime::new().unwrap();
+            let progress_bg = Arc::clone(&progress_out);
+            let outcome = runtime.block_on(async {
+                crate::download::download_forge_jar(
+                    &forge_dir,
+                    move |update| {
+                        if let Ok(mut guard) = progress_bg.lock() {
+                            let entry = guard.get_or_insert_with(DownloadProgress::default);
+                            entry.bytes_done = update.bytes_done;
+                            entry.total_bytes = update.total_bytes;
+                            entry.status_text = format_download_status(update.bytes_done, update.total_bytes);
+                        }
+                        ctx_progress.request_repaint();
+                    },
+                    cancelled,
+                )
+                .await
+            });
+
+            match outcome {
+                Ok(_jar_path) => {
+                    if let Ok(mut log) = activity_log.lock() {
+                        log.log_success("MaMo Forge updated successfully.");
+                    }
+                    forge_update_check.lock().unwrap().available_asset_name = None;
+                    if let Ok(mut p) = progress_out.lock() {
+                        if let Some(ref mut prog) = *p {
+                            prog.finished = true;
+                        }
+                    }
+                }
+                Err(e) if e.to_string().contains("cancelled") => {
+                    if let Ok(mut log) = activity_log.lock() {
+                        log.log_info("MaMo Forge update cancelled.");
+                    }
+                    *progress_out.lock().unwrap() = None;
+                }
+                Err(e) => {
+                    if let Ok(mut log) = activity_log.lock() {
+                        log.log_error(format!("MaMo Forge update failed: {e}"));
+                    }
+                    if let Ok(mut p) = progress_out.lock() {
+                        if let Some(ref mut prog) = *p {
+                            prog.finished = true;
+                            prog.error = Some(e.to_string());
+                        }
+                    }
+                }
+            }
             ctx_end.request_repaint();
         });
     }
@@ -4673,5 +4862,24 @@ mod deck_picker_tests {
         assert!(!is_deckless_evaluation_action("auth", false));
         assert!(!is_deckless_evaluation_action("replay-game", false));
         assert!(!is_deckless_evaluation_action("download-deck", false));
+    }
+
+    #[test]
+    fn connector_managed_forge_true_when_path_matches_download_dir() {
+        let dir = std::path::PathBuf::from(r"C:\Users\test\AppData\Roaming\MamoConnector\forge");
+        let path = dir.to_string_lossy().to_string();
+        assert!(is_connector_managed_forge(&path, &dir));
+    }
+
+    #[test]
+    fn connector_managed_forge_false_for_external_install() {
+        let dir = std::path::PathBuf::from(r"C:\Users\test\AppData\Roaming\MamoConnector\forge");
+        assert!(!is_connector_managed_forge(r"C:\SWProjects\Forge\forge-gui-desktop\target\forge.exe", &dir));
+    }
+
+    #[test]
+    fn connector_managed_forge_false_when_empty() {
+        let dir = std::path::PathBuf::from(r"C:\Users\test\AppData\Roaming\MamoConnector\forge");
+        assert!(!is_connector_managed_forge("", &dir));
     }
 }
