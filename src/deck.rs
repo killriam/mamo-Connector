@@ -1497,6 +1497,44 @@ pub async fn fetch_mamo_user_decks(username: &str) -> Result<Vec<MamoDeckEntry>>
     Ok(decks)
 }
 
+/// One entry from the curated opponent-deck pool (`GET /api/decks/curated-opponents`).
+#[derive(Debug, Deserialize)]
+struct CuratedOpponentDeck {
+    #[serde(rename = "deckId")]
+    deck_id: String,
+}
+
+/// Picks a random deck id from the curated opponent-deck pool, for auto-filling Forge's
+/// `--deck2` when a user launches with no opponent specified — so "just press Play" never
+/// requires manually configuring an opponent in Forge's own lobby. Returns `None` if the pool
+/// is empty or the fetch fails for any reason; callers must treat that exactly like today's
+/// "no deck2" behavior (never block or fail a launch over this being unavailable).
+pub fn pick_random_curated_opponent_deck_id() -> Option<String> {
+    let url = format!("{}/api/decks/curated-opponents", MAMO_API_URL);
+    let body = fetch_with_curl_custom(&url, &[
+        "-H", "User-Agent: MaMo-Connector/1.0",
+        "-H", "Accept: application/json",
+    ]).ok()?;
+    let decks: Vec<CuratedOpponentDeck> = serde_json::from_str(&body).ok()?;
+    let ids: Vec<String> = decks.into_iter().map(|d| d.deck_id).collect();
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_nanos();
+    pick_random_index(ids.len(), nanos).map(|idx| ids[idx].clone())
+}
+
+/// Pure index-selection logic for `pick_random_curated_opponent_deck_id`, factored out so it's
+/// testable without a real network call. `None` for an empty pool (the caller must fall back to
+/// launching with no `--deck2`, exactly like today's behavior); otherwise an index guaranteed to
+/// be `< len`.
+fn pick_random_index(len: usize, seed: u128) -> Option<usize> {
+    if len == 0 {
+        return None;
+    }
+    Some((seed as usize) % len)
+}
+
 // ==================== Deck Hash Calculation ====================
 
 /// Calculate a deck hash from Forge deck content
@@ -3245,5 +3283,37 @@ Name=Example Commander Deck
                 println!("Could not list decks (network may be unavailable): {}", e);
             }
         }
+    }
+
+    #[test]
+    fn pick_random_index_none_for_empty_pool() {
+        assert_eq!(pick_random_index(0, 12345), None);
+    }
+
+    #[test]
+    fn pick_random_index_always_in_bounds() {
+        // A handful of arbitrary seeds, including edge values, all must land in [0, len).
+        for len in [1usize, 2, 3, 7] {
+            for seed in [0u128, 1, 999_999_999, u128::MAX] {
+                let idx = pick_random_index(len, seed).expect("non-empty pool must return Some");
+                assert!(idx < len, "index {idx} out of bounds for len {len} (seed {seed})");
+            }
+        }
+    }
+
+    #[test]
+    fn curated_opponent_deck_deserializes_from_the_real_endpoint_shape() {
+        // Matches new-backend's CuratedOpponentDeck JSON shape exactly
+        // (controllers/curatedOpponentDecksController.ts) — camelCase deckId/deckName.
+        let json = r#"[{"deckId":"11111111-1111-1111-1111-111111111111","deckName":"MaMo Placeholder Opponent 1"}]"#;
+        let decks: Vec<CuratedOpponentDeck> = serde_json::from_str(json).expect("should deserialize");
+        assert_eq!(decks.len(), 1);
+        assert_eq!(decks[0].deck_id, "11111111-1111-1111-1111-111111111111");
+    }
+
+    #[test]
+    fn curated_opponent_deck_list_deserializes_when_empty() {
+        let decks: Vec<CuratedOpponentDeck> = serde_json::from_str("[]").expect("empty array is valid");
+        assert!(decks.is_empty());
     }
 }

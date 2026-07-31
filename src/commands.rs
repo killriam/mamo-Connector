@@ -363,7 +363,10 @@ async fn handle_launch_forge_with_logger(deeplink: &Deeplink, log_collector: Opt
 
     log(&format!("Launch Forge command - deck_id: {:?}", deck_id));
 
-    // Resolve deck2 path: download by UUID if provided, otherwise use direct name
+    // Resolve deck2 path: an explicit name/id from the deeplink wins; otherwise fall back to a
+    // random pick from the curated opponent-deck pool, so "just press Play" never requires
+    // manually configuring an opponent inside Forge's own lobby. If the pool is empty or
+    // unreachable, this silently falls through to None — exactly today's behavior.
     let deck2_path: Option<String> = if let Some(direct) = deck2_name_direct {
         log(&format!("Using deck2 by name: {}", direct));
         Some(direct)
@@ -382,6 +385,24 @@ async fn handle_launch_forge_with_logger(deeplink: &Deeplink, log_collector: Opt
             }
             Err(e) => {
                 log(&format!("Error downloading deck2: {}", e));
+                None
+            }
+        }
+    } else if let Some(curated_id) = crate::deck::pick_random_curated_opponent_deck_id() {
+        log(&format!("No opponent specified — downloading a curated opponent deck: {}", curated_id));
+        match create_deck_from_mamo(&curated_id).await {
+            Ok(result) if result.success => {
+                let path = result.deck_path.as_ref()
+                    .map(|p| p.to_string_lossy().to_string());
+                log(&format!("Opponent deck ready: {:?}", path));
+                path
+            }
+            Ok(result) => {
+                log(&format!("Curated opponent deck download failed: {}", result.message));
+                None
+            }
+            Err(e) => {
+                log(&format!("Error downloading curated opponent deck: {}", e));
                 None
             }
         }

@@ -338,6 +338,25 @@ fn find_local_deck_path(deck: &crate::gamelog::UserDeck, local_decks: &[String])
     local_decks.iter().find(|stem| stem.to_lowercase() == target).cloned()
 }
 
+/// Resolves an opponent deck to pass as Forge's `--deck2` for a standalone (non-deeplink) Play
+/// tab launch, so "just press Play" never lands the user in Forge's own lobby needing to
+/// configure an opponent by hand. Picks a random deck from the curated opponent pool and
+/// downloads it the same way any deck downloads — returns `None` (silently, logging only an
+/// info line) if the pool is empty or unreachable, which callers must treat exactly like
+/// "no deck2" (never block or fail the launch over this). Must be called from within an async
+/// context (this itself awaits — no blocking executor tricks).
+async fn resolve_curated_opponent_deck_path(activity_log: &Arc<Mutex<ActivityLogState>>) -> Option<String> {
+    let curated_id = crate::deck::pick_random_curated_opponent_deck_id()?;
+    let result = crate::deck::create_deck_from_mamo(&curated_id).await.ok()?;
+    if !result.success {
+        if let Ok(mut log) = activity_log.lock() {
+            log.log_info(format!("Couldn't prepare a curated opponent deck: {}", result.message));
+        }
+        return None;
+    }
+    result.deck_path.map(|p| p.to_string_lossy().to_string())
+}
+
 /// The directory MaMo Forge gets downloaded into (a `forge` subfolder of the Connector's own
 /// settings dir) — separate from wherever the user's own Forge install lives.
 fn forge_download_dir() -> std::path::PathBuf {
@@ -2500,7 +2519,8 @@ impl LauncherApp {
                     }
                     let deck_path_str = deck_result.deck_path.as_ref()
                         .map(|p| p.to_string_lossy().to_string());
-                    launch_forge_from_settings(deck_path_str.as_deref(), None)
+                    let deck2_path = resolve_curated_opponent_deck_path(&activity_log).await;
+                    launch_forge_from_settings(deck_path_str.as_deref(), deck2_path.as_deref())
                 }
                 Ok(deck_result) => {
                     if let Ok(mut log) = activity_log.lock() {
@@ -2539,6 +2559,56 @@ impl LauncherApp {
                         // window-open debounce is slightly off for this launch. Upgrade path: move
                         // those two fields behind Arc<Mutex<_>> like forge_pid if this becomes a
                         // real problem.
+                    }
+                    *play_session.lock().unwrap() = if result.success { PlaySession::Playing } else { PlaySession::Watching };
+                }
+                Err(e) => {
+                    if let Ok(mut log) = activity_log.lock() {
+                        log.log_error(format!("Failed to launch Forge: {}", e));
+                    }
+                    *play_session.lock().unwrap() = PlaySession::Watching;
+                }
+            }
+
+            refresh_requested.store(true, Ordering::Relaxed);
+            *is_launching.lock().unwrap() = false;
+            ctx_clone.request_repaint();
+        });
+    }
+
+    /// Launches Forge with a deck that's already downloaded locally, still resolving a curated
+    /// opponent deck for `--deck2` first — the counterpart to `launch_account_deck_async` for
+    /// when deck1 doesn't need downloading. Kept async (rather than the previous one-line
+    /// synchronous `launch_forge_from_settings` call) purely because picking an opponent now
+    /// means a network round-trip, which must never run on the UI thread.
+    fn launch_local_deck_with_curated_opponent_async(&mut self, local_stem: String, ctx: &egui::Context) {
+        *self.is_launching_selected_deck.lock().unwrap() = true;
+        *self.play_session.lock().unwrap() = PlaySession::Launching;
+
+        let activity_log = self.activity_log.clone();
+        let forge_pid = self.forge_pid.clone();
+        let forge_monitoring_since = self.forge_monitoring_since.clone();
+        let is_launching = self.is_launching_selected_deck.clone();
+        let refresh_requested = self.forge_local_decks_refresh_requested.clone();
+        let play_session = Arc::clone(&self.play_session);
+        let ctx_clone = ctx.clone();
+
+        tokio::spawn(async move {
+            let deck2_path = resolve_curated_opponent_deck_path(&activity_log).await;
+            let forge_result = launch_forge_from_settings(Some(&local_stem), deck2_path.as_deref());
+
+            match forge_result {
+                Ok(result) => {
+                    if let Ok(mut log) = activity_log.lock() {
+                        if result.success {
+                            log.log_success(&result.message);
+                        } else {
+                            log.log_info(&result.message);
+                        }
+                    }
+                    if let Some(pid) = result.pid {
+                        *forge_pid.lock().unwrap() = Some(pid);
+                        *forge_monitoring_since.lock().unwrap() = Some(Instant::now());
                     }
                     *play_session.lock().unwrap() = if result.success { PlaySession::Playing } else { PlaySession::Watching };
                 }
@@ -2623,8 +2693,7 @@ impl LauncherApp {
                                 }
                                 Some(deck) => match find_local_deck_path(&deck, &self.forge_local_decks) {
                                     Some(local_stem) => {
-                                        let result = launch_forge_from_settings(Some(&local_stem), None);
-                                        self.apply_forge_launch_result(result);
+                                        self.launch_local_deck_with_curated_opponent_async(local_stem, ctx);
                                     }
                                     None => self.launch_account_deck_async(deck, ctx),
                                 },
