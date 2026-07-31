@@ -114,7 +114,7 @@ Write-Step 4 "SETUP WIZARD - your turn"
 Write-Host "  The Connector window should be open now. Please:" -ForegroundColor White
 Write-Host "    1. Click 'Get Started ->' (the Forge download should start immediately, no" -ForegroundColor White
 Write-Host "       second click needed)" -ForegroundColor White
-Write-Host "    2. Wait for the ~100-300MB download to finish" -ForegroundColor White
+Write-Host "    2. Wait for the ~400MB download to finish" -ForegroundColor White
 Write-Host "    3. Click through Configure Forge -> Test Launch -> Done" -ForegroundColor White
 $wizardDone = Wait-ForCondition "forge_path to be set in settings.json" { Get-SettingsValue "forge_path" } 900
 if (-not $wizardDone) { exit 1 }

@@ -27,6 +27,7 @@ rfd = "0.14"
 sha2 = "0.10"
 flate2 = "1"
 base64 = "0.22"
+zip = "2"
 mamo-sim = { path = "../mamo-sim" }
 
 [target.'cfg(windows)'.dependencies]

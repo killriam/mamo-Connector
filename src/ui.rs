@@ -249,7 +249,9 @@ async fn check_forge_update_available() -> Option<String> {
     let local_name = crate::forge::resolve_latest_forge_jar(&forge_download_dir())
         .and_then(|p| p.file_name().map(|n| n.to_string_lossy().to_string()));
 
-    let (_, remote_name) = crate::download::resolve_forge_download_url().await.ok()?;
+    // The update path only ever re-fetches the standalone JAR (see start_forge_update /
+    // download_forge_jar) — compare against that asset, not the portable zip.
+    let (_, remote_name) = crate::download::resolve_forge_jar_url().await.ok()?;
 
     match local_name {
         Some(name) if name == remote_name => None,
@@ -1750,9 +1752,9 @@ impl LauncherApp {
         ctx.send_viewport_cmd(egui::ViewportCommand::Close);
     }
 
-    /// Start (or restart) the MaMo Forge jar download in the background, wiring up the wizard's
-    /// progress state. Shared by the Welcome step's auto-start and the DownloadForge screen's
-    /// manual "Download"/"Re-download" buttons.
+    /// Start (or restart) the MaMo Forge portable-bundle download (JAR + `res/`) in the
+    /// background, wiring up the wizard's progress state. Shared by the Welcome step's
+    /// auto-start and the DownloadForge screen's manual "Download"/"Re-download" buttons.
     fn start_forge_download(&mut self, ctx: &egui::Context) {
         let forge_dir = forge_download_dir();
 
@@ -1773,7 +1775,7 @@ impl LauncherApp {
         std::thread::spawn(move || {
             let runtime = tokio::runtime::Runtime::new().unwrap();
             let outcome = runtime.block_on(async {
-                crate::download::download_forge_jar(
+                crate::download::download_forge_portable(
                     &forge_dir,
                     move |update| {
                         if let Ok(mut p) = progress_bg.lock() {
@@ -1921,7 +1923,7 @@ impl LauncherApp {
                         egui::RichText::new(
                             "MaMo uses a custom Forge build with replay recording, \
                              commander simulation, and MaMo integration. \
-                             Download it automatically (~100-300 MB)."
+                             Download it automatically (~400 MB)."
                         )
                         .color(egui::Color32::from_rgb(80, 80, 80)),
                     ).wrap());

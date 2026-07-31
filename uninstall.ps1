@@ -7,8 +7,8 @@
 # the outside, whether or not anything is currently installed.
 #
 # Usage:
-#   .\uninstall.ps1                  # full reset (Forge jar re-downloads next run, ~100-300MB)
-#   .\uninstall.ps1 -KeepForgeCache  # keep the already-downloaded MaMo Forge jar (faster re-testing)
+#   .\uninstall.ps1                  # full reset (Forge portable bundle re-downloads next run, ~400MB)
+#   .\uninstall.ps1 -KeepForgeCache  # keep the already-downloaded MaMo Forge files (faster re-testing)
 
 param(
     [switch]$KeepForgeCache
@@ -50,8 +50,9 @@ if (Test-Path $stableAppDir) {
 }
 
 # 4. Remove settings/cache (%APPDATA%\MamoConnector): settings.json, cached decks, lock file,
-#    pending-command file, and the downloaded MaMo Forge jar - unless -KeepForgeCache was passed,
-#    since re-fetching a ~100-300MB jar on every test run gets old fast.
+#    pending-command file, and the downloaded MaMo Forge files (jar + res/) - unless
+#    -KeepForgeCache was passed, since re-fetching the ~400MB portable bundle on every test run
+#    gets old fast.
 Write-Host "`nRemoving settings and cache..." -ForegroundColor Yellow
 $settingsDir = Join-Path $env:APPDATA "MamoConnector"
 if (Test-Path $settingsDir) {
