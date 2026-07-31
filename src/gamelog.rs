@@ -52,10 +52,21 @@ pub struct GameLogProcessResult {
     pub server_id: Option<String>,
     /// Deck identifier extracted from the file
     pub deck_identifier: Option<String>,
+    /// The authoritative MaMo deck UUID this log was matched to, if the local deck mappings
+    /// resolved one (see `DeckMappings::get_mapping`) — lets the UI deep-link straight to that
+    /// deck's game analysis instead of just reporting an upload happened.
+    #[serde(default)]
+    pub resolved_deck_id: Option<String>,
 }
 
 impl GameLogProcessResult {
-    pub fn success(filename: String, file_size: u64, server_id: Option<String>, deck_identifier: Option<String>) -> Self {
+    pub fn success(
+        filename: String,
+        file_size: u64,
+        server_id: Option<String>,
+        deck_identifier: Option<String>,
+        resolved_deck_id: Option<String>,
+    ) -> Self {
         Self {
             filename,
             success: true,
@@ -64,6 +75,7 @@ impl GameLogProcessResult {
             processed_at: chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
             server_id,
             deck_identifier,
+            resolved_deck_id,
         }
     }
 
@@ -76,6 +88,7 @@ impl GameLogProcessResult {
             processed_at: chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
             server_id: None,
             deck_identifier: None,
+            resolved_deck_id: None,
         }
     }
 }
@@ -963,11 +976,19 @@ pub async fn process_new_logs_with_filter(
             Ok(response) => {
                 if response.success {
                     summary.successfully_uploaded += 1;
+                    // Same lookup upload_game_log already did internally to attach deck_id to
+                    // the upload payload — re-resolved here (rather than threading it back out
+                    // through UploadResponse) so the UI can link straight to this deck's
+                    // analysis instead of just reporting a filename.
+                    let resolved_deck_id = deck_identifier.as_deref().and_then(|name| {
+                        DeckMappings::load().ok().and_then(|m| m.get_mapping(name).cloned())
+                    });
                     summary.results.push(GameLogProcessResult::success(
                         filename.clone(),
                         log_content.file_size,
                         response.id,
                         deck_identifier,
+                        resolved_deck_id,
                     ));
                     
                     // Mark as processed
@@ -1367,12 +1388,14 @@ mod tests {
             1024,
             Some("id123".to_string()),
             Some("MyDeck".to_string()),
+            Some("deck-uuid-456".to_string()),
         );
         assert!(success.success);
         assert_eq!(success.filename, "test.json");
         assert_eq!(success.file_size, 1024);
         assert_eq!(success.server_id, Some("id123".to_string()));
         assert_eq!(success.deck_identifier, Some("MyDeck".to_string()));
+        assert_eq!(success.resolved_deck_id, Some("deck-uuid-456".to_string()));
 
         let failed = GameLogProcessResult::failed(
             "test.json".to_string(),

@@ -18,8 +18,9 @@ use crate::get_pending_command_path;
 
 #[derive(Clone, PartialEq, Eq)]
 enum Tab {
-    Home,
+    Play,
     Decks,
+    Setup,
     Settings,
 }
 
@@ -86,6 +87,74 @@ struct ForgeUpdateCheckState {
 enum ConfirmAction {
     ResetFirstRun,
     Uninstall,
+}
+
+/// The MaMo website's own base URL — the one place the Connector links back out to it.
+const MAMO_WEBSITE_URL: &str = "https://ma-mo-frontend.vercel.app";
+
+/// Drives the Play tab's persistent status strip and activity timeline. This mirrors what
+/// Connector is actually doing right now — launching, playing, scanning, uploading — rather
+/// than the activity log's scrolling lines, so it stays legible even after tabbing away, and
+/// it's the same story for a deck launched here or a playtest started from the website.
+#[derive(Clone, Default, PartialEq)]
+enum PlaySession {
+    /// Nothing in progress — idle between games (this is also where things settle back to
+    /// after an upload, so it never reads as a dead end).
+    #[default]
+    Watching,
+    /// A deck is being downloaded/prepared and Forge is about to start.
+    Launching,
+    /// Forge is open and being monitored.
+    Playing,
+    /// Forge just closed; checking what was played.
+    Scanning,
+    /// A found game log is being sent to MaMo.
+    Uploading,
+    /// Upload succeeded — `deck_id` (if the log matched a known deck) lets the UI link
+    /// straight to that deck's analysis instead of just reporting a filename.
+    Uploaded { deck_id: Option<String>, filename: String },
+    /// Upload attempted but failed, or the scan itself errored.
+    UploadIssue { message: String },
+}
+
+/// One line describing what's happening right now, for the persistent status strip shown on
+/// every tab, and whether that's an "actively doing something" state (accent dot) vs. settled
+/// (green dot) — it never goes blank, so it's always visible that Connector is still watching.
+fn play_session_strip(ps: &PlaySession) -> (String, bool) {
+    match ps {
+        PlaySession::Watching => (
+            "Watching for a game to start — keep this window open (minimized is fine) while you play".to_string(),
+            false,
+        ),
+        PlaySession::Launching => ("Launching Forge…".to_string(), true),
+        PlaySession::Playing => (
+            "Game in progress — still watching, no need to close Connector".to_string(),
+            true,
+        ),
+        PlaySession::Scanning => ("Scanning for your game log…".to_string(), true),
+        PlaySession::Uploading => ("Uploading…".to_string(), true),
+        PlaySession::Uploaded { filename, .. } => (
+            format!("Uploaded {filename} — back to watching for your next game"),
+            false,
+        ),
+        PlaySession::UploadIssue { message } => (format!("Upload issue — {message}"), false),
+    }
+}
+
+/// Index of `ps` within the linear Watching→Uploaded sequence, for coloring the Play tab's
+/// timeline cards (earlier = done, this one = active, later = pending). `UploadIssue` maps to
+/// the Uploading slot — that's the step that actually failed — and is rendered with its own
+/// error styling there instead of the normal "active" styling.
+fn play_session_step_index(ps: &PlaySession) -> usize {
+    match ps {
+        PlaySession::Watching => 0,
+        PlaySession::Launching => 1,
+        PlaySession::Playing => 2,
+        PlaySession::Scanning => 3,
+        PlaySession::Uploading => 4,
+        PlaySession::UploadIssue { .. } => 4,
+        PlaySession::Uploaded { .. } => 5,
+    }
 }
 
 /// Steps of the first-run setup wizard
@@ -208,6 +277,17 @@ fn is_newer_version(remote: &str, current: &str) -> bool {
 /// used instead.
 fn is_deckless_evaluation_action(action: &str, has_deck_reference: bool) -> bool {
     !has_deck_reference && matches!(action, "playtest" | "launch-forge" | "launchforge" | "simulate")
+}
+
+/// True for deeplink actions that actually start a play session (download-and-launch or replay),
+/// as opposed to account/deck-management actions like `auth` or `import-user-decks` — used to
+/// gate the Play tab's status strip so it only ever says "Launching" for something that's
+/// actually about to launch Forge.
+fn deeplink_starts_play_session(action: &str) -> bool {
+    matches!(
+        action,
+        "playtest" | "launch-forge" | "launchforge" | "playtest-scenario" | "replay-game" | "replaygame"
+    )
 }
 
 /// Whether a deeplink references a deck by *any* means `handle_launch_forge_with_logger`
@@ -535,6 +615,8 @@ struct LauncherApp {
     is_launching_selected_deck: Arc<Mutex<bool>>,
     /// Which destructive action is pending confirmation (None = no dialog showing)
     confirm_action: Option<ConfirmAction>,
+    /// Current phase of the play session — see `PlaySession` doc comment
+    play_session: Arc<Mutex<PlaySession>>,
 }
 
 impl LauncherApp {
@@ -605,7 +687,7 @@ impl LauncherApp {
                         activity_log.log_error(&deck_result.message);
                     }
                     if forge_result.already_running {
-                        activity_log.log_info(&forge_result.message);
+                        activity_log.log_success(&forge_result.message);
                     } else if forge_result.success {
                         activity_log.log_success(&forge_result.message);
                     } else {
@@ -614,7 +696,7 @@ impl LauncherApp {
                 }
                 CommandResult::ForgeLaunched(forge_result) => {
                     if forge_result.already_running {
-                        activity_log.log_info(&forge_result.message);
+                        activity_log.log_success(&forge_result.message);
                     } else if forge_result.success {
                         activity_log.log_success(&forge_result.message);
                     } else {
@@ -641,7 +723,7 @@ impl LauncherApp {
                 }
                 CommandResult::ReplayGameLaunched(forge_result) => {
                     if forge_result.already_running {
-                        activity_log.log_info(&forge_result.message);
+                        activity_log.log_success(&forge_result.message);
                     } else if forge_result.success {
                         activity_log.log_success(&forge_result.message);
                     } else {
@@ -658,8 +740,8 @@ impl LauncherApp {
             }
         }
 
-        // Switch to Home tab (activity panel will auto-expand for deeplink progress)
-        let initial_tab = Tab::Home;
+        // Switch to Play tab (activity panel will auto-expand for deeplink progress)
+        let initial_tab = Tab::Play;
 
         // Wizard: show on first run or when Forge is not configured
         let forge_not_configured = settings.forge_path.is_none();
@@ -751,6 +833,7 @@ impl LauncherApp {
             forge_local_decks_refresh_requested,
             is_launching_selected_deck: Arc::new(Mutex::new(false)),
             confirm_action: None,
+            play_session: Arc::new(Mutex::new(PlaySession::default())),
         }
     }
 }
@@ -902,7 +985,8 @@ impl eframe::App for LauncherApp {
                         if let Ok(mut log) = self.activity_log.lock() {
                             log.log_info("\u{1F3AE} Forge closed - triggering final gamelog scan");
                         }
-                        self.start_auto_gamelog_scan(ctx);
+                        *self.play_session.lock().unwrap() = PlaySession::Scanning;
+                        self.start_auto_gamelog_scan(ctx, true);
                     }
                     *self.forge_monitoring_since.lock().unwrap() = None;
                     self.forge_window_seen = false;
@@ -936,7 +1020,7 @@ impl eframe::App for LauncherApp {
                     if let Ok(mut log) = self.activity_log.lock() {
                         log.log_info("\u{1F504} Auto gamelog scan (periodic 5 min)");
                     }
-                    self.start_auto_gamelog_scan(ctx);
+                    self.start_auto_gamelog_scan(ctx, false);
                     self.last_auto_gamelog_scan = Some(now);
                 } else if should_scan {
                     // No token — defer silently so we don't re-check every frame.
@@ -1078,24 +1162,54 @@ impl eframe::App for LauncherApp {
                     ui.add_space(2.0);
                 }
 
-                // Tab bar — 3 tabs: Home, Decks, Settings
+                // Tab bar — 4 tabs, one per core journey: Play (start decks, launch Forge, watch
+                // an active session), Get Decks (pull someone else's list in), Setup (MaMo
+                // account + Forge + Connector updates), Settings (the rarer technical knobs).
                 ui.horizontal(|ui| {
-                    if ui.selectable_label(self.current_tab == Tab::Home, "🏠 Home").clicked() {
-                        self.current_tab = Tab::Home;
+                    if ui.selectable_label(self.current_tab == Tab::Play, "▶ Play").clicked() {
+                        self.current_tab = Tab::Play;
                     }
-                    if ui.selectable_label(self.current_tab == Tab::Decks, "📋 Decks").clicked() {
+                    if ui.selectable_label(self.current_tab == Tab::Decks, "⇩ Get Decks").clicked() {
                         self.current_tab = Tab::Decks;
+                    }
+                    if ui.selectable_label(self.current_tab == Tab::Setup, "🔧 Setup").clicked() {
+                        self.current_tab = Tab::Setup;
                     }
                     if ui.selectable_label(self.current_tab == Tab::Settings, "⚙ Settings").clicked() {
                         self.current_tab = Tab::Settings;
                     }
                 });
                 ui.separator();
-                
+
+                // Persistent status strip — visible on every tab, not just Play, and never
+                // blank, so it's always clear Connector needs to stay open to keep syncing.
+                {
+                    let ps = self.play_session.lock().unwrap().clone();
+                    let (text, is_active) = play_session_strip(&ps);
+                    let dot_color = if is_active {
+                        egui::Color32::from_rgb(76, 92, 196)
+                    } else {
+                        egui::Color32::from_rgb(23, 145, 90)
+                    };
+                    egui::Frame::default()
+                        .fill(egui::Color32::from_rgb(238, 236, 247))
+                        .inner_margin(egui::Margin::symmetric(10.0, 5.0))
+                        .show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                let (rect, _) = ui.allocate_exact_size(egui::vec2(8.0, 8.0), egui::Sense::hover());
+                                ui.painter().circle_filled(rect.center(), 4.0, dot_color);
+                                ui.label(egui::RichText::new(text).small().color(egui::Color32::from_rgb(70, 65, 105)));
+                            });
+                        });
+                }
+                ui.add_space(4.0);
+                ui.separator();
+
                 // Tab content
                 match self.current_tab {
-                    Tab::Home => self.render_home_tab(ui, ctx),
+                    Tab::Play => self.render_play_tab(ui, ctx),
                     Tab::Decks => self.render_decks_tab(ui, ctx),
+                    Tab::Setup => self.render_setup_tab(ui, ctx),
                     Tab::Settings => self.render_settings_tab(ui, ctx),
                 }
             });
@@ -1133,10 +1247,14 @@ impl LauncherApp {
             if let Ok(mut log) = self.activity_log.lock() {
                 log.log_info("No deck specified — pick one below to launch Forge.");
             }
-            self.current_tab = Tab::Home;
+            self.current_tab = Tab::Play;
             self.decks_fetch_requested.store(true, Ordering::Relaxed);
             ctx.request_repaint();
             return;
+        }
+
+        if deeplink_starts_play_session(&deeplink.action) {
+            *self.play_session.lock().unwrap() = PlaySession::Launching;
         }
 
         // Handle the command in a background thread
@@ -1146,6 +1264,7 @@ impl LauncherApp {
         let activity_log_for_polling = self.activity_log.clone();
         let forge_pid = self.forge_pid.clone();
         let forge_monitoring_since = self.forge_monitoring_since.clone();
+        let play_session = Arc::clone(&self.play_session);
         let ctx_clone = ctx.clone();
         let ctx_for_polling = ctx.clone();
         let wizard_requested = Arc::clone(&self.wizard_requested);
@@ -1205,7 +1324,7 @@ impl LauncherApp {
                             log.log_error(&deck_result.message);
                         }
                         if forge_result.already_running {
-                            log.log_info(&forge_result.message);
+                            log.log_success(&forge_result.message);
                         } else if forge_result.success {
                             log.log_success(&forge_result.message);
                         } else {
@@ -1215,7 +1334,7 @@ impl LauncherApp {
                     }
                     commands::CommandResult::ForgeLaunched(forge_result) => {
                         if forge_result.already_running {
-                            log.log_info(&forge_result.message);
+                            log.log_success(&forge_result.message);
                         } else if forge_result.success {
                             log.log_success(&forge_result.message);
                         } else {
@@ -1243,7 +1362,7 @@ impl LauncherApp {
                     }
                     commands::CommandResult::ReplayGameLaunched(forge_result) => {
                         if forge_result.already_running {
-                            log.log_info(&forge_result.message);
+                            log.log_success(&forge_result.message);
                         } else if forge_result.success {
                             log.log_success(&forge_result.message);
                         } else {
@@ -1261,32 +1380,40 @@ impl LauncherApp {
                 }
             }
 
-            // Track Forge PID for auto gamelog scanning
+            // Track Forge PID for auto gamelog scanning, and move the play session forward —
+            // Playing for a genuine fresh launch, back to Watching for everything else (already
+            // running, a failed launch, or a command that was never about playing in the first
+            // place, e.g. `auth`/`import-user-decks`).
             match &result {
                 commands::CommandResult::DeckCreatedAndLaunched(_, forge_result) if forge_result.success => {
                     if let Some(pid) = forge_result.pid {
                         *forge_pid.lock().unwrap() = Some(pid);
                         *forge_monitoring_since.lock().unwrap() = Some(Instant::now());
                     }
+                    *play_session.lock().unwrap() = if forge_result.already_running { PlaySession::Watching } else { PlaySession::Playing };
                 }
                 commands::CommandResult::ForgeLaunched(forge_result) if forge_result.success => {
                     if let Some(pid) = forge_result.pid {
                         *forge_pid.lock().unwrap() = Some(pid);
                         *forge_monitoring_since.lock().unwrap() = Some(Instant::now());
                     }
+                    *play_session.lock().unwrap() = if forge_result.already_running { PlaySession::Watching } else { PlaySession::Playing };
                 }
                 commands::CommandResult::ReplayGameLaunched(forge_result) if forge_result.success => {
                     if let Some(pid) = forge_result.pid {
                         *forge_pid.lock().unwrap() = Some(pid);
                         *forge_monitoring_since.lock().unwrap() = Some(Instant::now());
                     }
+                    *play_session.lock().unwrap() = if forge_result.already_running { PlaySession::Watching } else { PlaySession::Playing };
                 }
-                _ => {}
+                _ => {
+                    *play_session.lock().unwrap() = PlaySession::Watching;
+                }
             }
-            
+
             // Handle auth token saved result
             if let commands::CommandResult::AuthTokenSaved(ref token) = result {
-                info!("Auth token saved via initial deeplink: {}", 
+                info!("Auth token saved via initial deeplink: {}",
                     if token.len() > 20 { format!("{}...", &token[..20]) } else { token.clone() });
                 
                 // Reload settings from disk to get the updated auth_token
@@ -1353,10 +1480,14 @@ impl LauncherApp {
                             if let Ok(mut log) = self.activity_log.lock() {
                                 log.log_info("No deck specified — pick one below to launch Forge.");
                             }
-                            self.current_tab = Tab::Home;
+                            self.current_tab = Tab::Play;
                             self.decks_fetch_requested.store(true, Ordering::Relaxed);
                             ctx.request_repaint();
                         } else {
+                        if deeplink_starts_play_session(&deeplink.action) {
+                            *self.play_session.lock().unwrap() = PlaySession::Launching;
+                        }
+
                         // Create a log collector for real-time progress updates
                         let log_collector: SharedLogCollector = Arc::new(Mutex::new(Vec::new()));
 
@@ -1367,6 +1498,7 @@ impl LauncherApp {
                         let activity_log_for_polling = self.activity_log.clone();
                         let forge_pid = self.forge_pid.clone();
                         let forge_monitoring_since = self.forge_monitoring_since.clone();
+                        let play_session = Arc::clone(&self.play_session);
                         let log_collector_for_command = log_collector.clone();
                         let ctx_clone = ctx.clone();
                         let ctx_for_polling = ctx.clone();
@@ -1423,7 +1555,7 @@ impl LauncherApp {
                                             log.log_error(&deck_result.message);
                                         }
                                         if forge_result.already_running {
-                                            log.log_info(&forge_result.message);
+                                            log.log_success(&forge_result.message);
                                         } else if forge_result.success {
                                             log.log_success(&forge_result.message);
                                         } else {
@@ -1433,7 +1565,7 @@ impl LauncherApp {
                                     }
                                     commands::CommandResult::ForgeLaunched(forge_result) => {
                                         if forge_result.already_running {
-                                            log.log_info(&forge_result.message);
+                                            log.log_success(&forge_result.message);
                                         } else if forge_result.success {
                                             log.log_success(&forge_result.message);
                                         } else {
@@ -1461,7 +1593,7 @@ impl LauncherApp {
                                     }
                                     commands::CommandResult::ReplayGameLaunched(forge_result) => {
                                         if forge_result.already_running {
-                                            log.log_info(&forge_result.message);
+                                            log.log_success(&forge_result.message);
                                         } else if forge_result.success {
                                             log.log_success(&forge_result.message);
                                         } else {
@@ -1479,32 +1611,38 @@ impl LauncherApp {
                                 }
                             }
 
-                            // Track Forge PID for auto gamelog scanning
+                            // Track Forge PID for auto gamelog scanning, and move the play
+                            // session forward the same way process_deeplink_with_progress does.
                             match &result {
                                 commands::CommandResult::DeckCreatedAndLaunched(_, forge_result) if forge_result.success => {
                                     if let Some(pid) = forge_result.pid {
                                         *forge_pid.lock().unwrap() = Some(pid);
                                         *forge_monitoring_since.lock().unwrap() = Some(Instant::now());
                                     }
+                                    *play_session.lock().unwrap() = if forge_result.already_running { PlaySession::Watching } else { PlaySession::Playing };
                                 }
                                 commands::CommandResult::ForgeLaunched(forge_result) if forge_result.success => {
                                     if let Some(pid) = forge_result.pid {
                                         *forge_pid.lock().unwrap() = Some(pid);
                                         *forge_monitoring_since.lock().unwrap() = Some(Instant::now());
                                     }
+                                    *play_session.lock().unwrap() = if forge_result.already_running { PlaySession::Watching } else { PlaySession::Playing };
                                 }
                                 commands::CommandResult::ReplayGameLaunched(forge_result) if forge_result.success => {
                                     if let Some(pid) = forge_result.pid {
                                         *forge_pid.lock().unwrap() = Some(pid);
                                         *forge_monitoring_since.lock().unwrap() = Some(Instant::now());
                                     }
+                                    *play_session.lock().unwrap() = if forge_result.already_running { PlaySession::Watching } else { PlaySession::Playing };
                                 }
-                                _ => {}
+                                _ => {
+                                    *play_session.lock().unwrap() = PlaySession::Watching;
+                                }
                             }
-                            
+
                             // Handle auth token saved result
                             if let commands::CommandResult::AuthTokenSaved(ref token) = result {
-                                info!("Auth token saved via pending command: {}", 
+                                info!("Auth token saved via pending command: {}",
                                     if token.len() > 20 { format!("{}...", &token[..20]) } else { token.clone() });
                                 
                                 // Reload settings from disk to get the updated auth_token
@@ -2303,12 +2441,14 @@ impl LauncherApp {
     /// download-then-launch flow in `commands.rs::handle_launch_forge_with_logger`.
     fn launch_account_deck_async(&mut self, deck: crate::gamelog::UserDeck, ctx: &egui::Context) {
         *self.is_launching_selected_deck.lock().unwrap() = true;
+        *self.play_session.lock().unwrap() = PlaySession::Launching;
 
         let activity_log = self.activity_log.clone();
         let forge_pid = self.forge_pid.clone();
         let forge_monitoring_since = self.forge_monitoring_since.clone();
         let is_launching = self.is_launching_selected_deck.clone();
         let refresh_requested = self.forge_local_decks_refresh_requested.clone();
+        let play_session = Arc::clone(&self.play_session);
         let ctx_clone = ctx.clone();
 
         if let Ok(mut log) = self.activity_log.lock() {
@@ -2330,6 +2470,7 @@ impl LauncherApp {
                         log.log_error(format!("Deck download failed: {}", deck_result.message));
                     }
                     *is_launching.lock().unwrap() = false;
+                    *play_session.lock().unwrap() = PlaySession::Watching;
                     ctx_clone.request_repaint();
                     return;
                 }
@@ -2338,6 +2479,7 @@ impl LauncherApp {
                         log.log_error(format!("Failed to download deck: {}", e));
                     }
                     *is_launching.lock().unwrap() = false;
+                    *play_session.lock().unwrap() = PlaySession::Watching;
                     ctx_clone.request_repaint();
                     return;
                 }
@@ -2361,11 +2503,13 @@ impl LauncherApp {
                         // those two fields behind Arc<Mutex<_>> like forge_pid if this becomes a
                         // real problem.
                     }
+                    *play_session.lock().unwrap() = if result.success { PlaySession::Playing } else { PlaySession::Watching };
                 }
                 Err(e) => {
                     if let Ok(mut log) = activity_log.lock() {
                         log.log_error(format!("Failed to launch Forge: {}", e));
                     }
+                    *play_session.lock().unwrap() = PlaySession::Watching;
                 }
             }
 
@@ -2375,9 +2519,10 @@ impl LauncherApp {
         });
     }
 
-    fn render_home_tab(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+    fn render_play_tab(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         egui::ScrollArea::vertical().show(ui, |ui| {
-            // Connection status section
+            // Compact connection status — full account/Forge management lives in Setup now;
+            // this is just enough to tell at a glance whether Play is ready to use.
             ui.group(|ui| {
                 ui.horizontal(|ui| {
                     let has_token = {
@@ -2388,13 +2533,8 @@ impl LauncherApp {
                         ui.label(egui::RichText::new("● Connected to MaMo").color(egui::Color32::from_rgb(0, 128, 0)));
                     } else {
                         ui.label(egui::RichText::new("● Not connected").color(egui::Color32::from_rgb(176, 0, 32)));
-                        // Open browser to MaMo — the "Connect Connector" button is in the
-                        // profile dropdown (top-right person icon) on every page.
-                        if ui.hyperlink_to(
-                            "Connect on MaMo →",
-                            "https://ma-mo-frontend.vercel.app",
-                        ).on_hover_text("Opens MaMo in your browser — click the profile icon (top-right) → \"Connect Connector\"").clicked() {
-                            // hyperlink_to already opens the URL; nothing extra needed here
+                        if ui.small_button("Connect →").clicked() {
+                            self.current_tab = Tab::Setup;
                         }
                     }
 
@@ -2418,9 +2558,10 @@ impl LauncherApp {
 
             ui.add_space(10.0);
 
-            // Quick Actions section
+            // Your decks — standalone start (pick a deck, launch Forge) plus manual log
+            // upload/retry, independent of anything triggered from the website.
             ui.group(|ui| {
-                ui.label(egui::RichText::new("Quick Actions").strong());
+                ui.label(egui::RichText::new("Your decks").strong());
                 ui.add_space(5.0);
 
                 // Lazy-load local Forge decks on first render
@@ -2455,7 +2596,7 @@ impl LauncherApp {
                     } else {
                         ui.add_enabled(false, egui::Button::new("🎮 Launch Forge"));
                         if ui.small_button("Configure Forge →").clicked() {
-                            self.current_tab = Tab::Settings;
+                            self.current_tab = Tab::Setup;
                         }
                     }
 
@@ -2544,87 +2685,116 @@ impl LauncherApp {
 
             ui.add_space(10.0);
 
-            // Forge monitoring status
-            {
-                let monitoring = self.forge_monitoring_since.lock().unwrap().is_some();
-                if monitoring {
+            let directory_valid = self.gamelog_state.lock().unwrap().directory_valid;
+            if !directory_valid {
+                ui.group(|ui| {
                     ui.horizontal(|ui| {
-                        ui.label(egui::RichText::new("🎮 Forge running").color(egui::Color32::from_rgb(0, 128, 0)));
-                        ui.label(egui::RichText::new("— auto-scanning active").small().color(egui::Color32::GRAY));
-                    });
-                    ui.add_space(5.0);
-                }
-            }
-
-            // Game Logs summary section
-            ui.group(|ui| {
-                ui.label(egui::RichText::new("Game Logs").strong());
-                ui.add_space(5.0);
-
-                let (directory_valid, processed_count, last_summary, status_message) = {
-                    let state = self.gamelog_state.lock().unwrap();
-                    (
-                        state.directory_valid,
-                        state.processed_files.len(),
-                        state.last_scan_summary.clone(),
-                        state.status_message.clone(),
-                    )
-                };
-
-                if !directory_valid {
-                    ui.horizontal(|ui| {
-                        ui.label(egui::RichText::new("⚠ Log directory not configured").color(egui::Color32::from_rgb(196, 112, 0)));
+                        ui.label(egui::RichText::new("⚠ Game log folder not configured").color(egui::Color32::from_rgb(196, 112, 0)));
                         if ui.small_button("Configure →").clicked() {
                             self.current_tab = Tab::Settings;
                         }
                     });
-                } else {
-                    ui.label(format!("Total files processed: {}", processed_count));
+                    ui.label(egui::RichText::new("Uploads (and the Activity below) can't work until this is set.").small().color(egui::Color32::GRAY));
+                });
+                ui.add_space(10.0);
+            }
 
-                    if let Some(ref summary) = last_summary {
-                        ui.horizontal(|ui| {
-                            ui.label(egui::RichText::new(format!("Last scan: {} new, {} uploaded, {} failed",
-                                summary.new_files, summary.successfully_uploaded, summary.failed_uploads))
-                                .small());
+            // Activity — the play-session timeline (journey 2's centerpiece). Always shows the
+            // same six steps so the whole lifecycle is visible at a glance; the one matching
+            // what's happening right now is highlighted, earlier ones are marked done, later
+            // ones stay pending. This is the same story whether the session was started here or
+            // from the MaMo website.
+            ui.group(|ui| {
+                ui.label(egui::RichText::new("Activity").strong());
+                ui.label(
+                    egui::RichText::new(
+                        "Whatever you launch — from here or from the MaMo website — shows up \
+                         here, through to the finished game analysis. This keeps going for as \
+                         many games as you play in one sitting.",
+                    )
+                    .small()
+                    .color(egui::Color32::GRAY),
+                );
+                ui.add_space(6.0);
+
+                let ps = self.play_session.lock().unwrap().clone();
+                let current = play_session_step_index(&ps);
+                let is_issue = matches!(ps, PlaySession::UploadIssue { .. });
+
+                let steps: [(&str, &str); 6] = [
+                    ("◌ Watching for a game to start", "Nothing to do — launch a deck above, or start one from the MaMo website"),
+                    ("① Launching Forge", "Preparing your deck"),
+                    ("② Game in progress", "Forge is running — we'll pick this up when you're done"),
+                    ("③ Scanning for your game log", "Forge closed — checking what you played"),
+                    ("④ Uploading", "Sending your game log to MaMo"),
+                    ("✓ Uploaded — analysis ready", "Play a deck to see this update"),
+                ];
+
+                for (i, (title, default_sub)) in steps.into_iter().enumerate() {
+                    let (fill, stroke, text_color) = if is_issue && i == 4 {
+                        (egui::Color32::from_rgb(251, 228, 226), egui::Color32::from_rgb(211, 55, 47), egui::Color32::from_rgb(140, 30, 25))
+                    } else if i < current {
+                        (egui::Color32::from_rgb(227, 247, 236), egui::Color32::from_rgb(23, 145, 90), egui::Color32::from_rgb(15, 90, 60))
+                    } else if i == current {
+                        (egui::Color32::from_rgb(226, 222, 250), egui::Color32::from_rgb(76, 92, 196), egui::Color32::BLACK)
+                    } else {
+                        (egui::Color32::from_rgb(246, 245, 250), egui::Color32::from_rgb(216, 211, 238), egui::Color32::GRAY)
+                    };
+
+                    egui::Frame::default()
+                        .fill(fill)
+                        .stroke(egui::Stroke::new(1.0, stroke))
+                        .inner_margin(egui::Margin::same(10.0))
+                        .rounding(6.0)
+                        .show(ui, |ui| {
+                            ui.label(egui::RichText::new(title).strong().color(text_color));
+                            if is_issue && i == 4 {
+                                if let PlaySession::UploadIssue { ref message } = ps {
+                                    ui.label(egui::RichText::new(message).small().color(text_color));
+                                }
+                            } else if i == 5 {
+                                if let PlaySession::Uploaded { ref deck_id, ref filename } = ps {
+                                    ui.label(egui::RichText::new(filename).small().color(text_color));
+                                    if let Some(id) = deck_id {
+                                        if ui.small_button("View analysis on MaMo →").clicked() {
+                                            let url = format!(
+                                                "{}/DeckBuilding/playbook?deckId={}&tab=evaluation",
+                                                MAMO_WEBSITE_URL, id
+                                            );
+                                            let _ = std::process::Command::new("cmd").args(["/c", "start", &url]).spawn();
+                                        }
+                                    } else {
+                                        ui.label(
+                                            egui::RichText::new("Couldn't match this to a deck — map it under Settings → Deck Mapping")
+                                                .small()
+                                                .color(egui::Color32::GRAY),
+                                        );
+                                    }
+                                } else {
+                                    ui.label(egui::RichText::new(default_sub).small().color(text_color));
+                                }
+                            } else {
+                                ui.label(egui::RichText::new(default_sub).small().color(text_color));
+                            }
                         });
-                    }
-
-                    if let Some(ref msg) = status_message {
-                        let color = if msg.starts_with("Error") || (msg.contains("failed") && !msg.contains("0 failed")) {
-                            egui::Color32::from_rgb(176, 0, 32)
-                        } else if msg.contains("uploaded") || msg.contains("complete") || msg.contains("Success") {
-                            egui::Color32::from_rgb(0, 128, 0)
-                        } else {
-                            egui::Color32::DARK_GRAY
-                        };
-                        ui.label(egui::RichText::new(msg).small().color(color));
-                    }
+                    ui.add_space(6.0);
                 }
             });
 
             ui.add_space(10.0);
 
-            // Scan results (if any from last upload)
+            // Per-file detail for the last scan — secondary to the Activity timeline above
+            // (which only ever reflects the single most relevant file), so a batch of several
+            // logs found at once is still fully visible here, just tucked behind a disclosure.
             let scan_results: Vec<GameLogProcessResult> = {
                 let state = self.gamelog_state.lock().unwrap();
                 state.scan_results.clone()
             };
 
             if !scan_results.is_empty() {
-                ui.group(|ui| {
-                    ui.label(egui::RichText::new("📋 Last Upload Results").strong());
-                    ui.add_space(5.0);
-
-                    let successful = scan_results.iter().filter(|r| r.success).count();
-                    let failed = scan_results.len() - successful;
-
-                    ui.horizontal(|ui| {
-                        ui.label(egui::RichText::new(format!("✓ {} uploaded", successful)).color(egui::Color32::from_rgb(0, 128, 0)));
-                        if failed > 0 {
-                            ui.label(egui::RichText::new(format!("✗ {} failed", failed)).color(egui::Color32::from_rgb(176, 0, 32)));
-                        }
-                    });
-
+                let successful = scan_results.iter().filter(|r| r.success).count();
+                let failed = scan_results.len() - successful;
+                ui.collapsing(format!("Recent uploads ({successful} uploaded, {failed} failed)"), |ui| {
                     egui::ScrollArea::vertical()
                         .id_source("home_scan_results")
                         .max_height(150.0)
@@ -2647,9 +2817,10 @@ impl LauncherApp {
                             }
                         });
                 });
+                ui.add_space(6.0);
             }
 
-            ui.add_space(10.0);
+            ui.add_space(4.0);
 
             // Build info (compact)
             ui.horizontal(|ui| {
@@ -3756,8 +3927,9 @@ impl LauncherApp {
     fn start_gamelog_scan(&mut self, ctx: &egui::Context) {
         let gamelog_state = Arc::clone(&self.gamelog_state);
         let settings = Arc::clone(&self.settings);
+        let play_session = Arc::clone(&self.play_session);
         let ctx_clone = ctx.clone();
-        
+
         // Get filter options
         let filter_options = {
             let state = gamelog_state.lock().unwrap();
@@ -3774,7 +3946,8 @@ impl LauncherApp {
             state.status_message = Some("Scanning for new game logs...".to_string());
             state.scan_results.clear();
         }
-        
+        *play_session.lock().unwrap() = PlaySession::Uploading;
+
         tokio::spawn(async move {
             let config = {
                 let settings = settings.lock().unwrap();
@@ -3813,15 +3986,29 @@ impl LauncherApp {
                                 summary.new_files, summary.successfully_uploaded, summary.failed_uploads
                             ));
                         }
-                        
+
+                        *play_session.lock().unwrap() = if let Some(uploaded) =
+                            summary.results.iter().find(|r| r.success)
+                        {
+                            PlaySession::Uploaded {
+                                deck_id: uploaded.resolved_deck_id.clone(),
+                                filename: uploaded.filename.clone(),
+                            }
+                        } else if let Some(failed) = summary.results.iter().find(|r| !r.success) {
+                            PlaySession::UploadIssue { message: failed.message.clone() }
+                        } else {
+                            PlaySession::Watching
+                        };
+
                         state.last_scan_summary = Some(summary);
                     }
                     Err(e) => {
                         state.status_message = Some(format!("Error: {}", e));
+                        *play_session.lock().unwrap() = PlaySession::UploadIssue { message: e.to_string() };
                     }
                 }
             }
-            
+
             ctx_clone.request_repaint();
         });
     }
@@ -3874,37 +4061,19 @@ impl LauncherApp {
         });
     }
 
-    fn toggle_background_scanning(&mut self, enabled: bool) {
-        // Update state
-        {
-            let mut state = self.gamelog_state.lock().unwrap();
-            state.background_enabled = enabled;
-        }
-        
-        // Save to settings
-        {
-            let mut settings = self.settings.lock().unwrap();
-            settings.gamelog_config.background_scan_enabled = enabled;
-            let _ = settings.save();
-        }
-        
-        // Note: Actual background scanning would require a separate thread/task
-        // that periodically calls process_new_logs. For now, this just saves the preference.
-        let mut state = self.gamelog_state.lock().unwrap();
-        if enabled {
-            state.status_message = Some("Background scanning enabled. Use 'Scan Now' to manually trigger.".to_string());
-        } else {
-            state.status_message = Some("Background scanning disabled.".to_string());
-        }
-    }
-
     /// Start an automatic gamelog scan (no filters, triggered by Forge process tracking)
-    fn start_auto_gamelog_scan(&mut self, ctx: &egui::Context) {
+    /// `is_final_scan` distinguishes the "Forge just closed" scan (which should drive the Play
+    /// tab's timeline through Scanning/Uploading/Uploaded) from the periodic every-5-minutes
+    /// scan that runs *while Forge is still open* — that one is incidental housekeeping for a
+    /// multi-game sitting, not "the game just ended", so it must not yank the strip away from
+    /// Playing while the game is still genuinely in progress.
+    fn start_auto_gamelog_scan(&mut self, ctx: &egui::Context, is_final_scan: bool) {
         let gamelog_state = Arc::clone(&self.gamelog_state);
         let settings = Arc::clone(&self.settings);
         let activity_log = Arc::clone(&self.activity_log);
+        let play_session = Arc::clone(&self.play_session);
         let ctx_clone = ctx.clone();
-        
+
         // Don't scan if already scanning
         {
             let state = gamelog_state.lock().unwrap();
@@ -3912,13 +4081,13 @@ impl LauncherApp {
                 return;
             }
         }
-        
+
         // Mark as scanning
         {
             let mut state = gamelog_state.lock().unwrap();
             state.is_scanning = true;
         }
-        
+
         // No filters for auto-scan - scan all new logs
         let filter_options = GameLogFilterOptions {
             days_filter: 0,
@@ -3992,17 +4161,36 @@ impl LauncherApp {
                                 }
                             }
                         }
-                        
+
+                        if is_final_scan {
+                            *play_session.lock().unwrap() = if let Some(uploaded) =
+                                summary.results.iter().find(|r| r.success)
+                            {
+                                PlaySession::Uploaded {
+                                    deck_id: uploaded.resolved_deck_id.clone(),
+                                    filename: uploaded.filename.clone(),
+                                }
+                            } else if let Some(failed) = summary.results.iter().find(|r| !r.success) {
+                                PlaySession::UploadIssue { message: failed.message.clone() }
+                            } else {
+                                // Nothing new found this scan — back to idle.
+                                PlaySession::Watching
+                            };
+                        }
+
                         state.last_scan_summary = Some(summary);
                     }
                     Err(e) => {
                         if let Ok(mut log) = activity_log.lock() {
                             log.log_error(format!("Auto-scan error: {}", e));
                         }
+                        if is_final_scan {
+                            *play_session.lock().unwrap() = PlaySession::UploadIssue { message: e.to_string() };
+                        }
                     }
                 }
             }
-            
+
             ctx_clone.request_repaint();
         });
     }
@@ -4256,301 +4444,353 @@ impl LauncherApp {
         });
     }
 
+    // ==================== Setup Tab ====================
+    // Journey 1: connect your MaMo account, configure Forge, keep both Forge and the
+    // Connector itself up to date. Everything here is account/install management — the rarer,
+    // "set it up once and mostly forget it" side of things, as opposed to Play's day-to-day use.
+
+    fn render_setup_tab(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        egui::ScrollArea::vertical().show(ui, |ui| {
+            let (forge_path_input, forge_path_valid, has_token, status_message) = {
+                let s = self.settings_state.lock().unwrap();
+                (s.forge_path_input.clone(), s.forge_path_valid, !s.auth_token_input.is_empty(), s.status_message.clone())
+            };
+
+            // ── MaMo account ──────────────────────────────────────────────
+            ui.group(|ui| {
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new("MaMo account").strong());
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if has_token {
+                            ui.label(egui::RichText::new("✓ Connected").color(egui::Color32::from_rgb(0, 128, 0)));
+                        } else {
+                            ui.label(egui::RichText::new("Not connected").color(egui::Color32::from_rgb(176, 0, 32)));
+                        }
+                    });
+                });
+                ui.add_space(6.0);
+
+                if has_token {
+                    ui.label("Game logs upload automatically, and your MaMo decks show up in Play.");
+                    ui.add_space(5.0);
+                    if ui.button("Disconnect").clicked() {
+                        {
+                            let mut state = self.settings_state.lock().unwrap();
+                            state.auth_token_input.clear();
+                        }
+                        self.save_auth_token();
+                    }
+                } else {
+                    ui.label("On the MaMo website, click the profile icon (top-right) → \"Connect Connector\".");
+                    if ui.hyperlink_to("Connect to MaMo →", MAMO_WEBSITE_URL)
+                        .on_hover_text("Opens MaMo in your browser")
+                        .clicked()
+                    {
+                        // hyperlink_to already opens the URL
+                    }
+                    ui.add_space(8.0);
+                    ui.label(egui::RichText::new("Or paste a token directly:").small().weak());
+                    ui.horizontal(|ui| {
+                        let mut token_input = {
+                            let state = self.settings_state.lock().unwrap();
+                            state.auth_token_input.clone()
+                        };
+                        let response = ui.add(
+                            egui::TextEdit::singleline(&mut token_input)
+                                .desired_width(320.0)
+                                .password(true)
+                                .hint_text("Paste token here"),
+                        );
+                        if response.changed() {
+                            let mut state = self.settings_state.lock().unwrap();
+                            state.auth_token_input = token_input;
+                        }
+                        if ui.button("💾 Save").clicked() {
+                            self.save_auth_token();
+                        }
+                    });
+                }
+            });
+
+            ui.add_space(12.0);
+
+            // ── Forge ──────────────────────────────────────────────────────
+            ui.group(|ui| {
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new("Forge").strong());
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if forge_path_valid {
+                            let (forge_update_asset, forge_update_dismissed) = {
+                                let s = self.forge_update_check.lock().unwrap();
+                                (s.available_asset_name.clone(), s.dismissed)
+                            };
+                            if forge_update_asset.is_some() && !forge_update_dismissed {
+                                ui.label(egui::RichText::new("⬆ Update available").color(egui::Color32::from_rgb(0, 90, 158)));
+                            } else {
+                                ui.label(egui::RichText::new("✓ Configured").color(egui::Color32::from_rgb(0, 128, 0)));
+                            }
+                        } else {
+                            ui.label(egui::RichText::new("Not configured").color(egui::Color32::from_rgb(176, 0, 32)));
+                        }
+                    });
+                });
+                ui.add_space(6.0);
+
+                ui.horizontal(|ui| {
+                    ui.label("Path:");
+                    let mut path_input = forge_path_input.clone();
+                    let response = ui.add(
+                        egui::TextEdit::singleline(&mut path_input)
+                            .desired_width(360.0)
+                            .hint_text("Path to forge.exe, .jar, Forge.app, or a Forge directory"),
+                    );
+                    if response.changed() {
+                        let mut state = self.settings_state.lock().unwrap();
+                        state.forge_path_input = path_input.clone();
+                        state.forge_path_valid = validate_forge_path(&path_input);
+                    }
+                    if !forge_path_input.is_empty() {
+                        if forge_path_valid {
+                            ui.label(egui::RichText::new("✓").color(egui::Color32::from_rgb(0, 128, 0)));
+                        } else {
+                            ui.label(egui::RichText::new("✗").color(egui::Color32::from_rgb(176, 0, 32)));
+                        }
+                    }
+                });
+                ui.add_space(5.0);
+                ui.horizontal(|ui| {
+                    if ui.button("🔍 Auto-detect").clicked() {
+                        if let Some(path) = get_default_forge_path() {
+                            let path_str = path.to_string_lossy().to_string();
+                            let mut state = self.settings_state.lock().unwrap();
+                            state.forge_path_input = path_str.clone();
+                            state.forge_path_valid = true;
+                            state.status_message = Some(format!("Found Forge at: {}", path_str));
+                        } else {
+                            let mut state = self.settings_state.lock().unwrap();
+                            state.status_message = Some("Could not find Forge installation automatically.".to_string());
+                        }
+                    }
+                    if ui.button("📁 Browse…").clicked() {
+                        let dialog = FileDialog::new()
+                            .add_filter("Forge Executable", &["exe", "jar", "bat"])
+                            .add_filter("All Files", &["*"])
+                            .set_title("Select Forge Executable");
+                        if let Some(path) = dialog.pick_file() {
+                            let path_str = path.to_string_lossy().to_string();
+                            let is_valid = validate_forge_path(&path_str);
+                            let mut state = self.settings_state.lock().unwrap();
+                            state.forge_path_input = path_str.clone();
+                            state.forge_path_valid = is_valid;
+                            state.status_message = Some(if is_valid {
+                                format!("Selected: {}", path_str)
+                            } else {
+                                format!("Warning: {} may not be a valid Forge executable", path_str)
+                            });
+                        }
+                    }
+                    if ui.button("📂 Folder…").clicked() {
+                        if let Some(folder) = rfd::FileDialog::new()
+                            .set_title("Select Forge Directory (e.g. forge-gui-desktop/target/)")
+                            .pick_folder()
+                        {
+                            let path_str = folder.to_string_lossy().to_string();
+                            let is_valid = validate_forge_path(&path_str);
+                            let mut state = self.settings_state.lock().unwrap();
+                            state.forge_path_input = path_str.clone();
+                            state.forge_path_valid = is_valid;
+                            state.status_message = Some(if is_valid {
+                                resolve_latest_forge_jar(&folder)
+                                    .map(|jar| format!("Folder OK — will launch: {}", jar.file_name().unwrap_or_default().to_string_lossy()))
+                                    .unwrap_or_else(|| "Folder OK".to_string())
+                            } else {
+                                format!("No forge-gui-desktop JAR found in: {}", path_str)
+                            });
+                        }
+                    }
+                    if ui.button("💾 Save").clicked() {
+                        self.save_forge_settings();
+                    }
+                });
+
+                if forge_path_valid {
+                    let p = std::path::Path::new(&forge_path_input);
+                    if p.is_dir() {
+                        if let Some(jar) = resolve_latest_forge_jar(p) {
+                            ui.add_space(3.0);
+                            ui.label(
+                                egui::RichText::new(format!("→  {}", jar.file_name().unwrap_or_default().to_string_lossy()))
+                                    .color(egui::Color32::from_rgb(80, 130, 200))
+                                    .small(),
+                            );
+                        }
+                    }
+                }
+
+                ui.add_space(5.0);
+                let forge_auto_launch = self.settings_state.lock().unwrap().forge_auto_launch;
+                let mut auto_launch = forge_auto_launch;
+                if ui.checkbox(&mut auto_launch, "Auto-launch Forge after downloading a deck").changed() {
+                    self.settings_state.lock().unwrap().forge_auto_launch = auto_launch;
+                }
+
+                ui.add_space(5.0);
+                ui.horizontal(|ui| {
+                    if ui.add_enabled(forge_path_valid, egui::Button::new("🚀 Test Launch Forge")).clicked() {
+                        match launch_forge_from_settings(None, None) {
+                            Ok(result) => self.settings_state.lock().unwrap().status_message = Some(result.message),
+                            Err(e) => self.settings_state.lock().unwrap().status_message = Some(format!("Launch failed: {}", e)),
+                        }
+                    }
+                    if ui.button("Re-run setup").clicked() {
+                        self.wizard.step = WizardStep::Welcome;
+                        self.show_setup_wizard = true;
+                    }
+                });
+
+                // Update controls for a Connector-managed Forge install — mirrors the top
+                // banner but stays here, non-dismissible, so it's never missed for long.
+                if is_connector_managed_forge(&forge_path_input, &forge_download_dir()) {
+                    let (forge_update_asset, forge_update_dismissed) = {
+                        let s = self.forge_update_check.lock().unwrap();
+                        (s.available_asset_name.clone(), s.dismissed)
+                    };
+                    let forge_update_progress = self.forge_update_progress.lock().unwrap().clone();
+                    if forge_update_progress.is_some() || (forge_update_asset.is_some() && !forge_update_dismissed) {
+                        ui.add_space(8.0);
+                        egui::Frame::default()
+                            .fill(egui::Color32::from_rgb(205, 232, 255))
+                            .inner_margin(egui::Margin::same(8.0))
+                            .rounding(6.0)
+                            .show(ui, |ui| {
+                                if let Some(ref prog) = forge_update_progress {
+                                    if let Some(ref err) = prog.error {
+                                        ui.label(egui::RichText::new(format!("✗ MaMo Forge update failed: {err}")).color(egui::Color32::from_rgb(176, 0, 32)));
+                                    } else {
+                                        ui.horizontal(|ui| {
+                                            ui.label(egui::RichText::new(format!("⬆ Updating MaMo Forge… {}", format_download_status(prog.bytes_done, prog.total_bytes))).color(egui::Color32::from_rgb(0, 90, 158)));
+                                            if !prog.finished && ui.small_button("Cancel").clicked() {
+                                                self.forge_update_cancelled.store(true, Ordering::Relaxed);
+                                            }
+                                        });
+                                    }
+                                } else if let Some(ref asset_name) = forge_update_asset {
+                                    ui.horizontal(|ui| {
+                                        ui.label(egui::RichText::new(format!("⬆ MaMo Forge update available ({asset_name})")).color(egui::Color32::from_rgb(0, 90, 158)));
+                                        if ui.small_button("Update").clicked() {
+                                            self.start_forge_update(ctx);
+                                        }
+                                    });
+                                }
+                            });
+                    }
+                }
+            });
+
+            ui.add_space(12.0);
+
+            // ── MaMo Connector itself ────────────────────────────────────
+            ui.group(|ui| {
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new("MaMo Connector").strong());
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let (update_ver, dismissed) = {
+                            let s = self.update_check.lock().unwrap();
+                            (s.available_version.clone(), s.dismissed)
+                        };
+                        if update_ver.is_some() && !dismissed {
+                            ui.label(egui::RichText::new("⬆ Update available").color(egui::Color32::from_rgb(133, 100, 4)));
+                        } else {
+                            ui.label(egui::RichText::new("✓ Up to date").color(egui::Color32::from_rgb(0, 128, 0)));
+                        }
+                    });
+                });
+                ui.add_space(4.0);
+                ui.label(egui::RichText::new(format!("You're on v{}", env!("CARGO_PKG_VERSION"))).small().weak());
+
+                let update_ver = self.update_check.lock().unwrap().available_version.clone();
+                if let Some(ver) = update_ver {
+                    ui.add_space(6.0);
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new(format!("v{ver} is available")).color(egui::Color32::from_rgb(133, 100, 4)));
+                        if ui.button("Update now").clicked() {
+                            let _ = std::process::Command::new("cmd")
+                                .args(["/c", "start", "https://github.com/killriam/mamo-Connector/releases/latest"])
+                                .spawn();
+                        }
+                    });
+                }
+            });
+
+            ui.add_space(16.0);
+
+            // ── Advanced ──────────────────────────────────────────────────
+            ui.collapsing("Advanced", |ui| {
+                ui.horizontal(|ui| {
+                    if ui.add(
+                        egui::Button::new("🔄 Reset to First Run")
+                            .fill(egui::Color32::from_rgb(255, 243, 220)),
+                    )
+                    .on_hover_text("Clears Forge path, MaMo account connection, and saved links, then reopens setup. The mamoConnector:// URL scheme stays registered, so deeplinks from the website keep working.")
+                    .clicked()
+                    {
+                        self.confirm_action = Some(ConfirmAction::ResetFirstRun);
+                    }
+                    ui.label(egui::RichText::new("Re-run the setup wizard and clear all settings").weak().small());
+                });
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    if ui.add(
+                        egui::Button::new("🗑 Uninstall")
+                            .fill(egui::Color32::from_rgb(255, 220, 220)),
+                    )
+                    .on_hover_text("De-registers the URL scheme, deletes all data, then deletes the application itself.")
+                    .clicked()
+                    {
+                        self.confirm_action = Some(ConfirmAction::Uninstall);
+                    }
+                    ui.label(egui::RichText::new("Remove MaMo Connector from this machine").weak().small());
+                });
+            });
+
+            if let Some(msg) = status_message {
+                ui.add_space(10.0);
+                let color = if msg.contains("failed") || msg.contains("Could not") || msg.contains("Error") {
+                    egui::Color32::from_rgb(176, 0, 32)
+                } else if msg.contains("Found") || msg.contains("Saved") || msg.contains("success") {
+                    egui::Color32::from_rgb(0, 128, 0)
+                } else {
+                    egui::Color32::from_rgb(100, 100, 100)
+                };
+                ui.label(egui::RichText::new(msg).color(color));
+            }
+        });
+    }
+
     // ==================== Settings Tab ====================
 
     fn render_settings_tab(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         egui::ScrollArea::vertical().show(ui, |ui| {
         ui.label(egui::RichText::new("⚙ Settings").strong());
+        ui.label(egui::RichText::new("MaMo account and Forge configuration moved to the Setup tab — this is everything else.").small().weak());
         ui.add_space(10.0);
-        
+
         // Get current state
-        let (forge_path_input, forge_path_valid, forge_auto_launch, forge_scripts_path_input, status_message) = {
+        let (forge_scripts_path_input, status_message) = {
             let state = self.settings_state.lock().unwrap();
-            (
-                state.forge_path_input.clone(),
-                state.forge_path_valid,
-                state.forge_auto_launch,
-                state.forge_scripts_path_input.clone(),
-                state.status_message.clone(),
-            )
+            (state.forge_scripts_path_input.clone(), state.status_message.clone())
         };
-        
-        // Forge Configuration Section
-        ui.group(|ui| {
-            ui.label(egui::RichText::new("🎮 Forge Integration").strong());
-            ui.add_space(5.0);
-            
-            ui.label("Configure Forge MTG for playtesting decks directly from MaMo.");
-            ui.add_space(10.0);
-            
-            // Forge path input
-            ui.horizontal(|ui| {
-                ui.label("Forge Executable:");
-                
-                let mut path_input = forge_path_input.clone();
-                let response = ui.add(
-                    egui::TextEdit::singleline(&mut path_input)
-                        .desired_width(400.0)
-                        .hint_text("Path to forge.exe, .jar, Forge.app, or target/ dir")
-                );
-                
-                if response.changed() {
-                    let mut state = self.settings_state.lock().unwrap();
-                    state.forge_path_input = path_input.clone();
-                    state.forge_path_valid = validate_forge_path(&path_input);
-                }
-                
-                // Status indicator
-                if !forge_path_input.is_empty() {
-                    if forge_path_valid {
-                        ui.label(egui::RichText::new("✓").color(egui::Color32::from_rgb(0, 128, 0)));
-                    } else {
-                        ui.label(egui::RichText::new("✗").color(egui::Color32::from_rgb(176, 0, 32)));
-                    }
-                }
-            });
-            
-            ui.add_space(5.0);
-            
-            // Auto-detect and Browse buttons
-            ui.horizontal(|ui| {
-                if ui.button("🔍 Auto-detect").clicked() {
-                    if let Some(path) = get_default_forge_path() {
-                        let path_str = path.to_string_lossy().to_string();
-                        let mut state = self.settings_state.lock().unwrap();
-                        state.forge_path_input = path_str.clone();
-                        state.forge_path_valid = true;
-                        state.status_message = Some(format!("Found Forge at: {}", path_str));
-                    } else {
-                        let mut state = self.settings_state.lock().unwrap();
-                        state.status_message = Some("Could not find Forge installation automatically.".to_string());
-                    }
-                }
-                
-                if ui.button("📁 Browse...").clicked() {
-                    let dialog = FileDialog::new()
-                        .add_filter("Forge Executable", &["exe", "jar", "bat"])
-                        .add_filter("All Files", &["*"])
-                        .set_title("Select Forge Executable");
-                    
-                    if let Some(path) = dialog.pick_file() {
-                        let path_str = path.to_string_lossy().to_string();
-                        let is_valid = validate_forge_path(&path_str);
-                        let mut state = self.settings_state.lock().unwrap();
-                        state.forge_path_input = path_str.clone();
-                        state.forge_path_valid = is_valid;
-                        if is_valid {
-                            state.status_message = Some(format!("Selected: {}", path_str));
-                        } else {
-                            state.status_message = Some(format!("Warning: {} may not be a valid Forge executable", path_str));
-                        }
-                    }
-                }
-                
-                if ui.button("� Folder...").clicked() {
-                    if let Some(folder) = rfd::FileDialog::new()
-                        .set_title("Select Forge Directory (e.g. forge-gui-desktop/target/)")
-                        .pick_folder()
-                    {
-                        let path_str = folder.to_string_lossy().to_string();
-                        let is_valid = validate_forge_path(&path_str);
-                        let mut state = self.settings_state.lock().unwrap();
-                        state.forge_path_input = path_str.clone();
-                        state.forge_path_valid = is_valid;
-                        if is_valid {
-                            if let Some(jar) = resolve_latest_forge_jar(&folder) {
-                                state.status_message = Some(format!(
-                                    "Folder OK — will launch: {}",
-                                    jar.file_name().unwrap_or_default().to_string_lossy()
-                                ));
-                            }
-                        } else {
-                            state.status_message = Some(format!(
-                                "No forge-gui-desktop JAR found in: {}", path_str
-                            ));
-                        }
-                    }
-                }
 
-                if ui.button("💾 Save").clicked() {
-                    self.save_forge_settings();
-                }
-            });
-
-            ui.add_space(5.0);
-
-            // If a directory is configured, show which JAR will be launched
-            if forge_path_valid {
-                let p = std::path::Path::new(&forge_path_input);
-                if p.is_dir() {
-                    if let Some(jar) = resolve_latest_forge_jar(p) {
-                        ui.label(
-                            egui::RichText::new(format!(
-                                "→  {}",
-                                jar.file_name().unwrap_or_default().to_string_lossy()
-                            ))
-                            .color(egui::Color32::from_rgb(80, 130, 200))
-                            .small(),
-                        );
-                        ui.add_space(3.0);
-                    }
-                }
-            }
-
-            // Auto-launch checkbox
-            let mut auto_launch = forge_auto_launch;
-            if ui.checkbox(&mut auto_launch, "Auto-launch Forge after downloading deck").changed() {
-                let mut state = self.settings_state.lock().unwrap();
-                state.forge_auto_launch = auto_launch;
-            }
-            
-            ui.add_space(5.0);
-            
-            // Test launch button
-            if ui.add_enabled(forge_path_valid, egui::Button::new("🚀 Test Launch Forge")).clicked() {
-                match launch_forge_from_settings(None, None) {
-                    Ok(result) => {
-                        let mut state = self.settings_state.lock().unwrap();
-                        state.status_message = Some(result.message);
-                    }
-                    Err(e) => {
-                        let mut state = self.settings_state.lock().unwrap();
-                        state.status_message = Some(format!("Launch failed: {}", e));
-                    }
-                }
-            }
-        });
-        
-        ui.add_space(15.0);
-
-        // AI Simulation Scripts Section
-        ui.group(|ui| {
-            ui.label(egui::RichText::new("🤖 AI Simulation Scripts").strong());
-            ui.add_space(5.0);
-            ui.label("Path to the folder containing run_commander_simulation.ps1 and analyze_commander_stats.py.");
-            ui.label(egui::RichText::new("Example: D:\\Dev\\forge\\forge").small().weak());
-            ui.add_space(8.0);
-
-            ui.horizontal(|ui| {
-                ui.label("Scripts folder:");
-                let mut scripts_input = forge_scripts_path_input.clone();
-                let response = ui.add(
-                    egui::TextEdit::singleline(&mut scripts_input)
-                        .desired_width(400.0)
-                        .hint_text("Path to folder with .ps1 and .py scripts"),
-                );
-                if response.changed() {
-                    let mut state = self.settings_state.lock().unwrap();
-                    state.forge_scripts_path_input = scripts_input.clone();
-                }
-
-                // Valid indicator
-                let scripts_valid = !forge_scripts_path_input.is_empty()
-                    && std::path::Path::new(&forge_scripts_path_input)
-                        .join("run_commander_simulation.ps1")
-                        .exists();
-                if !forge_scripts_path_input.is_empty() {
-                    if scripts_valid {
-                        ui.label(egui::RichText::new("✓").color(egui::Color32::from_rgb(0, 128, 0)));
-                    } else {
-                        ui.label(egui::RichText::new("✗ ps1 not found").color(egui::Color32::from_rgb(176, 0, 32)));
-                    }
-                }
-            });
-
-            ui.add_space(5.0);
-            ui.horizontal(|ui| {
-                if ui.button("📂 Browse…").clicked() {
-                    if let Some(folder) = rfd::FileDialog::new().pick_folder() {
-                        let path_str = folder.to_string_lossy().to_string();
-                        let mut state = self.settings_state.lock().unwrap();
-                        state.forge_scripts_path_input = path_str;
-                    }
-                }
-                if ui.button("💾 Save").clicked() {
-                    self.save_forge_scripts_path();
-                }
-            });
-        });
-
-        ui.add_space(15.0);
-
-        // Authentication Section
-        ui.group(|ui| {
-            ui.label(egui::RichText::new("🔐 MaMo Authentication").strong());
-            ui.add_space(5.0);
-            
-            // Check if we have a token
-            let has_token = {
-                let state = self.settings_state.lock().unwrap();
-                !state.auth_token_input.is_empty()
-            };
-            
-            if has_token {
-                ui.horizontal(|ui| {
-                    ui.label(egui::RichText::new("✓ Connected to MaMo").color(egui::Color32::from_rgb(0, 128, 0)));
-                    ui.label("- Game log uploads enabled");
-                });
-                ui.add_space(5.0);
-                if ui.button("🔓 Disconnect").clicked() {
-                    {
-                        let mut state = self.settings_state.lock().unwrap();
-                        state.auth_token_input.clear();
-                    }
-                    self.save_auth_token();
-                }
-            } else {
-                ui.label("Not connected. Click 'Connect MaMo Connector' in MaMo settings to enable game log uploads.");
-                ui.add_space(5.0);
-                ui.label(egui::RichText::new("Or manually enter your token:").small().weak());
-            }
-            
-            // Manual token input (collapsed if already connected)
-            if !has_token {
-                ui.add_space(5.0);
-                ui.horizontal(|ui| {
-                    ui.label("Token:");
-                    
-                    let mut token_input = {
-                        let state = self.settings_state.lock().unwrap();
-                        state.auth_token_input.clone()
-                    };
-                    
-                    let response = ui.add(
-                        egui::TextEdit::singleline(&mut token_input)
-                            .desired_width(350.0)
-                            .password(true)
-                            .hint_text("Paste token here")
-                    );
-                    
-                    if response.changed() {
-                        let mut state = self.settings_state.lock().unwrap();
-                        state.auth_token_input = token_input;
-                    }
-                    
-                    if ui.button("💾 Save").clicked() {
-                        self.save_auth_token();
-                    }
-                });
-            }
-        });
-        
-        ui.add_space(15.0);
-
-        // Game Logs — Directory & Filters section (moved from GameLogs tab)
+        // Game Logs directory section (moved from GameLogs tab)
         {
-            let (directory_input, directory_valid, file_count, background_enabled) = {
+            let (directory_input, directory_valid, file_count) = {
                 let state = self.gamelog_state.lock().unwrap();
-                (
-                    state.directory_input.clone(),
-                    state.directory_valid,
-                    state.file_count,
-                    state.background_enabled,
-                )
+                (state.directory_input.clone(), state.directory_valid, state.file_count)
             };
 
             ui.group(|ui| {
-                ui.label(egui::RichText::new("📁 Game Logs — Directory & Filters").strong());
+                ui.label(egui::RichText::new("📁 Game log folder").strong());
+                ui.label(egui::RichText::new("Where Forge writes game logs — Connector watches this while Forge is running.").small().weak());
                 ui.add_space(5.0);
 
                 ui.horizontal(|ui| {
@@ -4610,12 +4850,6 @@ impl LauncherApp {
 
                 ui.add_space(5.0);
 
-                // Background scanning toggle
-                let mut bg_enabled = background_enabled;
-                if ui.checkbox(&mut bg_enabled, "Enable Background Scanning").changed() {
-                    self.toggle_background_scanning(bg_enabled);
-                }
-
                 // Processed files info
                 let processed_count = {
                     let state = self.gamelog_state.lock().unwrap();
@@ -4636,45 +4870,12 @@ impl LauncherApp {
         self.render_deck_mapping_section(ui, ctx);
 
         ui.add_space(15.0);
-        
-        // URL Scheme Info
-        ui.group(|ui| {
-            ui.label(egui::RichText::new("🔗 Deeplink Commands").strong());
-            ui.add_space(5.0);
-            
-            ui.label("MaMo Connector responds to the following deeplink commands:");
-            ui.add_space(5.0);
-            
-            egui::Grid::new("deeplink_commands")
-                .num_columns(2)
-                .spacing([20.0, 4.0])
-                .show(ui, |ui| {
-                    ui.label(egui::RichText::new("Command").strong());
-                    ui.label(egui::RichText::new("Description").strong());
-                    ui.end_row();
-                    
-                    ui.label("mamoConnector://playtest/DECK_UUID");
-                    ui.label("Download deck & launch Forge");
-                    ui.end_row();
-                    
-                    ui.label("mamoConnector://mamo/DECK_UUID");
-                    ui.label("Download deck from MaMo");
-                    ui.end_row();
-                    
-                    ui.label("mamoConnector://deck/MOXFIELD_ID");
-                    ui.label("Download deck from Moxfield");
-                    ui.end_row();
-                    
-                    ui.label("mamoConnector://launch-forge");
-                    ui.label("Launch Forge (no deck)");
-                    ui.end_row();
-                    
-                    ui.label("mamoConnector://auth?token=XXX");
-                    ui.label("Set auth token for gamelog uploads");
-                    ui.end_row();
-                });
-        });
-        
+        ui.label(
+            egui::RichText::new("Full list of mamoConnector:// links the website can open: see the project docs.")
+                .small()
+                .weak(),
+        );
+
         // Status message
         if let Some(msg) = status_message {
             ui.add_space(10.0);
@@ -4690,30 +4891,52 @@ impl LauncherApp {
 
         ui.add_space(20.0);
 
-        // ── Advanced / Uninstall ──────────────────────────────────────────
-        ui.group(|ui| {
-            ui.label(egui::RichText::new("⚠ Advanced").strong().color(egui::Color32::from_rgb(160, 60, 0)));
-            ui.add_space(6.0);
-            ui.horizontal(|ui| {
-                if ui.add(
-                    egui::Button::new("🔄 Reset to First Run")
-                        .fill(egui::Color32::from_rgb(255, 243, 220)),
-                ).on_hover_text("De-registers URL scheme, deletes all settings, shows setup wizard on next launch")
-                .clicked() {
-                    self.confirm_action = Some(ConfirmAction::ResetFirstRun);
-                }
-                ui.label(egui::RichText::new("Re-run the setup wizard and clear all settings").weak().small());
-            });
-            ui.add_space(4.0);
-            ui.horizontal(|ui| {
-                if ui.add(
-                    egui::Button::new("🗑 Uninstall")
-                        .fill(egui::Color32::from_rgb(255, 220, 220)),
-                ).on_hover_text("De-registers URL scheme, deletes all data, then deletes the executable")
-                .clicked() {
-                    self.confirm_action = Some(ConfirmAction::Uninstall);
-                }
-                ui.label(egui::RichText::new("Remove MaMo Connector from this machine").weak().small());
+        // ── Advanced (rare/technical knobs) ────────────────────────────────
+        ui.collapsing("Advanced", |ui| {
+            ui.group(|ui| {
+                ui.label(egui::RichText::new("Simulation scripts").strong());
+                ui.label(egui::RichText::new("Optional — only needed for local AI simulation. Path to the folder containing run_commander_simulation.ps1 and analyze_commander_stats.py.").small().weak());
+                ui.add_space(8.0);
+
+                ui.horizontal(|ui| {
+                    ui.label("Scripts folder:");
+                    let mut scripts_input = forge_scripts_path_input.clone();
+                    let response = ui.add(
+                        egui::TextEdit::singleline(&mut scripts_input)
+                            .desired_width(360.0)
+                            .hint_text("Path to folder with .ps1 and .py scripts"),
+                    );
+                    if response.changed() {
+                        let mut state = self.settings_state.lock().unwrap();
+                        state.forge_scripts_path_input = scripts_input.clone();
+                    }
+
+                    let scripts_valid = !forge_scripts_path_input.is_empty()
+                        && std::path::Path::new(&forge_scripts_path_input)
+                            .join("run_commander_simulation.ps1")
+                            .exists();
+                    if !forge_scripts_path_input.is_empty() {
+                        if scripts_valid {
+                            ui.label(egui::RichText::new("✓").color(egui::Color32::from_rgb(0, 128, 0)));
+                        } else {
+                            ui.label(egui::RichText::new("✗ ps1 not found").color(egui::Color32::from_rgb(176, 0, 32)));
+                        }
+                    }
+                });
+
+                ui.add_space(5.0);
+                ui.horizontal(|ui| {
+                    if ui.button("📂 Browse…").clicked() {
+                        if let Some(folder) = rfd::FileDialog::new().pick_folder() {
+                            let path_str = folder.to_string_lossy().to_string();
+                            let mut state = self.settings_state.lock().unwrap();
+                            state.forge_scripts_path_input = path_str;
+                        }
+                    }
+                    if ui.button("💾 Save").clicked() {
+                        self.save_forge_scripts_path();
+                    }
+                });
             });
         });
 
@@ -4896,5 +5119,64 @@ mod deck_picker_tests {
     fn connector_managed_forge_false_when_empty() {
         let dir = std::path::PathBuf::from(r"C:\Users\test\AppData\Roaming\MamoConnector\forge");
         assert!(!is_connector_managed_forge("", &dir));
+    }
+
+    #[test]
+    fn play_session_step_index_is_linear_for_the_normal_lifecycle() {
+        assert_eq!(play_session_step_index(&PlaySession::Watching), 0);
+        assert_eq!(play_session_step_index(&PlaySession::Launching), 1);
+        assert_eq!(play_session_step_index(&PlaySession::Playing), 2);
+        assert_eq!(play_session_step_index(&PlaySession::Scanning), 3);
+        assert_eq!(play_session_step_index(&PlaySession::Uploading), 4);
+        assert_eq!(
+            play_session_step_index(&PlaySession::Uploaded { deck_id: None, filename: "a.json".to_string() }),
+            5
+        );
+    }
+
+    #[test]
+    fn play_session_step_index_upload_issue_lands_on_the_uploading_step() {
+        // The failure happened while uploading, so earlier steps (Launching/Playing/Scanning)
+        // should still read as done, and Uploaded (index 5) should still read as pending.
+        let issue = PlaySession::UploadIssue { message: "network error".to_string() };
+        assert_eq!(play_session_step_index(&issue), 4);
+    }
+
+    #[test]
+    fn play_session_strip_never_returns_an_empty_string() {
+        let sessions = [
+            PlaySession::Watching,
+            PlaySession::Launching,
+            PlaySession::Playing,
+            PlaySession::Scanning,
+            PlaySession::Uploading,
+            PlaySession::Uploaded { deck_id: Some("deck-1".to_string()), filename: "a.json".to_string() },
+            PlaySession::UploadIssue { message: "oops".to_string() },
+        ];
+        for ps in &sessions {
+            let (text, _) = play_session_strip(ps);
+            assert!(!text.is_empty(), "strip text should never be blank — that's the whole point");
+        }
+    }
+
+    #[test]
+    fn play_session_strip_is_active_only_while_something_is_actually_happening() {
+        assert!(!play_session_strip(&PlaySession::Watching).1);
+        assert!(play_session_strip(&PlaySession::Launching).1);
+        assert!(play_session_strip(&PlaySession::Playing).1);
+        assert!(play_session_strip(&PlaySession::Scanning).1);
+        assert!(play_session_strip(&PlaySession::Uploading).1);
+        assert!(!play_session_strip(&PlaySession::Uploaded { deck_id: None, filename: "a.json".to_string() }).1);
+        assert!(!play_session_strip(&PlaySession::UploadIssue { message: "oops".to_string() }).1);
+    }
+
+    #[test]
+    fn deeplink_starts_play_session_only_for_launch_shaped_actions() {
+        for action in ["playtest", "launch-forge", "launchforge", "playtest-scenario", "replay-game", "replaygame"] {
+            assert!(deeplink_starts_play_session(action), "{action} should start a play session");
+        }
+        for action in ["auth", "import-user-decks", "list-user-decks", "simulate", "simulate-ai", "unknown"] {
+            assert!(!deeplink_starts_play_session(action), "{action} should not start a play session");
+        }
     }
 }
