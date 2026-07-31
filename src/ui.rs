@@ -157,6 +157,39 @@ fn play_session_step_index(ps: &PlaySession) -> usize {
     }
 }
 
+/// Coordinates the single gamelog-scan "slot" shared by the periodic auto-scan, the
+/// Forge-closed final scan, and the manual "Upload Logs" button — only one
+/// `process_new_logs_with_filter` call may run at a time. Also tracks whether a caller that
+/// wants the Play tab's timeline resolved (moved to Uploaded/UploadIssue/Watching) is still
+/// waiting: if a final or manual scan asks to run while another scan already holds the slot,
+/// that intent isn't lost — recorded regardless of whether the slot was actually claimed, so
+/// whichever scan currently holds it will resolve play_session with its own results when it
+/// finishes, instead of leaving the Play tab's timeline stuck mid-step forever.
+#[derive(Clone, Default)]
+struct ScanSlot {
+    busy: Arc<AtomicBool>,
+    resolution_owed: Arc<AtomicBool>,
+}
+
+impl ScanSlot {
+    /// Attempts to claim the slot for a new scan. `wants_resolution` is recorded unconditionally
+    /// (even if the slot can't be claimed), so an overlapping request's intent still gets
+    /// honored by whichever scan is actually running. Returns `true` if the caller may proceed
+    /// to spawn a scan; `false` means another scan already holds the slot.
+    fn try_begin(&self, wants_resolution: bool) -> bool {
+        if wants_resolution {
+            self.resolution_owed.store(true, Ordering::SeqCst);
+        }
+        self.busy.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst).is_ok()
+    }
+
+    /// Releases the slot. Returns (and clears) whether a play_session resolution is owed.
+    fn finish(&self) -> bool {
+        self.busy.store(false, Ordering::SeqCst);
+        self.resolution_owed.swap(false, Ordering::SeqCst)
+    }
+}
+
 /// Steps of the first-run setup wizard
 #[derive(Clone, PartialEq, Eq, Default)]
 enum WizardStep {
@@ -617,6 +650,9 @@ struct LauncherApp {
     confirm_action: Option<ConfirmAction>,
     /// Current phase of the play session — see `PlaySession` doc comment
     play_session: Arc<Mutex<PlaySession>>,
+    /// Coordinates the single gamelog-scan slot shared by the auto-scan and manual-scan paths —
+    /// see `ScanSlot` doc comment
+    scan_slot: ScanSlot,
 }
 
 impl LauncherApp {
@@ -834,6 +870,7 @@ impl LauncherApp {
             is_launching_selected_deck: Arc::new(Mutex::new(false)),
             confirm_action: None,
             play_session: Arc::new(Mutex::new(PlaySession::default())),
+            scan_slot: ScanSlot::default(),
         }
     }
 }
@@ -1169,7 +1206,7 @@ impl eframe::App for LauncherApp {
                     if ui.selectable_label(self.current_tab == Tab::Play, "▶ Play").clicked() {
                         self.current_tab = Tab::Play;
                     }
-                    if ui.selectable_label(self.current_tab == Tab::Decks, "⇩ Get Decks").clicked() {
+                    if ui.selectable_label(self.current_tab == Tab::Decks, "📥 Get Decks").clicked() {
                         self.current_tab = Tab::Decks;
                     }
                     if ui.selectable_label(self.current_tab == Tab::Setup, "🔧 Setup").clicked() {
@@ -2530,10 +2567,10 @@ impl LauncherApp {
                         !state.auth_token_input.is_empty()
                     };
                     if has_token {
-                        ui.label(egui::RichText::new("● Connected to MaMo").color(egui::Color32::from_rgb(0, 128, 0)));
+                        ui.label(egui::RichText::new("Connected to MaMo").color(egui::Color32::from_rgb(0, 128, 0)));
                     } else {
-                        ui.label(egui::RichText::new("● Not connected").color(egui::Color32::from_rgb(176, 0, 32)));
-                        if ui.small_button("Connect →").clicked() {
+                        ui.label(egui::RichText::new("Not connected").color(egui::Color32::from_rgb(176, 0, 32)));
+                        if ui.small_button("Connect").clicked() {
                             self.current_tab = Tab::Setup;
                         }
                     }
@@ -2721,13 +2758,17 @@ impl LauncherApp {
                 let current = play_session_step_index(&ps);
                 let is_issue = matches!(ps, PlaySession::UploadIssue { .. });
 
+                // No leading glyph on these titles — egui's bundled font doesn't cover the
+                // dotted-circle/circled-digit/dingbat characters that would naturally go here
+                // (confirmed by a real screenshot: they rendered as tofu boxes), and the
+                // colored frame below already carries the done/active/pending signal on its own.
                 let steps: [(&str, &str); 6] = [
-                    ("◌ Watching for a game to start", "Nothing to do — launch a deck above, or start one from the MaMo website"),
-                    ("① Launching Forge", "Preparing your deck"),
-                    ("② Game in progress", "Forge is running — we'll pick this up when you're done"),
-                    ("③ Scanning for your game log", "Forge closed — checking what you played"),
-                    ("④ Uploading", "Sending your game log to MaMo"),
-                    ("✓ Uploaded — analysis ready", "Play a deck to see this update"),
+                    ("Watching for a game to start", "Nothing to do — launch a deck above, or start one from the MaMo website"),
+                    ("Launching Forge", "Preparing your deck"),
+                    ("Game in progress", "Forge is running — we'll pick this up when you're done"),
+                    ("Scanning for your game log", "Forge closed — checking what you played"),
+                    ("Uploading", "Sending your game log to MaMo"),
+                    ("Uploaded — analysis ready", "Play a deck to see this update"),
                 ];
 
                 for (i, (title, default_sub)) in steps.into_iter().enumerate() {
@@ -2756,7 +2797,7 @@ impl LauncherApp {
                                 if let PlaySession::Uploaded { ref deck_id, ref filename } = ps {
                                     ui.label(egui::RichText::new(filename).small().color(text_color));
                                     if let Some(id) = deck_id {
-                                        if ui.small_button("View analysis on MaMo →").clicked() {
+                                        if ui.small_button("View analysis on MaMo").clicked() {
                                             let url = format!(
                                                 "{}/DeckBuilding/playbook?deckId={}&tab=evaluation",
                                                 MAMO_WEBSITE_URL, id
@@ -3925,9 +3966,20 @@ impl LauncherApp {
     }
 
     fn start_gamelog_scan(&mut self, ctx: &egui::Context) {
+        // Claim the shared scan slot — if the auto-scan path already holds it, don't spawn a
+        // second concurrent process_new_logs_with_filter call (that used to cause duplicate
+        // overlapping scans and nondeterministic play_session flicker). Our intent to resolve
+        // play_session is still recorded, so whichever scan is currently running will honor it.
+        if !self.scan_slot.try_begin(true) {
+            let mut state = self.gamelog_state.lock().unwrap();
+            state.status_message = Some("A scan is already running — it'll finish shortly.".to_string());
+            return;
+        }
+
         let gamelog_state = Arc::clone(&self.gamelog_state);
         let settings = Arc::clone(&self.settings);
         let play_session = Arc::clone(&self.play_session);
+        let scan_slot = self.scan_slot.clone();
         let ctx_clone = ctx.clone();
 
         // Get filter options
@@ -3938,7 +3990,7 @@ impl LauncherApp {
                 deck_filter: state.selected_deck_filters.clone(),
             }
         };
-        
+
         // Mark as scanning
         {
             let mut state = gamelog_state.lock().unwrap();
@@ -3953,31 +4005,32 @@ impl LauncherApp {
                 let settings = settings.lock().unwrap();
                 settings.gamelog_config.clone()
             };
-            
+
             let processed_files = {
                 let state = gamelog_state.lock().unwrap();
                 Arc::new(Mutex::new(state.processed_files.clone()))
             };
-            
+
             let result = process_new_logs_with_filter(&config, &processed_files, &filter_options).await;
-            
+            let should_resolve = scan_slot.finish();
+
             {
                 let mut state = gamelog_state.lock().unwrap();
                 state.is_scanning = false;
-                
+
                 match result {
                     Ok(summary) => {
                         // Clone results before moving
                         let results = summary.results.clone();
                         state.scan_results = results;
-                        
+
                         // Update processed files
                         let new_processed = processed_files.lock().unwrap().clone();
                         state.processed_files = new_processed.clone();
-                        
+
                         // Save processed files to disk
                         let _ = save_processed_files(&new_processed);
-                        
+
                         if summary.new_files == 0 {
                             state.status_message = Some("No new files to process".to_string());
                         } else {
@@ -3987,24 +4040,28 @@ impl LauncherApp {
                             ));
                         }
 
-                        *play_session.lock().unwrap() = if let Some(uploaded) =
-                            summary.results.iter().find(|r| r.success)
-                        {
-                            PlaySession::Uploaded {
-                                deck_id: uploaded.resolved_deck_id.clone(),
-                                filename: uploaded.filename.clone(),
-                            }
-                        } else if let Some(failed) = summary.results.iter().find(|r| !r.success) {
-                            PlaySession::UploadIssue { message: failed.message.clone() }
-                        } else {
-                            PlaySession::Watching
-                        };
+                        if should_resolve {
+                            *play_session.lock().unwrap() = if let Some(uploaded) =
+                                summary.results.iter().find(|r| r.success)
+                            {
+                                PlaySession::Uploaded {
+                                    deck_id: uploaded.resolved_deck_id.clone(),
+                                    filename: uploaded.filename.clone(),
+                                }
+                            } else if let Some(failed) = summary.results.iter().find(|r| !r.success) {
+                                PlaySession::UploadIssue { message: failed.message.clone() }
+                            } else {
+                                PlaySession::Watching
+                            };
+                        }
 
                         state.last_scan_summary = Some(summary);
                     }
                     Err(e) => {
                         state.status_message = Some(format!("Error: {}", e));
-                        *play_session.lock().unwrap() = PlaySession::UploadIssue { message: e.to_string() };
+                        if should_resolve {
+                            *play_session.lock().unwrap() = PlaySession::UploadIssue { message: e.to_string() };
+                        }
                     }
                 }
             }
@@ -4068,19 +4125,21 @@ impl LauncherApp {
     /// multi-game sitting, not "the game just ended", so it must not yank the strip away from
     /// Playing while the game is still genuinely in progress.
     fn start_auto_gamelog_scan(&mut self, ctx: &egui::Context, is_final_scan: bool) {
+        // Claim the shared scan slot. If a periodic scan already holds it when Forge closes
+        // (is_final_scan=true), we don't spawn a second overlapping scan — but `is_final_scan`
+        // is still recorded as a pending resolution, so the periodic scan already in flight
+        // will resolve play_session with its own results when it finishes, instead of leaving
+        // the Play tab's timeline stuck on "Scanning" forever.
+        if !self.scan_slot.try_begin(is_final_scan) {
+            return;
+        }
+
         let gamelog_state = Arc::clone(&self.gamelog_state);
         let settings = Arc::clone(&self.settings);
         let activity_log = Arc::clone(&self.activity_log);
         let play_session = Arc::clone(&self.play_session);
+        let scan_slot = self.scan_slot.clone();
         let ctx_clone = ctx.clone();
-
-        // Don't scan if already scanning
-        {
-            let state = gamelog_state.lock().unwrap();
-            if state.is_scanning {
-                return;
-            }
-        }
 
         // Mark as scanning
         {
@@ -4106,11 +4165,12 @@ impl LauncherApp {
             };
             
             let result = process_new_logs_with_filter(&config, &processed_files, &filter_options).await;
-            
+            let should_resolve = scan_slot.finish();
+
             {
                 let mut state = gamelog_state.lock().unwrap();
                 state.is_scanning = false;
-                
+
                 match result {
                     Ok(summary) => {
                         state.scan_results = summary.results.clone();
@@ -4162,7 +4222,7 @@ impl LauncherApp {
                             }
                         }
 
-                        if is_final_scan {
+                        if should_resolve {
                             *play_session.lock().unwrap() = if let Some(uploaded) =
                                 summary.results.iter().find(|r| r.success)
                             {
@@ -4184,7 +4244,7 @@ impl LauncherApp {
                         if let Ok(mut log) = activity_log.lock() {
                             log.log_error(format!("Auto-scan error: {}", e));
                         }
-                        if is_final_scan {
+                        if should_resolve {
                             *play_session.lock().unwrap() = PlaySession::UploadIssue { message: e.to_string() };
                         }
                     }
@@ -4481,8 +4541,8 @@ impl LauncherApp {
                         self.save_auth_token();
                     }
                 } else {
-                    ui.label("On the MaMo website, click the profile icon (top-right) → \"Connect Connector\".");
-                    if ui.hyperlink_to("Connect to MaMo →", MAMO_WEBSITE_URL)
+                    ui.label("On the MaMo website, click the profile icon (top-right), then \"Connect Connector\".");
+                    if ui.hyperlink_to("Connect to MaMo", MAMO_WEBSITE_URL)
                         .on_hover_text("Opens MaMo in your browser")
                         .clicked()
                     {
@@ -5178,5 +5238,71 @@ mod deck_picker_tests {
         for action in ["auth", "import-user-decks", "list-user-decks", "simulate", "simulate-ai", "unknown"] {
             assert!(!deeplink_starts_play_session(action), "{action} should not start a play session");
         }
+    }
+
+    // ── ScanSlot: regression tests for the two race conditions found while assessing
+    // confidence in the redesign — a periodic auto-scan racing the Forge-closed final scan,
+    // and a manual "Upload Logs" click racing either kind of auto-scan. Both are simulated
+    // deterministically here (no real threads/timing needed) since the whole point of
+    // ScanSlot is that the outcome doesn't depend on which call happens to finish first.
+
+    #[test]
+    fn scan_slot_first_caller_claims_it_second_caller_does_not() {
+        let slot = ScanSlot::default();
+        assert!(slot.try_begin(true), "first caller should claim the slot");
+        assert!(!slot.try_begin(true), "second caller must not claim an already-busy slot");
+    }
+
+    #[test]
+    fn scan_slot_final_scan_racing_an_in_flight_periodic_scan_is_not_lost() {
+        // Reproduces the original bug: a periodic scan (wants_resolution=false) is already
+        // running when Forge closes and a final scan (wants_resolution=true) is requested.
+        let slot = ScanSlot::default();
+
+        // Periodic scan starts first and claims the slot.
+        assert!(slot.try_begin(false), "periodic scan should claim the empty slot");
+
+        // Forge closes; the final-scan request arrives while the periodic scan still holds it.
+        assert!(!slot.try_begin(true), "final scan must not start a second overlapping run");
+
+        // The periodic scan (the one actually running) finishes. Even though *it* never asked
+        // for a resolution, the final scan's request must still be honored here — this is the
+        // fix: play_session gets resolved instead of staying stuck on "Scanning" forever.
+        assert!(slot.finish(), "the in-flight scan must report the pending resolution as owed");
+    }
+
+    #[test]
+    fn scan_slot_manual_click_racing_auto_scan_does_not_spawn_a_second_scan() {
+        // Reproduces the second original bug: clicking "Upload Logs" while an auto-scan is
+        // already running used to spawn a second concurrent process_new_logs_with_filter call.
+        let slot = ScanSlot::default();
+        assert!(slot.try_begin(false), "auto-scan claims the slot first");
+        assert!(
+            !slot.try_begin(true),
+            "a manual click while auto-scan is running must not claim its own slot"
+        );
+        // Only one scan's completion should ever fire — and it still resolves play_session for
+        // the manual click that asked for it.
+        assert!(slot.finish());
+    }
+
+    #[test]
+    fn scan_slot_no_resolution_owed_when_nobody_asked_for_one() {
+        // A plain periodic scan, uncontested, with no final/manual request racing it: finishing
+        // must NOT resolve play_session — that would fight the "still Playing" state a real
+        // mid-game housekeeping scan should leave alone.
+        let slot = ScanSlot::default();
+        assert!(slot.try_begin(false));
+        assert!(!slot.finish(), "an uncontested periodic scan should not claim a resolution");
+    }
+
+    #[test]
+    fn scan_slot_reusable_after_finish() {
+        let slot = ScanSlot::default();
+        assert!(slot.try_begin(true));
+        assert!(slot.finish());
+        // The slot must be free again for the next scan, with no resolution wrongly carried over.
+        assert!(slot.try_begin(false), "slot should be claimable again after finish()");
+        assert!(!slot.finish());
     }
 }
