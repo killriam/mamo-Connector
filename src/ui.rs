@@ -2186,6 +2186,19 @@ impl LauncherApp {
                                             self.wizard.java_status = Some(crate::forge::detect_java());
                                         }
                                     });
+                                    ui.add_space(4.0);
+                                    ui.label(
+                                        egui::RichText::new(
+                                            "That page offers two options: the .msi installer is \
+                                             easiest, but needs administrator rights. No admin \
+                                             rights? Pick the .zip instead — extract it anywhere, \
+                                             then set a JAVA_HOME environment variable (your own \
+                                             account, no admin needed) pointing at that folder, \
+                                             and click Re-check."
+                                        )
+                                        .small()
+                                        .color(egui::Color32::from_rgb(150, 80, 0)),
+                                    );
                                 });
                         }
                         None => {}
