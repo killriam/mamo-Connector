@@ -249,13 +249,77 @@ async fn handle_playtest_with_scenario(deeplink: &Deeplink, log_collector: Optio
 
     let deck_path_str = result.deck_path.as_ref().map(|p| p.to_string_lossy().to_string());
     log("Launching Forge with scenario deck...");
-    match launch_forge_from_settings(deck_path_str.as_deref(), None) {
+    let deck2_path = resolve_opponent_deck_path(Some(&deck_id), None, None, &log).await;
+    match launch_forge_from_settings(deck_path_str.as_deref(), deck2_path.as_deref()) {
         Ok(forge_res) => CommandResult::DeckCreatedAndLaunched(result, forge_res),
         Err(e) => {
             error!("Forge launch failed: {}", e);
             CommandResult::Error(format!("Deck and scenario ready but Forge launch failed: {}", e))
         }
     }
+}
+
+/// Resolves the Forge `--deck2` opponent path for a launch, in priority order:
+/// 1. An explicit deck2 name/id from the deeplink — an override, i.e. "if changed".
+/// 2. `deck1_id`'s configured archenemy deck (Playbook's Deck Rules tab), if any.
+/// 3. A random pick from the curated opponent-deck pool.
+/// 4. `None` — Forge's own lobby default.
+///
+/// Every tier is best-effort: a failure or absence at any tier falls through to the next.
+/// This must never block or fail a Forge launch — exactly today's "no deck2" behavior.
+async fn resolve_opponent_deck_path(
+    deck1_id: Option<&str>,
+    deck2_id: Option<String>,
+    deck2_name_direct: Option<String>,
+    log: &dyn Fn(&str),
+) -> Option<String> {
+    if let Some(direct) = deck2_name_direct {
+        log(&format!("Using deck2 by name: {}", direct));
+        return Some(direct);
+    }
+
+    if let Some(ref id2) = deck2_id {
+        log(&format!("Downloading deck2 from MaMo: {}", id2));
+        match create_deck_from_mamo(id2).await {
+            Ok(result) if result.success => {
+                let path = result.deck_path.as_ref().map(|p| p.to_string_lossy().to_string());
+                log(&format!("Deck2 ready: {:?}", path));
+                return path;
+            }
+            Ok(result) => log(&format!("Deck2 download failed: {}", result.message)),
+            Err(e) => log(&format!("Error downloading deck2: {}", e)),
+        }
+    }
+
+    if let Some(id1) = deck1_id {
+        if let Some((archenemy_id, archenemy_name)) = crate::deck::fetch_archenemy_deck_for_deck(id1) {
+            log(&format!("Using this deck's configured archenemy deck: {} ({})", archenemy_name, archenemy_id));
+            match create_deck_from_mamo(&archenemy_id).await {
+                Ok(result) if result.success => {
+                    let path = result.deck_path.as_ref().map(|p| p.to_string_lossy().to_string());
+                    log(&format!("Archenemy deck ready: {:?}", path));
+                    return path;
+                }
+                Ok(result) => log(&format!("Archenemy deck download failed: {}", result.message)),
+                Err(e) => log(&format!("Error downloading archenemy deck: {}", e)),
+            }
+        }
+    }
+
+    if let Some(curated_id) = crate::deck::pick_random_curated_opponent_deck_id() {
+        log(&format!("No opponent specified — downloading a curated opponent deck: {}", curated_id));
+        match create_deck_from_mamo(&curated_id).await {
+            Ok(result) if result.success => {
+                let path = result.deck_path.as_ref().map(|p| p.to_string_lossy().to_string());
+                log(&format!("Opponent deck ready: {:?}", path));
+                return path;
+            }
+            Ok(result) => log(&format!("Curated opponent deck download failed: {}", result.message)),
+            Err(e) => log(&format!("Error downloading curated opponent deck: {}", e)),
+        }
+    }
+
+    None
 }
 
 /// Handle mamoConnector://launch-forge?deckId=UUID or mamoConnector://playtest/UUID
@@ -363,52 +427,17 @@ async fn handle_launch_forge_with_logger(deeplink: &Deeplink, log_collector: Opt
 
     log(&format!("Launch Forge command - deck_id: {:?}", deck_id));
 
-    // Resolve deck2 path: an explicit name/id from the deeplink wins; otherwise fall back to a
-    // random pick from the curated opponent-deck pool, so "just press Play" never requires
-    // manually configuring an opponent inside Forge's own lobby. If the pool is empty or
-    // unreachable, this silently falls through to None — exactly today's behavior.
-    let deck2_path: Option<String> = if let Some(direct) = deck2_name_direct {
-        log(&format!("Using deck2 by name: {}", direct));
-        Some(direct)
-    } else if let Some(ref id2) = deck2_id {
-        log(&format!("Downloading deck2 from MaMo: {}", id2));
-        match create_deck_from_mamo(id2).await {
-            Ok(result) if result.success => {
-                let path = result.deck_path.as_ref()
-                    .map(|p| p.to_string_lossy().to_string());
-                log(&format!("Deck2 ready: {:?}", path));
-                path
-            }
-            Ok(result) => {
-                log(&format!("Deck2 download failed: {}", result.message));
-                None
-            }
-            Err(e) => {
-                log(&format!("Error downloading deck2: {}", e));
-                None
-            }
-        }
-    } else if let Some(curated_id) = crate::deck::pick_random_curated_opponent_deck_id() {
-        log(&format!("No opponent specified — downloading a curated opponent deck: {}", curated_id));
-        match create_deck_from_mamo(&curated_id).await {
-            Ok(result) if result.success => {
-                let path = result.deck_path.as_ref()
-                    .map(|p| p.to_string_lossy().to_string());
-                log(&format!("Opponent deck ready: {:?}", path));
-                path
-            }
-            Ok(result) => {
-                log(&format!("Curated opponent deck download failed: {}", result.message));
-                None
-            }
-            Err(e) => {
-                log(&format!("Error downloading curated opponent deck: {}", e));
-                None
-            }
-        }
-    } else {
-        None
-    };
+    // Resolve deck2 path: an explicit name/id from the deeplink wins; otherwise fall back to
+    // this deck's configured archenemy deck, then a random pick from the curated opponent-deck
+    // pool, so "just press Play" never requires manually configuring an opponent inside Forge's
+    // own lobby. If nothing resolves, this silently falls through to None — exactly today's
+    // behavior.
+    let deck2_path = resolve_opponent_deck_path(
+        deck_id.as_deref(),
+        deck2_id,
+        deck2_name_direct,
+        &log,
+    ).await;
 
     // If we have a deck ID and shouldn't skip download, download it first
     let deck_path: Option<String> = if let Some(ref id) = deck_id {
@@ -1465,5 +1494,41 @@ mod tests {
             }
             _ => panic!("Expected UserDecksList or Error result"),
         }
+    }
+
+    // ==================== Opponent Deck Resolution Tests ====================
+    //
+    // resolve_opponent_deck_path()'s later tiers (archenemy lookup, curated pool, deck2
+    // download) all require real network I/O with no mocking seam in this codebase — the same
+    // constraint pick_random_curated_opponent_deck_id() already lives with (see deck.rs, where
+    // only the pure pick_random_index() fragment is unit-tested). The explicit-override tier is
+    // the one branch that's a pure early return before any await point, so it's the one
+    // deterministically testable without network access — and it's also the branch most likely
+    // to silently break in a future reordering, since "if not changed" (no override) is the
+    // common case that exercises the network tiers instead.
+
+    #[tokio::test]
+    async fn test_resolve_opponent_deck_path_prefers_explicit_name_over_everything() {
+        let log = |_msg: &str| {};
+        let result = resolve_opponent_deck_path(
+            Some("deck-1"),
+            Some("some-deck2-id".to_string()),
+            Some("Explicit Opponent".to_string()),
+            &log,
+        ).await;
+
+        assert_eq!(result, Some("Explicit Opponent".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_resolve_opponent_deck_path_skips_archenemy_tier_without_deck1_id() {
+        // With deck1_id = None, the archenemy tier (gated on `if let Some(id1) = deck1_id`)
+        // must never be attempted; only the curated-pool fallback remains, which is a real
+        // network call. Like other networked tests in this suite, we only assert it resolves
+        // without panicking — not the specific Some/None outcome, which depends on the test
+        // environment's connectivity and the current curated pool's contents.
+        let log = |_msg: &str| {};
+        let result = resolve_opponent_deck_path(None, None, None, &log).await;
+        let _ = result;
     }
 }

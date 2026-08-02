@@ -1535,6 +1535,32 @@ fn pick_random_index(len: usize, seed: u128) -> Option<usize> {
     Some((seed as usize) % len)
 }
 
+/// Response shape from `GET /api/deck/:deckId/archenemy-deck`.
+#[derive(Debug, Deserialize)]
+struct ArchenemyDeckResponse {
+    #[serde(rename = "archenemyDeckId")]
+    archenemy_deck_id: Option<String>,
+    #[serde(rename = "archenemyDeckName")]
+    #[allow(dead_code)]
+    archenemy_deck_name: Option<String>,
+}
+
+/// Looks up the archenemy (default opponent) deck configured for `deck_id`, if any, via the
+/// deck-level Archenemy setting in the Playbook's Deck Rules tab. Returns `(deckId, deckName)`
+/// on success; `None` if unset, the deck isn't found, or the fetch fails for any reason —
+/// callers must treat that exactly like "no archenemy configured" (never block a launch).
+pub fn fetch_archenemy_deck_for_deck(deck_id: &str) -> Option<(String, String)> {
+    let url = format!("{}/api/deck/{}/archenemy-deck", MAMO_API_URL, deck_id);
+    let body = fetch_with_curl_custom(&url, &[
+        "-H", "User-Agent: MaMo-Connector/1.0",
+        "-H", "Accept: application/json",
+    ]).ok()?;
+    let parsed: ArchenemyDeckResponse = serde_json::from_str(&body).ok()?;
+    let id = parsed.archenemy_deck_id?;
+    let name = parsed.archenemy_deck_name.unwrap_or_else(|| id.clone());
+    Some((id, name))
+}
+
 // ==================== Deck Hash Calculation ====================
 
 /// Calculate a deck hash from Forge deck content
