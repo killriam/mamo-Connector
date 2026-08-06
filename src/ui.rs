@@ -2102,10 +2102,6 @@ impl LauncherApp {
                             self.start_forge_download(ctx);
                         }
                     }
-                    ui.add_space(8.0);
-                    if ui.small_button("Skip for now").clicked() {
-                        self.show_setup_wizard = false;
-                    }
                 }
 
                 // ── Step 1b: Download MaMo Forge ─────────────────────────────
@@ -2213,17 +2209,6 @@ impl LauncherApp {
                             self.wizard.download_progress = None;
                             self.wizard.download_result = None;
                             self.wizard.download_cancelled = None;
-                        }
-                        if ui.add(egui::Button::new("I already have Forge →").frame(false)).clicked() {
-                            // Auto-detect on skip
-                            if self.wizard.forge_path_input.is_empty() {
-                                if let Some(p) = get_default_forge_path() {
-                                    let s = p.to_string_lossy().to_string();
-                                    self.wizard.forge_path_valid = validate_forge_path(&s);
-                                    self.wizard.forge_path_input = s;
-                                }
-                            }
-                            self.wizard.step = WizardStep::ConfigureForge;
                         }
                     });
                 }
@@ -2424,9 +2409,6 @@ impl LauncherApp {
                                 ss.forge_path_valid = true;
                             }
                             self.wizard.step = WizardStep::Done;
-                        }
-                        if ui.small_button("Skip for now").clicked() {
-                            self.show_setup_wizard = false;
                         }
                     });
                 }
@@ -4611,11 +4593,11 @@ impl LauncherApp {
                     }
                 } else {
                     ui.label("On the MaMo website, click the profile icon (top-right), then \"Connect Connector\".");
-                    if ui.hyperlink_to("Connect to MaMo", MAMO_WEBSITE_URL)
-                        .on_hover_text("Opens MaMo in your browser")
+                    if ui.button("🌐 Open MaMo Website")
+                        .on_hover_text("Opens MaMo in your browser to retrieve an API token")
                         .clicked()
                     {
-                        // hyperlink_to already opens the URL
+                        ctx.output_mut(|o| o.open_url = Some(egui::OpenUrl::new_tab(MAMO_WEBSITE_URL)));
                     }
                     ui.add_space(8.0);
                     ui.label(egui::RichText::new("Or paste a token directly:").small().weak());
