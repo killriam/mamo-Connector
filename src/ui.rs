@@ -2600,8 +2600,11 @@ impl LauncherApp {
                     if has_token {
                         ui.label(egui::RichText::new("Connected to MaMo").color(egui::Color32::from_rgb(0, 128, 0)));
                     } else {
-                        ui.label(egui::RichText::new("Not connected").color(egui::Color32::from_rgb(176, 0, 32)));
+                        ui.label(egui::RichText::new("Not connected to MaMo account").color(egui::Color32::from_rgb(176, 0, 32)));
                         if ui.small_button("Connect").clicked() {
+                            let _ = std::process::Command::new("cmd")
+                                .args(["/c", "start", MAMO_WEBSITE_URL])
+                                .spawn();
                             self.current_tab = Tab::Setup;
                         }
                     }
