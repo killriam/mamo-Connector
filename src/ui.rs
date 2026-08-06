@@ -1120,22 +1120,7 @@ impl eframe::App for LauncherApp {
                 ui.visuals_mut().override_text_color = Some(egui::Color32::BLACK);
                 ui.visuals_mut().panel_fill = egui::Color32::WHITE;
 
-                if self.show_setup_wizard {
-                    self.render_setup_wizard(ui, ctx);
-                    return;
-                }
-
-                // Title with version info
-                ui.horizontal(|ui| {
-                    ui.heading("Mamo Connector");
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        ui.small(egui::RichText::new(format!("v{} ({})", env!("CARGO_PKG_VERSION"), env!("GIT_HASH")))
-                            .color(egui::Color32::GRAY));
-                    });
-                });
-                ui.separator();
-
-                // Update available banner
+                // Update available banner (render even during setup wizard)
                 let (update_ver, already_dismissed) = {
                     let s = self.update_check.lock().unwrap();
                     (s.available_version.clone(), s.dismissed)
@@ -1167,6 +1152,21 @@ impl eframe::App for LauncherApp {
                         ui.add_space(2.0);
                     }
                 }
+
+                if self.show_setup_wizard {
+                    self.render_setup_wizard(ui, ctx);
+                    return;
+                }
+
+                // Title with version info
+                ui.horizontal(|ui| {
+                    ui.heading("Mamo Connector");
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.small(egui::RichText::new(format!("v{} ({})", env!("CARGO_PKG_VERSION"), env!("GIT_HASH")))
+                            .color(egui::Color32::GRAY));
+                    });
+                });
+                ui.separator();
 
                 // MaMo Forge update banner — only ever populated for Connector-managed installs
                 let (forge_update_asset, forge_update_dismissed) = {
