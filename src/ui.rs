@@ -896,9 +896,11 @@ impl LauncherApp {
 
 impl eframe::App for LauncherApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // Process initial deeplink on first frame (with progress logging)
-        if let Some(deeplink) = self.pending_initial_deeplink.take() {
-            self.process_deeplink_with_progress(deeplink, ctx);
+        // Process initial deeplink on first frame (with progress logging) - only after setup wizard is completed/closed
+        if !self.show_setup_wizard {
+            if let Some(deeplink) = self.pending_initial_deeplink.take() {
+                self.process_deeplink_with_progress(deeplink, ctx);
+            }
         }
 
         // Pick up wizard requests from background threads (e.g. forge launch failure)
@@ -970,9 +972,9 @@ impl eframe::App for LauncherApp {
             }
         }
         
-        // Check for pending commands from secondary instances every 500ms
+        // Check for pending commands from secondary instances every 500ms - only after setup wizard is completed/closed
         let now = Instant::now();
-        if now.duration_since(self.last_pending_check).as_millis() > 500 {
+        if !self.show_setup_wizard && now.duration_since(self.last_pending_check).as_millis() > 500 {
             self.last_pending_check = now;
             self.check_pending_commands(ctx);
         }
