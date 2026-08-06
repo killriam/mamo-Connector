@@ -2148,12 +2148,6 @@ impl LauncherApp {
                                 ui.add(egui::ProgressBar::new(0.0).animate(true).desired_width(380.0));
                             }
                         }
-                        ui.add_space(10.0);
-                        if ui.button("Cancel").clicked() {
-                            if let Some(ref c) = self.wizard.download_cancelled {
-                                c.store(true, Ordering::Relaxed);
-                            }
-                        }
                     } else {
                         // ── Idle / error / already downloaded ────────────────
                         let forge_dir = forge_download_dir();
@@ -2200,19 +2194,6 @@ impl LauncherApp {
                             }
                         }
                     }
-
-                    ui.add_space(16.0);
-                    ui.separator();
-                    ui.add_space(8.0);
-
-                    ui.horizontal(|ui| {
-                        if ui.button("← Back").clicked() {
-                            self.wizard.step = WizardStep::Welcome;
-                            self.wizard.download_progress = None;
-                            self.wizard.download_result = None;
-                            self.wizard.download_cancelled = None;
-                        }
-                    });
                 }
 
                 // ── Step 2: Configure Forge path ─────────────────────────────
@@ -2386,11 +2367,7 @@ impl LauncherApp {
                     }
                     ui.add_space(16.0);
 
-                    // Navigation
                     ui.horizontal(|ui| {
-                        if ui.button("← Back").clicked() {
-                            self.wizard.step = WizardStep::Welcome;
-                        }
                         let can_finish = self.wizard.forge_path_valid;
                         if ui.add_enabled(
                             can_finish,
