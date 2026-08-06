@@ -311,6 +311,47 @@ use log::debug;
 /// generic fallback) so they can't drift out of sync with each other — which is exactly how the
 /// Windows exe/cmd/bat branch previously ended up launching Forge with none of these args at all,
 /// even though Forge's own launcher does forward them through to `forge.view.Main` correctly.
+fn force_constructed_view_in_preferences() {
+    let Some(mut path) = get_forge_deck_directory() else { return; };
+    if path.pop() && path.pop() {
+        let pref_file = path.join("preferences").join("forge.preferences");
+        if pref_file.exists() {
+            if let Ok(content) = std::fs::read_to_string(&pref_file) {
+                let mut lines: Vec<String> = content.lines().map(|s| s.to_string()).collect();
+                let keys_to_update = [
+                    ("SUBMENU_CURRENTMENU", "HOME_CONSTRUCTED"),
+                    ("SUBMENU_SANCTIONED", "true"),
+                    ("SUBMENU_PUZZLE", "false"),
+                    ("SUBMENU_QUEST", "false"),
+                ];
+                let mut modified = false;
+                for (key, val) in keys_to_update {
+                    let prefix = format!("{}=", key);
+                    let mut found = false;
+                    for line in lines.iter_mut() {
+                        if line.starts_with(&prefix) {
+                            let expected = format!("{}={}", key, val);
+                            if *line != expected {
+                                *line = expected;
+                                modified = true;
+                            }
+                            found = true;
+                            break;
+                        }
+                    }
+                    if !found {
+                        lines.push(format!("{}={}", key, val));
+                        modified = true;
+                    }
+                }
+                if modified {
+                    let _ = std::fs::write(&pref_file, lines.join("\n") + "\n");
+                }
+            }
+        }
+    }
+}
+
 fn forge_launch_args(deck_name: Option<&str>, deck2_name: Option<&str>) -> Vec<String> {
     let mut args = vec!["gui".to_string(), "--format".to_string(), "commander".to_string()];
     if let Some(deck) = deck_name {
@@ -340,6 +381,8 @@ pub fn launch_forge(forge_path: &str, deck_name: Option<&str>, deck2_name: Optio
             "Forge executable not found at: {}", forge_path
         )));
     }
+
+    force_constructed_view_in_preferences();
 
     // If a directory was configured, resolve to the latest forge-gui-desktop JAR inside it
     let forge_path_buf = if forge_path_buf.is_dir() {
