@@ -1212,18 +1212,22 @@ pub async fn create_deck_from_mamo_with_progress(
 
     log(&format!("Deck name: {}", deck_name));
 
-    // Remember which revision this export was built from, keyed by the same Forge deck
-    // name that gamelog association matches against — best-effort, never fails the launch.
-    if let Some(ref revision_id) = export_revision_id {
-        match crate::gamelog::DeckMappings::load() {
-            Ok(mut mappings) => {
+    // Remember this deck's MaMo id — and, if known, the revision this export was built from —
+    // keyed by the same Forge deck name that gamelog association matches against. Without the
+    // deck_id mapping, a gamelog uploaded after this playtest can only be associated with a
+    // deck via the backend's fuzzy name-matching fallback instead of a direct, reliable link.
+    // Best-effort: never fails the launch.
+    match crate::gamelog::DeckMappings::load() {
+        Ok(mut mappings) => {
+            mappings.set_mapping(deck_name, deck_id);
+            if let Some(ref revision_id) = export_revision_id {
                 mappings.set_revision_mapping(deck_name, revision_id);
-                if let Err(e) = mappings.save() {
-                    warn!("Could not persist deck revision mapping: {}", e);
-                }
             }
-            Err(e) => warn!("Could not load deck mappings to record revision: {}", e),
+            if let Err(e) = mappings.save() {
+                warn!("Could not persist deck mapping: {}", e);
+            }
         }
+        Err(e) => warn!("Could not load deck mappings to record deck/revision mapping: {}", e),
     }
 
     // Calculate deck hash to check if deck content changed
