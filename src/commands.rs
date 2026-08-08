@@ -90,6 +90,32 @@ pub async fn handle_command_with_logger(deeplink: &Deeplink, log_collector: Opti
     
     log(&format!("Processing action: {}", deeplink.action));
     
+    // If a token is provided in the deeplink, automatically update the settings
+    // so any subsequent network calls (e.g. deck downloads, simulations, or gamelog uploads)
+    // use the current web app user's authentication context.
+    if let Some(ref token) = deeplink.token {
+        if !token.is_empty() {
+            log("Updating authentication token from deeplink parameter...");
+            match Settings::load() {
+                Ok(mut settings) => {
+                    settings.auth_token = Some(token.clone());
+                    settings.gamelog_config.auth_token = Some(token.clone());
+                    if let Err(e) = settings.save() {
+                        error!("Failed to save auto-loaded token: {}", e);
+                        log(&format!("Failed to save auth token: {}", e));
+                    } else {
+                        info!("Authentication token updated successfully from command");
+                        log("Authentication token updated successfully.");
+                    }
+                }
+                Err(e) => {
+                    error!("Failed to load settings to save auto-loaded token: {}", e);
+                    log(&format!("Failed to load settings: {}", e));
+                }
+            }
+        }
+    }
+    
     match deeplink.action.as_str() {
         "create-deck" => handle_create_deck(deeplink).await,
         "createdeck" => handle_create_deck(deeplink).await, // Alternative format
