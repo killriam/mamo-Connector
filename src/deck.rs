@@ -2380,6 +2380,64 @@ pub fn ensure_dummy_defender_deck() -> Result<()> {
 mod tests {
     use super::*;
 
+    // ==================== Forge Scenario Export — Live Verification ====================
+    //
+    // Not a unit test: hits the real production backend and writes real files into this
+    // machine's actual Forge deck/gamelog directories. Ignored by default so a normal
+    // `cargo test` run never does that unexpectedly; run explicitly with
+    // `cargo test test_create_deck_and_scenario_for_forge_writes_expected_files -- --ignored --nocapture`
+    // against a deckId/scenarioId known to exist and have eventTiming-scheduled cards.
+    #[tokio::test]
+    #[ignore]
+    async fn test_create_deck_and_scenario_for_forge_writes_expected_files() {
+        let deck_id = "f4f240a2-72a3-45d1-98bf-04028a8522e4";
+        let scenario_id = "56773e5a-fece-42cc-b2a1-6d99e292e717";
+
+        let result = create_deck_and_scenario_for_forge(deck_id, scenario_id)
+            .await
+            .expect("should fetch bundle from production and write files");
+
+        assert!(result.success, "expected success: {}", result.message);
+        let deck_path = result.deck_path.expect("deck_path should be set on success");
+        assert!(deck_path.exists(), "expected .dck file at {:?}", deck_path);
+
+        let deck_content = fs::read_to_string(&deck_path).expect("should read .dck file");
+        assert!(deck_content.contains("[Commander]"));
+        assert!(deck_content.contains("[Main]"));
+        println!("✅ .dck written: {:?}", deck_path);
+
+        let log_dir = get_game_log_directory().expect("should resolve gamelog directory");
+        let deck_name_stem = deck_path
+            .file_stem()
+            .expect("deck path should have a file stem")
+            .to_string_lossy()
+            .to_string();
+        let scenario_json_path = log_dir.join(format!("Scenario_{}.json", deck_name_stem));
+        assert!(
+            scenario_json_path.exists(),
+            "expected scenario JSON at {:?}",
+            scenario_json_path
+        );
+
+        let scenario_json_content =
+            fs::read_to_string(&scenario_json_path).expect("should read scenario JSON");
+        let parsed: serde_json::Value =
+            serde_json::from_str(&scenario_json_content).expect("scenario JSON should parse");
+        assert_eq!(parsed["format"], "mtg-replay");
+        assert_eq!(parsed["mode"], "scenario");
+
+        let events = parsed["events"]
+            .as_array()
+            .expect("events should be an array for this scenario");
+        assert!(!events.is_empty(), "expected at least one scripted event");
+        for event in events {
+            assert_eq!(event["a"], "P1", "every event actor should be the plain seat id P1");
+        }
+
+        println!("✅ Scenario JSON written: {:?}", scenario_json_path);
+        println!("✅ {} event(s), all actor=\"P1\"", events.len());
+    }
+
     // ==================== Deck Hash Calculation Tests ====================
     
     #[test]
