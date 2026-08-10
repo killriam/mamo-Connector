@@ -841,7 +841,7 @@ pub fn is_process_running(pid: u32) -> bool {
 pub fn is_forge_window_open() -> bool {
     #[cfg(windows)]
     {
-        use winapi::um::winuser::{EnumWindows, GetWindowTextW, IsWindowVisible};
+        use winapi::um::winuser::{EnumWindows, GetWindowTextW, IsWindowVisible, GetWindowThreadProcessId};
         use winapi::shared::windef::HWND;
         use winapi::shared::minwindef::{BOOL, LPARAM, TRUE};
         
@@ -855,9 +855,55 @@ pub fn is_forge_window_open() -> bool {
                 if len > 0 {
                     let title = String::from_utf16_lossy(&buf[..len as usize]);
                     if title.contains("Forge") {
-                        let found = &mut *(lparam as *mut bool);
-                        *found = true;
-                        return 0; // stop enumeration
+                        // Get process ID of the window to verify if it's the actual Forge game
+                        // (either java.exe/javaw.exe for jar launch, or forge.exe for native launcher).
+                        // This prevents false positives from browser tabs, VS Code, or explorer windows
+                        // that happen to contain "Forge" in their title.
+                        let mut pid = 0;
+                        GetWindowThreadProcessId(hwnd, &mut pid);
+                        if pid != 0 {
+                            use winapi::um::processthreadsapi::OpenProcess;
+                            use winapi::um::handleapi::CloseHandle;
+                            
+                            unsafe extern "system" {
+                                fn QueryFullProcessImageNameW(
+                                    hProcess: *mut winapi::ctypes::c_void,
+                                    dwFlags: u32,
+                                    lpExeName: *mut u16,
+                                    lpdwSize: *mut u32,
+                                ) -> i32;
+                            }
+                            
+                            const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
+                            
+                            let h_process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+                            if !h_process.is_null() {
+                                let mut img_buf = [0u16; 1024];
+                                let mut size = img_buf.len() as u32;
+                                if QueryFullProcessImageNameW(h_process, 0, img_buf.as_mut_ptr(), &mut size) != 0 {
+                                    let img_path = String::from_utf16_lossy(&img_buf[..size as usize]);
+                                    let exe_name = img_path
+                                        .split('\\')
+                                        .last()
+                                        .unwrap_or("")
+                                        .to_lowercase();
+                                    
+                                    if exe_name == "forge.exe"
+                                        || exe_name == "java.exe"
+                                        || exe_name == "javaw.exe"
+                                        || exe_name == "forge"
+                                        || exe_name == "java"
+                                        || exe_name == "javaw"
+                                    {
+                                        let found = &mut *(lparam as *mut bool);
+                                        *found = true;
+                                        CloseHandle(h_process);
+                                        return 0; // stop enumeration
+                                    }
+                                }
+                                CloseHandle(h_process);
+                            }
+                        }
                     }
                 }
                 TRUE // continue
