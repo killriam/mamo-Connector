@@ -1,8 +1,8 @@
-# Mamo Connector Launcher
+# MaMo Connector (Mamo Connector Launcher)
 
-This Rust desktop helper registers the custom `mamoConnector://` URI scheme and displays any
-incoming deep-link arguments in a simple native UI. It is intended as the groundwork for a
-secure launcher that can be invoked from the browser and expanded with action handling logic.
+**MaMo Connector** (also known as **Mamo Connector Launcher**) is a lightweight, open-source desktop companion client for the **Magic Moments (MaMo)** playtesting platform. 
+
+This Rust-based helper registers the custom `mamo://` and `mamoConnector://` URI schemes, enabling secure browser-to-desktop deep linking. It automatically downloads deck files, parses action parameters, and coordinates local game clients (such as launching Forge replays and playtest sessions).
 
 ## Features
 
