@@ -1,4 +1,4 @@
-# MaMo Connector (Mamo Connector Launcher)
+# MaMo Connector - Magic Moments Companion
 
 **MaMo Connector** (also known as **Mamo Connector Launcher**) is a lightweight, open-source desktop companion client for the **Magic Moments (MaMo)** playtesting platform. 
 
