@@ -99,4 +99,11 @@ The API should return JSON data in the following format:
 
 ## Privacy Policy
 
-The MaMo Connector application does not collect, store, or transmit any user personal data, telemetry, or analytics. It operates purely as a local helper client to parse deep-link parameters and launch local game clients. All operations are performed locally on the user's machine.
+The MaMo Connector application does not collect or transmit telemetry, usage analytics, or personal profiles. 
+
+To enable its core functionality, the application stores the following configuration data **locally on your computer's disk** (within the user application data directory):
+*   **Local Paths:** File paths to your local Forge executable and script directories.
+*   **Sync Configuration:** Names, URLs, and deck/owner IDs associated with the links you configure for synchronization.
+*   **Authentication Tokens:** Short-lived security tokens (JWTs) required to authorize deck downloads from the Magic Moments platform and third-party APIs (like Moxfield).
+
+This data is used strictly for local operations and to authenticate synchronization requests against the respective APIs. It is never uploaded or shared with any third-party tracking or collection servers.
