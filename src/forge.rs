@@ -658,8 +658,8 @@ pub fn launch_forge_replay(replay_path: &str) -> Result<ForgeLaunchResult> {
                 cmd.current_dir(dir);
             }
 
-            // Forge replay CLI: `replay <path>`
-            cmd.arg("replay").arg(replay_path);
+            // Forge replay CLI: `gui replay <path>`
+            cmd.arg("gui").arg("replay").arg(replay_path);
 
             cmd.spawn()
         }
@@ -674,9 +674,9 @@ pub fn launch_forge_replay(replay_path: &str) -> Result<ForgeLaunchResult> {
                     cmd.current_dir(dir);
                 }
                 // Forge's native launcher forwards CLI args straight through to forge.view.Main
-                // (confirmed empirically — see launch_forge's Windows branch), so `replay <path>`
+                // (confirmed empirically — see launch_forge's Windows branch), so `gui replay <path>`
                 // works here exactly like it does on the JAR/mac/Linux paths below.
-                cmd.arg("replay").arg(replay_path);
+                cmd.arg("gui").arg("replay").arg(replay_path);
                 cmd.creation_flags(DETACHED_PROCESS);
                 cmd.spawn()
             }
@@ -686,14 +686,14 @@ pub fn launch_forge_replay(replay_path: &str) -> Result<ForgeLaunchResult> {
                 if let Some(dir) = &forge_dir {
                     cmd.current_dir(dir);
                 }
-                cmd.arg("replay").arg(replay_path);
+                cmd.arg("gui").arg("replay").arg(replay_path);
                 cmd.spawn()
             }
         }
         "app" => {
             let mut cmd = Command::new("open");
             cmd.arg(&forge_path_buf);
-            cmd.arg("--args").arg("replay").arg(replay_path);
+            cmd.arg("--args").arg("gui").arg("replay").arg(replay_path);
             cmd.spawn()
         }
         "sh" => {
@@ -701,7 +701,7 @@ pub fn launch_forge_replay(replay_path: &str) -> Result<ForgeLaunchResult> {
             if let Some(dir) = &forge_dir {
                 cmd.current_dir(dir);
             }
-            cmd.arg("replay").arg(replay_path);
+            cmd.arg("gui").arg("replay").arg(replay_path);
             cmd.spawn()
         }
         _ => {
@@ -709,7 +709,7 @@ pub fn launch_forge_replay(replay_path: &str) -> Result<ForgeLaunchResult> {
             if let Some(dir) = &forge_dir {
                 cmd.current_dir(dir);
             }
-            cmd.arg("replay").arg(replay_path);
+            cmd.arg("gui").arg("replay").arg(replay_path);
             cmd.spawn()
         }
     };
