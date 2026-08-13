@@ -1,5 +1,18 @@
 # Forge Replay Launching Bug & Fix Details
 
+> **RESOLVED 2026-08-13.** Implemented on both sides (Forge `replay-Features` branch,
+> mamo-Connector `src/forge.rs`) and verified end-to-end with a real CLI launch against an
+> actual replay log: no crash, deck/library reconstruction ran, and the interactive match
+> screen opened correctly (Commander-upgrade fallback and forced draw-order reorder both
+> fired as designed). One correction to the plan below: `Main.java`'s CLI `case "replay"`
+> stores the path and calls `startGui()`, which — after `Singletons.getControl().initialize()`
+> completes, not before — calls `CSubmenuReplay.SINGLETON_INSTANCE.startReplayFromPath(path)`
+> directly (wrapped in `SwingUtilities.invokeLater`, required or a live `IllegalStateException`
+> is thrown deep in match-screen Swing construction, which asserts EDT). This was simpler and
+> more reliable than routing through `CSubmenuReplay.setPendingReplayPath()` +
+> `update()`, which only auto-fires if the Replay Game submenu happens to be the user's
+> last-selected tab (persisted preference) — not guaranteed for a fresh CLI/deeplink launch.
+
 ## The Problem
 
 When starting a game replay via the `mamoConnector://replay-game` deeplink, Forge fails to start and exits with the following output:

@@ -582,10 +582,10 @@ pub fn launch_forge(forge_path: &str, deck_name: Option<&str>, deck2_name: Optio
 
 /// Launch Forge in replay mode with a specific replay JSON file
 ///
-/// Uses the `replay <path>` CLI argument documented in Forge's FEATURE_GAME_REPLAY.md.
-/// JAR/macOS/Linux: passes `replay <path>` directly to Forge CLI.
-/// Windows EXE: cannot pass CLI args — logs a warning, launches Forge normally
-/// (user must pick from Replay Mode menu; file is already in gamelogs dir).
+/// Uses the `replay <path>` CLI mode added to Forge's Main.java (see FORGE_REPLAY_BUG.md).
+/// Passes `replay <path>` directly to Forge's CLI on every launch path (JAR, Windows EXE,
+/// macOS .app, shell script) — Forge's native launchers all forward CLI args straight through
+/// to forge.view.Main, same as the deck-preselect args in launch_forge() above.
 pub fn launch_forge_replay(replay_path: &str) -> Result<ForgeLaunchResult> {
     // Don't open another Forge window if one is already visible
     if is_forge_window_open() {
@@ -658,8 +658,8 @@ pub fn launch_forge_replay(replay_path: &str) -> Result<ForgeLaunchResult> {
                 cmd.current_dir(dir);
             }
 
-            // Forge replay CLI: `gui replay <path>`
-            cmd.arg("gui").arg("replay").arg(replay_path);
+            // Forge replay CLI: `replay <path>`
+            cmd.arg("replay").arg(replay_path);
 
             cmd.spawn()
         }
@@ -674,9 +674,9 @@ pub fn launch_forge_replay(replay_path: &str) -> Result<ForgeLaunchResult> {
                     cmd.current_dir(dir);
                 }
                 // Forge's native launcher forwards CLI args straight through to forge.view.Main
-                // (confirmed empirically — see launch_forge's Windows branch), so `gui replay <path>`
+                // (confirmed empirically — see launch_forge's Windows branch), so `replay <path>`
                 // works here exactly like it does on the JAR/mac/Linux paths below.
-                cmd.arg("gui").arg("replay").arg(replay_path);
+                cmd.arg("replay").arg(replay_path);
                 cmd.creation_flags(DETACHED_PROCESS);
                 cmd.spawn()
             }
@@ -686,14 +686,14 @@ pub fn launch_forge_replay(replay_path: &str) -> Result<ForgeLaunchResult> {
                 if let Some(dir) = &forge_dir {
                     cmd.current_dir(dir);
                 }
-                cmd.arg("gui").arg("replay").arg(replay_path);
+                cmd.arg("replay").arg(replay_path);
                 cmd.spawn()
             }
         }
         "app" => {
             let mut cmd = Command::new("open");
             cmd.arg(&forge_path_buf);
-            cmd.arg("--args").arg("gui").arg("replay").arg(replay_path);
+            cmd.arg("--args").arg("replay").arg(replay_path);
             cmd.spawn()
         }
         "sh" => {
@@ -701,7 +701,7 @@ pub fn launch_forge_replay(replay_path: &str) -> Result<ForgeLaunchResult> {
             if let Some(dir) = &forge_dir {
                 cmd.current_dir(dir);
             }
-            cmd.arg("gui").arg("replay").arg(replay_path);
+            cmd.arg("replay").arg(replay_path);
             cmd.spawn()
         }
         _ => {
@@ -709,7 +709,7 @@ pub fn launch_forge_replay(replay_path: &str) -> Result<ForgeLaunchResult> {
             if let Some(dir) = &forge_dir {
                 cmd.current_dir(dir);
             }
-            cmd.arg("gui").arg("replay").arg(replay_path);
+            cmd.arg("replay").arg(replay_path);
             cmd.spawn()
         }
     };
