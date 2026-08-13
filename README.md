@@ -96,3 +96,7 @@ The API should return JSON data in the following format:
 - Add more deck import formats and sources.
 - Implement deck validation and error handling.
 - Add support for other card game formats beyond Magic: The Gathering.
+
+## Privacy Policy
+
+The MaMo Connector application does not collect, store, or transmit any user personal data, telemetry, or analytics. It operates purely as a local helper client to parse deep-link parameters and launch local game clients. All operations are performed locally on the user's machine.
