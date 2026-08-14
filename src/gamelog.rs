@@ -1291,6 +1291,67 @@ pub async fn fetch_my_decks(config: &GameLogConfig) -> Result<Vec<UserDeck>> {
     Ok(data.decks)
 }
 
+/// A lightweight scenario summary from `GET /api/scenarios?deckId=` — enough to list a deck's
+/// saved scenarios and decide which are playable in Forge, without needing the full
+/// `ScenarioDefinition` payload's synergies/combos/events.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ScenarioSummary {
+    pub id: String,
+    pub name: String,
+    pub mode: String,
+    #[serde(default)]
+    pub cards: Vec<ScenarioCardZoneOnly>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub(crate) struct ScenarioCardZoneOnly {
+    zone: String,
+}
+
+impl ScenarioSummary {
+    /// Mirrors the same two gates the web app applies before showing its own
+    /// "▶ Play in Forge (scenario)" link: only starting-hand/perfect-game scenarios are
+    /// exportable to Forge (the backend's forge-scenario export rejects other modes), and
+    /// only once at least one card has actually been placed in the opening hand.
+    pub fn playable_in_forge(&self) -> bool {
+        (self.mode == "starting-hand" || self.mode == "perfect-game")
+            && self.cards.iter().any(|c| c.zone == "hand")
+    }
+}
+
+/// Fetch a deck's saved scenarios from the backend using PAT authentication — reuses the same
+/// `gamelog:upload`-scoped token `fetch_my_decks` already sends, since the backend's
+/// `/api/scenarios` route accepts either a JWT or that scope.
+pub async fn fetch_deck_scenarios(config: &GameLogConfig, deck_id: &str) -> Result<Vec<ScenarioSummary>> {
+    let auth_token = config.auth_token.as_ref()
+        .ok_or_else(|| anyhow::anyhow!("No authentication token configured"))?;
+
+    let client = reqwest::Client::new();
+    let url = format!("{}/api/scenarios?deckId={}", config.api_url, deck_id);
+
+    log::info!("Fetching deck scenarios from: {}", url);
+
+    let response = client
+        .get(&url)
+        .header("Authorization", format!("Bearer {}", auth_token))
+        .send()
+        .await
+        .context("Failed to fetch scenarios")?;
+
+    if !response.status().is_success() {
+        let status = response.status();
+        let error_text = response.text().await.unwrap_or_else(|_| "Unknown error".to_string());
+        return Err(anyhow::anyhow!("Failed to fetch scenarios: {} - {}", status, error_text));
+    }
+
+    let scenarios: Vec<ScenarioSummary> = response.json().await
+        .context("Failed to parse scenarios response")?;
+
+    log::info!("Fetched {} scenarios for deck {}", scenarios.len(), deck_id);
+    Ok(scenarios)
+}
+
 /// Calculate similarity score between two deck names (0.0 - 1.0)
 pub fn deck_name_similarity(name1: &str, name2: &str) -> f64 {
     let n1 = name1.to_lowercase();

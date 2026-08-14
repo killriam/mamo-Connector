@@ -403,6 +403,19 @@ fn forge_jar_already_downloaded() -> bool {
         .unwrap_or(false)
 }
 
+/// State for the Play tab's scenario picker — the saved Starting Hand/Perfect Game scenarios
+/// for whichever deck is currently selected in `selected_account_deck`.
+#[derive(Clone, Default)]
+struct ScenarioPickerState {
+    /// Which deck `scenarios` belongs to — lets an in-flight fetch detect that the user has
+    /// since selected a different deck and drop its (now stale) result instead of applying it.
+    deck_id: Option<String>,
+    /// Already filtered to Forge-playable scenarios (see `ScenarioSummary::playable_in_forge`)
+    scenarios: Vec<crate::gamelog::ScenarioSummary>,
+    is_loading: bool,
+    error_message: Option<String>,
+}
+
 /// State for the game log tab
 #[derive(Clone, Default)]
 #[allow(dead_code)]
@@ -641,6 +654,8 @@ struct LauncherApp {
     last_seen_entry_count: usize,
     /// Account deck (from MaMo, not necessarily downloaded yet) to pre-select when launching Forge
     selected_account_deck: Option<crate::gamelog::UserDeck>,
+    /// Saved scenarios for `selected_account_deck`, shown in the Play tab's scenario picker
+    scenario_picker: Arc<Mutex<ScenarioPickerState>>,
     /// Local `.dck` file names available in the Forge deck directory
     forge_local_decks: Vec<String>,
     /// Background version check result
@@ -876,6 +891,7 @@ impl LauncherApp {
             activity_panel_collapsed: !started_with_deeplink,
             last_seen_entry_count: 0,
             selected_account_deck: None,
+            scenario_picker: Arc::new(Mutex::new(ScenarioPickerState::default())),
             forge_local_decks: Vec::new(),
             update_check,
             forge_update_check,
@@ -2537,6 +2553,92 @@ impl LauncherApp {
         });
     }
 
+    /// Download+launch a scenario picked from the Play tab's scenario list — the scenario
+    /// counterpart to `launch_account_deck_async` above: same activity-log/PID/play-session
+    /// bookkeeping and curated-opponent resolution, but prepares the scenario-ordered deck
+    /// (`create_deck_and_scenario_for_forge`) instead of a plain deck download.
+    fn launch_scenario_async(
+        &mut self,
+        deck_id: String,
+        scenario_id: String,
+        scenario_name: String,
+        ctx: &egui::Context,
+    ) {
+        *self.is_launching_selected_deck.lock().unwrap() = true;
+        *self.play_session.lock().unwrap() = PlaySession::Launching;
+
+        let activity_log = self.activity_log.clone();
+        let forge_pid = self.forge_pid.clone();
+        let forge_monitoring_since = self.forge_monitoring_since.clone();
+        let is_launching = self.is_launching_selected_deck.clone();
+        let refresh_requested = self.forge_local_decks_refresh_requested.clone();
+        let play_session = Arc::clone(&self.play_session);
+        let ctx_clone = ctx.clone();
+
+        if let Ok(mut log) = self.activity_log.lock() {
+            log.log_info(format!("Preparing scenario '{}' before launching Forge…", scenario_name));
+        }
+
+        tokio::spawn(async move {
+            let forge_result = match crate::deck::create_deck_and_scenario_for_forge(&deck_id, &scenario_id).await {
+                Ok(deck_result) if deck_result.success => {
+                    if let Ok(mut log) = activity_log.lock() {
+                        log.log_success(&deck_result.message);
+                    }
+                    let deck_path_str = deck_result.deck_path.as_ref()
+                        .map(|p| p.to_string_lossy().to_string());
+                    let deck2_path = resolve_curated_opponent_deck_path(&activity_log).await;
+                    launch_forge_from_settings(deck_path_str.as_deref(), deck2_path.as_deref())
+                }
+                Ok(deck_result) => {
+                    if let Ok(mut log) = activity_log.lock() {
+                        log.log_error(format!("Scenario preparation failed: {}", deck_result.message));
+                    }
+                    *is_launching.lock().unwrap() = false;
+                    *play_session.lock().unwrap() = PlaySession::Watching;
+                    ctx_clone.request_repaint();
+                    return;
+                }
+                Err(e) => {
+                    if let Ok(mut log) = activity_log.lock() {
+                        log.log_error(format!("Failed to prepare scenario: {}", e));
+                    }
+                    *is_launching.lock().unwrap() = false;
+                    *play_session.lock().unwrap() = PlaySession::Watching;
+                    ctx_clone.request_repaint();
+                    return;
+                }
+            };
+
+            match forge_result {
+                Ok(result) => {
+                    if let Ok(mut log) = activity_log.lock() {
+                        if result.success {
+                            log.log_success(&result.message);
+                        } else {
+                            log.log_info(&result.message);
+                        }
+                    }
+                    if let Some(pid) = result.pid {
+                        *forge_pid.lock().unwrap() = Some(pid);
+                        *forge_monitoring_since.lock().unwrap() = Some(Instant::now());
+                    }
+                    *play_session.lock().unwrap() = if result.success { PlaySession::Playing } else { PlaySession::Watching };
+                }
+                Err(e) => {
+                    if let Ok(mut log) = activity_log.lock() {
+                        log.log_error(format!("Failed to launch Forge: {}", e));
+                    }
+                    *play_session.lock().unwrap() = PlaySession::Watching;
+                }
+            }
+
+            refresh_requested.store(true, Ordering::Relaxed);
+            *is_launching.lock().unwrap() = false;
+            ctx_clone.request_repaint();
+        });
+    }
+
     /// Launches Forge with a deck that's already downloaded locally, still resolving a curated
     /// opponent deck for `--deck2` first — the counterpart to `launch_account_deck_async` for
     /// when deck1 doesn't need downloading. Kept async (rather than the previous one-line
@@ -2709,6 +2811,7 @@ impl LauncherApp {
                     state.forge_path_valid
                 };
                 if forge_configured {
+                    let deck_id_before = self.selected_account_deck.as_ref().map(|d| d.deck_id.clone());
                     ui.horizontal(|ui| {
                         ui.label(egui::RichText::new("Deck:").small());
                         let decks_snapshot = self.account_decks();
@@ -2750,6 +2853,17 @@ impl LauncherApp {
                             self.fetch_my_mamo_decks(ctx);
                         }
                     });
+
+                    // Selecting a different deck refreshes its scenario picker below.
+                    let deck_id_after = self.selected_account_deck.as_ref().map(|d| d.deck_id.clone());
+                    if deck_id_after != deck_id_before {
+                        match self.selected_account_deck.clone() {
+                            Some(deck) => self.fetch_scenarios_for_deck(deck.deck_id, ctx),
+                            None => *self.scenario_picker.lock().unwrap() = ScenarioPickerState::default(),
+                        }
+                    }
+
+                    self.render_scenario_picker(ui, ctx);
                 }
             });
 
@@ -4534,6 +4648,105 @@ impl LauncherApp {
             }
             
             ctx_clone.request_repaint();
+        });
+    }
+
+    /// Fetch the saved scenarios for `deck_id` and show them in the Play tab's scenario
+    /// picker — mirrors `fetch_my_mamo_decks` above, scoped to one deck.
+    fn fetch_scenarios_for_deck(&mut self, deck_id: String, ctx: &egui::Context) {
+        let scenario_picker = Arc::clone(&self.scenario_picker);
+        let settings = Arc::clone(&self.settings);
+        let ctx_clone = ctx.clone();
+
+        {
+            let mut picker = scenario_picker.lock().unwrap();
+            picker.deck_id = Some(deck_id.clone());
+            picker.scenarios.clear();
+            picker.is_loading = true;
+            picker.error_message = None;
+        }
+
+        tokio::spawn(async move {
+            let config = {
+                let settings = settings.lock().unwrap();
+                settings.gamelog_config.clone()
+            };
+
+            let result = crate::gamelog::fetch_deck_scenarios(&config, &deck_id).await;
+
+            {
+                let mut picker = scenario_picker.lock().unwrap();
+                // The user may have selected a different deck while this was in flight —
+                // drop a stale response instead of showing scenarios for the wrong deck.
+                if picker.deck_id.as_deref() != Some(deck_id.as_str()) {
+                    return;
+                }
+                picker.is_loading = false;
+
+                match result {
+                    Ok(scenarios) => {
+                        picker.scenarios = scenarios
+                            .into_iter()
+                            .filter(|s| s.playable_in_forge())
+                            .collect();
+                    }
+                    Err(e) => {
+                        picker.error_message = Some(format!("Failed to fetch scenarios: {}", e));
+                    }
+                }
+            }
+
+            ctx_clone.request_repaint();
+        });
+    }
+
+    /// Renders the "Scenarios" list under the deck picker for whichever deck is selected —
+    /// one row per Forge-playable saved scenario, each with its own "▶ Play in Forge" button.
+    /// No-op if no deck is selected (nothing to show).
+    fn render_scenario_picker(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        let Some(deck) = self.selected_account_deck.clone() else {
+            return;
+        };
+
+        let (is_loading, scenarios, error_message) = {
+            let picker = self.scenario_picker.lock().unwrap();
+            (picker.is_loading, picker.scenarios.clone(), picker.error_message.clone())
+        };
+
+        ui.add_space(6.0);
+        ui.group(|ui| {
+            ui.label(egui::RichText::new("Scenarios").strong().small());
+            if is_loading {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label(egui::RichText::new("Loading scenarios…").small());
+                });
+            } else if let Some(err) = error_message {
+                ui.label(egui::RichText::new(err).small().color(egui::Color32::from_rgb(176, 0, 32)));
+            } else if scenarios.is_empty() {
+                ui.label(
+                    egui::RichText::new(
+                        "No Starting Hand / Perfect Game scenarios with a filled opening hand for this deck yet."
+                    )
+                    .small()
+                    .color(egui::Color32::GRAY),
+                );
+            } else {
+                let is_launching = *self.is_launching_selected_deck.lock().unwrap();
+                for scenario in &scenarios {
+                    ui.horizontal(|ui| {
+                        ui.label(&scenario.name);
+                        if ui.add_enabled(!is_launching, egui::Button::new("▶ Play in Forge")).clicked() {
+                            self.launch_scenario_async(
+                                deck.deck_id.clone(),
+                                scenario.id.clone(),
+                                scenario.name.clone(),
+                                ctx,
+                            );
+                        }
+                    });
+                }
+            }
         });
     }
 
