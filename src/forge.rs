@@ -1,5 +1,5 @@
 use anyhow::Result;
-use log::{error, info};
+use log::{error, info, warn};
 use std::path::PathBuf;
 use std::process::Command;
 
@@ -365,6 +365,80 @@ fn forge_launch_args(deck_name: Option<&str>, deck2_name: Option<&str>) -> Vec<S
     args
 }
 
+/// Spawns `cmd` and verifies the child is still alive shortly after, instead of trusting
+/// `Command::spawn()` alone. `spawn()` succeeding only proves the OS accepted the exec request —
+/// it says nothing about whether the launched program did anything useful. A mismatched CLI arg
+/// (e.g. a Forge build without the `replay` CLI mode patch — see FORGE_REPLAY_BUG.md) makes
+/// Forge print an error and exit within milliseconds; with stdio inherited from this windowed,
+/// consoleless app, that error was previously discarded and every caller here reported
+/// "launched" success regardless, since they only ever checked `Ok(child)` vs `Err(e)` on
+/// spawn() itself. This pipes stderr and gives the process a short grace period so a near-
+/// instant crash is reported as a real failure carrying Forge's actual error text.
+///
+/// ponytail: the grace-period wait is a blocking `thread::sleep`, not an async delay — some
+/// callers (e.g. the Play tab's deck-less "🎮 Launch Forge" click) invoke this synchronously on
+/// the egui UI thread, so this stalls rendering for up to `GRACE_PERIOD`. Kept short enough
+/// (400ms) to be barely perceptible on a single click while still safely catching a crash that
+/// happens in the first few hundred ms — a real Forge startup takes seconds. Upgrade path: move
+/// this off the UI thread (spawn_blocking / a dedicated async verification step reported back
+/// through the same Arc<Mutex<_>> + request_repaint pattern the *_async launch methods already
+/// use) if 400ms ever proves noticeable in practice.
+fn spawn_and_verify(
+    mut cmd: Command,
+    success_message: impl Into<String>,
+    deck_path: Option<String>,
+    forge_path: String,
+) -> Result<ForgeLaunchResult> {
+    use std::io::Read;
+    use std::process::Stdio;
+    use std::time::Duration;
+
+    const GRACE_PERIOD: Duration = Duration::from_millis(400);
+
+    let success_message = success_message.into();
+    cmd.stderr(Stdio::piped());
+    let mut child = cmd.spawn()?;
+    let pid = child.id();
+
+    std::thread::sleep(GRACE_PERIOD);
+
+    match child.try_wait() {
+        Ok(Some(status)) => {
+            let mut stderr_output = String::new();
+            if let Some(mut stderr) = child.stderr.take() {
+                let _ = stderr.read_to_string(&mut stderr_output);
+            }
+            let detail = stderr_output.trim();
+            let message = if detail.is_empty() {
+                format!("Forge exited immediately (exit status: {})", status)
+            } else {
+                format!("Forge exited immediately: {}", detail)
+            };
+            error!("{}", message);
+            Ok(ForgeLaunchResult::failure(message))
+        }
+        Ok(None) => {
+            info!("{} PID: {:?}", success_message, pid);
+            Ok(ForgeLaunchResult::success(
+                success_message,
+                deck_path,
+                Some(forge_path),
+                Some(pid),
+            ))
+        }
+        Err(e) => {
+            // Can't determine process state — don't block a possibly-genuine launch on this.
+            warn!("Could not verify Forge process state after launch: {}", e);
+            Ok(ForgeLaunchResult::success(
+                success_message,
+                deck_path,
+                Some(forge_path),
+                Some(pid),
+            ))
+        }
+    }
+}
+
 /// Launch Forge with an optional deck name and optional second deck name.
 ///
 /// For JAR builds the command becomes:
@@ -447,7 +521,7 @@ pub fn launch_forge(forge_path: &str, deck_name: Option<&str>, deck2_name: Optio
         }
     }
 
-    let result = match extension.as_str() {
+    let cmd = match extension.as_str() {
         "jar" => {
             debug!("[launch_forge] Launching as JAR with java");
             let mut cmd = Command::new(resolve_java_command());
@@ -462,7 +536,7 @@ pub fn launch_forge(forge_path: &str, deck_name: Option<&str>, deck2_name: Optio
                 cmd.current_dir(dir);
             }
             cmd.args(forge_launch_args(deck_name, deck2_name));
-            cmd.spawn()
+            cmd
         }
         "exe" | "cmd" | "bat" => {
             debug!("[launch_forge] Launching as Windows executable");
@@ -484,7 +558,7 @@ pub fn launch_forge(forge_path: &str, deck_name: Option<&str>, deck2_name: Optio
                 cmd.args(forge_launch_args(deck_name, deck2_name));
                 cmd.creation_flags(DETACHED_PROCESS);
                 debug!("[launch_forge] Using DETACHED_PROCESS flag");
-                cmd.spawn()
+                cmd
             }
             #[cfg(not(windows))]
             {
@@ -502,7 +576,7 @@ pub fn launch_forge(forge_path: &str, deck_name: Option<&str>, deck2_name: Optio
                     debug!("[launch_forge] Adding --deck2 argument: {}", deck2);
                     cmd.arg("--deck2").arg(deck2);
                 }
-                cmd.spawn()
+                cmd
             }
         }
         "app" => {
@@ -520,7 +594,7 @@ pub fn launch_forge(forge_path: &str, deck_name: Option<&str>, deck2_name: Optio
                     cmd.arg("--deck2").arg(deck2);
                 }
             }
-            cmd.spawn()
+            cmd
         }
         "sh" => {
             debug!("[launch_forge] Launching as shell script");
@@ -537,7 +611,7 @@ pub fn launch_forge(forge_path: &str, deck_name: Option<&str>, deck2_name: Optio
                 debug!("[launch_forge] Adding --deck2 argument: {}", deck2);
                 cmd.arg("--deck2").arg(deck2);
             }
-            cmd.spawn()
+            cmd
         }
         _ => {
             debug!("[launch_forge] Launching as generic executable");
@@ -554,30 +628,17 @@ pub fn launch_forge(forge_path: &str, deck_name: Option<&str>, deck2_name: Optio
                 debug!("[launch_forge] Adding --deck2 argument: {}", deck2);
                 cmd.arg("--deck2").arg(deck2);
             }
-            cmd.spawn()
+            cmd
         }
     };
 
-    match result {
-        Ok(child) => {
-            let pid = child.id();
-            info!("Forge launched successfully with PID: {:?}", pid);
-            debug!("[launch_forge] Child process PID: {:?}", pid);
-            Ok(ForgeLaunchResult::success(
-                format!("Forge launched successfully"),
-                deck_name.map(|s| s.to_string()),
-                Some(resolved_path_str.clone()),
-                Some(pid),
-            ))
-        }
-        Err(e) => {
-            error!("Failed to launch Forge: {}", e);
-            debug!("[launch_forge] Command spawn error: {}", e);
-            Ok(ForgeLaunchResult::failure(format!(
-                "Failed to launch Forge: {}", e
-            )))
-        }
-    }
+    debug!("[launch_forge] Spawning and verifying process stays alive");
+    spawn_and_verify(
+        cmd,
+        "Forge launched successfully",
+        deck_name.map(|s| s.to_string()),
+        resolved_path_str.clone(),
+    )
 }
 
 /// Launch Forge in replay mode with a specific replay JSON file
@@ -645,7 +706,7 @@ pub fn launch_forge_replay(replay_path: &str) -> Result<ForgeLaunchResult> {
         .unwrap_or("")
         .to_lowercase();
 
-    let result = match extension.as_str() {
+    let cmd = match extension.as_str() {
         "jar" => {
             let mut cmd = Command::new(resolve_java_command());
             cmd.arg("-Xmx4096m")
@@ -661,7 +722,7 @@ pub fn launch_forge_replay(replay_path: &str) -> Result<ForgeLaunchResult> {
             // Forge replay CLI: `replay <path>`
             cmd.arg("replay").arg(replay_path);
 
-            cmd.spawn()
+            cmd
         }
         "exe" | "cmd" | "bat" => {
             #[cfg(windows)]
@@ -678,7 +739,7 @@ pub fn launch_forge_replay(replay_path: &str) -> Result<ForgeLaunchResult> {
                 // works here exactly like it does on the JAR/mac/Linux paths below.
                 cmd.arg("replay").arg(replay_path);
                 cmd.creation_flags(DETACHED_PROCESS);
-                cmd.spawn()
+                cmd
             }
             #[cfg(not(windows))]
             {
@@ -687,14 +748,14 @@ pub fn launch_forge_replay(replay_path: &str) -> Result<ForgeLaunchResult> {
                     cmd.current_dir(dir);
                 }
                 cmd.arg("replay").arg(replay_path);
-                cmd.spawn()
+                cmd
             }
         }
         "app" => {
             let mut cmd = Command::new("open");
             cmd.arg(&forge_path_buf);
             cmd.arg("--args").arg("replay").arg(replay_path);
-            cmd.spawn()
+            cmd
         }
         "sh" => {
             let mut cmd = Command::new(&forge_path_buf);
@@ -702,7 +763,7 @@ pub fn launch_forge_replay(replay_path: &str) -> Result<ForgeLaunchResult> {
                 cmd.current_dir(dir);
             }
             cmd.arg("replay").arg(replay_path);
-            cmd.spawn()
+            cmd
         }
         _ => {
             let mut cmd = Command::new(&forge_path_buf);
@@ -710,28 +771,16 @@ pub fn launch_forge_replay(replay_path: &str) -> Result<ForgeLaunchResult> {
                 cmd.current_dir(dir);
             }
             cmd.arg("replay").arg(replay_path);
-            cmd.spawn()
+            cmd
         }
     };
 
-    match result {
-        Ok(child) => {
-            let pid = child.id();
-            info!("Forge launched in replay mode with PID: {:?}", pid);
-            Ok(ForgeLaunchResult::success(
-                "Forge launched in replay mode.",
-                Some(replay_path.to_string()),
-                Some(resolved_path_str),
-                Some(pid),
-            ))
-        }
-        Err(e) => {
-            error!("Failed to launch Forge for replay: {}", e);
-            Ok(ForgeLaunchResult::failure(format!(
-                "Failed to launch Forge: {}", e
-            )))
-        }
-    }
+    spawn_and_verify(
+        cmd,
+        "Forge launched in replay mode.",
+        Some(replay_path.to_string()),
+        resolved_path_str,
+    )
 }
 
 /// Launch Forge using the path from settings.
@@ -974,5 +1023,37 @@ mod tests {
     fn java_home_not_preferred_when_too_old_or_unset() {
         assert!(!java_home_is_preferred(Some(8)));
         assert!(!java_home_is_preferred(None));
+    }
+
+    // Regression coverage for the "Unknown mode" replay bug (FORGE_REPLAY_BUG.md): spawn()
+    // succeeding was previously treated as "launched", even when the process crashed within
+    // milliseconds. These exercise spawn_and_verify() directly against real short-lived
+    // processes rather than mocking Command, since std::process::Command isn't mockable.
+    #[cfg(windows)]
+    #[test]
+    fn spawn_and_verify_reports_failure_on_immediate_exit() {
+        let mut cmd = Command::new("cmd");
+        cmd.args(["/C", "exit", "1"]);
+        let result = spawn_and_verify(cmd, "should not appear", None, "test".to_string())
+            .expect("spawn itself should succeed even though the process exits immediately");
+        assert!(!result.success);
+        assert!(
+            result.message.contains("exited immediately"),
+            "message was: {}",
+            result.message
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn spawn_and_verify_reports_success_when_process_outlives_grace_period() {
+        // ping takes ~2s for 3 pings — comfortably longer than the 400ms grace period.
+        let mut cmd = Command::new("ping");
+        cmd.args(["127.0.0.1", "-n", "3"]);
+        cmd.stdout(std::process::Stdio::null());
+        let result =
+            spawn_and_verify(cmd, "launched", None, "test".to_string()).expect("spawn should succeed");
+        assert!(result.success, "message was: {}", result.message);
+        assert_eq!(result.message, "launched");
     }
 }
