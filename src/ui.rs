@@ -377,17 +377,25 @@ fn is_connector_managed_forge(forge_path: &str, forge_download_dir: &std::path::
 /// the `replay-features-latest` tag. Returns `Some(asset_name)` when a different build is
 /// available, `None` when they already match or the check couldn't complete (offline, GitHub
 /// unreachable, etc. — fails silently, this is a best-effort background check).
+///
+/// Compares GitHub's per-asset `updated_at` timestamp, not the filename: `replay-features-latest`
+/// is a rolling tag that gets re-published from a new commit under the exact same (fixed
+/// `-SNAPSHOT-`) asset name, so a filename comparison can never detect a same-named republish —
+/// confirmed as the reason a build containing a real fix (FORGE_REPLAY_BUG.md) sat published for
+/// a full day while a stale local jar was never flagged as out of date. An older download with no
+/// recorded `updated_at` (predates this fix, or a user-provided Forge path outside our management)
+/// is treated as "unknown, assume an update may be available" rather than silently assumed current.
 async fn check_forge_update_available() -> Option<String> {
-    let local_name = crate::forge::resolve_latest_forge_jar(&forge_download_dir())
-        .and_then(|p| p.file_name().map(|n| n.to_string_lossy().to_string()));
+    let local_jar = crate::forge::resolve_latest_forge_jar(&forge_download_dir())?;
+    let local_updated_at = crate::download::read_asset_meta_updated_at(&local_jar);
 
     // The update path only ever re-fetches the standalone JAR (see start_forge_update /
     // download_forge_jar) — compare against that asset, not the portable zip.
-    let (_, remote_name) = crate::download::resolve_forge_jar_url().await.ok()?;
+    let remote = crate::download::resolve_forge_jar_url().await.ok()?;
 
-    match local_name {
-        Some(name) if name == remote_name => None,
-        _ => Some(remote_name),
+    match local_updated_at {
+        Some(updated_at) if updated_at == remote.updated_at => None,
+        _ => Some(remote.name),
     }
 }
 

@@ -14,9 +14,25 @@ pub struct DownloadUpdate {
     pub total_bytes: Option<u64>,
 }
 
+/// A resolved GitHub release asset — enough to download it and, later, tell whether the server
+/// has since republished a different build under the same name.
+#[derive(Debug, Clone)]
+pub struct ForgeAsset {
+    pub download_url: String,
+    pub name: String,
+    /// GitHub's `updated_at` timestamp for this specific asset (ISO 8601). `replay-features-latest`
+    /// is a rolling tag — the release gets re-published from a new commit without the asset
+    /// filename ever changing (it's a fixed `-SNAPSHOT-` name), so filename equality can never
+    /// detect a newer build. This timestamp is the only field on the asset that actually changes
+    /// when the server-side file is replaced. See FORGE_REPLAY_BUG.md for the incident (a fixed
+    /// build sat published for a full day while an old local jar was never flagged as stale)
+    /// that this was added to prevent from recurring.
+    pub updated_at: String,
+}
+
 /// Resolves a release asset whose name satisfies `matches`, falling back to the first asset if
-/// none match. Returns `(browser_download_url, asset_name)`.
-async fn resolve_forge_asset_url(matches: impl Fn(&str) -> bool) -> Result<(String, String)> {
+/// none match.
+async fn resolve_forge_asset_url(matches: impl Fn(&str) -> bool) -> Result<ForgeAsset> {
     let client = reqwest::Client::builder()
         .user_agent("mamo-connector-forge-downloader")
         .timeout(std::time::Duration::from_secs(15))
@@ -42,7 +58,7 @@ async fn resolve_forge_asset_url(matches: impl Fn(&str) -> bool) -> Result<(Stri
         .or_else(|| assets.first())
         .context("No suitable asset found in release")?;
 
-    let url = asset["browser_download_url"]
+    let download_url = asset["browser_download_url"]
         .as_str()
         .context("Asset is missing browser_download_url")?
         .to_string();
@@ -52,19 +68,53 @@ async fn resolve_forge_asset_url(matches: impl Fn(&str) -> bool) -> Result<(Stri
         .context("Asset is missing name")?
         .to_string();
 
-    Ok((url, name))
+    let updated_at = asset["updated_at"]
+        .as_str()
+        .context("Asset is missing updated_at")?
+        .to_string();
+
+    Ok(ForgeAsset { download_url, name, updated_at })
 }
 
 /// Resolves the portable bundle (JAR + `res/` resources) — what a fresh install needs, since
 /// Forge looks for `res/` as loose files next to the jar, not on the classpath.
-pub async fn resolve_forge_portable_zip_url() -> Result<(String, String)> {
+pub async fn resolve_forge_portable_zip_url() -> Result<ForgeAsset> {
     resolve_forge_asset_url(|n| n.ends_with(".zip")).await
 }
 
 /// Resolves the standalone JAR — enough to update an install that already has `res/` from a
 /// previous portable-bundle extraction (much smaller download than re-fetching the whole zip).
-pub async fn resolve_forge_jar_url() -> Result<(String, String)> {
+pub async fn resolve_forge_jar_url() -> Result<ForgeAsset> {
     resolve_forge_asset_url(|n| n.ends_with("-jar-with-dependencies.jar")).await
+}
+
+/// Path to the sidecar metadata file recording which server-side build a downloaded jar came
+/// from — `<jar>.source.json` next to it. Absence (older download, predating this file, or a
+/// user-provided Forge path) is treated as "unknown" by the update check, not "up to date".
+fn asset_meta_path(jar_path: &Path) -> PathBuf {
+    let mut name = jar_path.file_name().map(|n| n.to_os_string()).unwrap_or_default();
+    name.push(".source.json");
+    jar_path.with_file_name(name)
+}
+
+/// Records which build a just-downloaded jar came from, so a later `check_forge_update_available`
+/// can tell a same-named-but-newer republish apart from a genuinely up-to-date local copy.
+/// Best-effort: a write failure here just means the next update check treats this jar as
+/// "unknown" (see `asset_meta_path`'s doc) rather than failing the download itself.
+fn write_asset_meta(jar_path: &Path, asset: &ForgeAsset) {
+    let meta = serde_json::json!({ "updated_at": asset.updated_at });
+    if let Ok(content) = serde_json::to_string(&meta) {
+        if let Err(e) = std::fs::write(asset_meta_path(jar_path), content) {
+            log::warn!("Failed to write Forge asset metadata sidecar: {e}");
+        }
+    }
+}
+
+/// Reads back what `write_asset_meta` recorded for `jar_path`, if anything.
+pub fn read_asset_meta_updated_at(jar_path: &Path) -> Option<String> {
+    let content = std::fs::read_to_string(asset_meta_path(jar_path)).ok()?;
+    let value: serde_json::Value = serde_json::from_str(&content).ok()?;
+    value["updated_at"].as_str().map(|s| s.to_string())
 }
 
 /// Streams `download_url` into `dest_dir/filename`, reporting progress and honoring
@@ -203,19 +253,22 @@ pub async fn download_forge_portable(
     on_progress: impl Fn(DownloadUpdate) + Send + Sync + 'static,
     cancelled: Arc<AtomicBool>,
 ) -> Result<PathBuf> {
-    let (download_url, filename) = resolve_forge_portable_zip_url()
+    let asset = resolve_forge_portable_zip_url()
         .await
         .context("Could not resolve MaMo Forge portable bundle URL")?;
 
-    let zip_path = download_to_file(&download_url, dest_dir, &filename, &on_progress, &cancelled).await?;
+    let zip_path =
+        download_to_file(&asset.download_url, dest_dir, &asset.name, &on_progress, &cancelled).await?;
 
     extract_zip_to_dir(zip_path.clone(), dest_dir.to_path_buf())
         .await
         .context("Downloaded MaMo Forge but failed to extract it")?;
     let _ = std::fs::remove_file(&zip_path);
 
-    crate::forge::resolve_latest_forge_jar(dest_dir)
-        .context("Extracted MaMo Forge bundle but couldn't find a Forge jar inside it")
+    let jar_path = crate::forge::resolve_latest_forge_jar(dest_dir)
+        .context("Extracted MaMo Forge bundle but couldn't find a Forge jar inside it")?;
+    write_asset_meta(&jar_path, &asset);
+    Ok(jar_path)
 }
 
 /// Downloads just the standalone JAR into `dest_dir`, replacing any existing one — used to
@@ -230,10 +283,13 @@ pub async fn download_forge_jar(
     on_progress: impl Fn(DownloadUpdate) + Send + Sync + 'static,
     cancelled: Arc<AtomicBool>,
 ) -> Result<PathBuf> {
-    let (download_url, filename) = resolve_forge_jar_url()
+    let asset = resolve_forge_jar_url()
         .await
         .context("Could not resolve Forge JAR download URL")?;
-    download_to_file(&download_url, dest_dir, &filename, &on_progress, &cancelled).await
+    let jar_path =
+        download_to_file(&asset.download_url, dest_dir, &asset.name, &on_progress, &cancelled).await?;
+    write_asset_meta(&jar_path, &asset);
+    Ok(jar_path)
 }
 
 #[cfg(test)]
@@ -293,6 +349,48 @@ mod tests {
 
         assert!(dest.join("forge.jar").exists());
         assert!(dest.join("res").join("howto.txt").exists());
+
+        let _ = std::fs::remove_dir_all(&dest);
+    }
+
+    // Regression coverage for the FORGE_REPLAY_BUG.md incident: a same-named rolling-tag
+    // asset republished with new content must still be detected as "different" via
+    // updated_at, since the filename alone never changes between builds.
+
+    #[test]
+    fn asset_meta_round_trips_through_sidecar_file() {
+        let dest = std::env::temp_dir().join("mamo-connector-asset-meta-test-roundtrip");
+        let _ = std::fs::remove_dir_all(&dest);
+        std::fs::create_dir_all(&dest).unwrap();
+        let jar_path = dest.join("forge-gui-desktop-2.0.14-SNAPSHOT-jar-with-dependencies.jar");
+        std::fs::write(&jar_path, b"fake jar").unwrap();
+
+        let asset = ForgeAsset {
+            download_url: "https://example.com/forge.jar".to_string(),
+            name: jar_path.file_name().unwrap().to_string_lossy().to_string(),
+            updated_at: "2026-08-14T08:55:25Z".to_string(),
+        };
+        write_asset_meta(&jar_path, &asset);
+
+        assert_eq!(
+            read_asset_meta_updated_at(&jar_path),
+            Some("2026-08-14T08:55:25Z".to_string())
+        );
+
+        let _ = std::fs::remove_dir_all(&dest);
+    }
+
+    #[test]
+    fn asset_meta_is_none_when_sidecar_missing() {
+        // A jar downloaded before this fix shipped (or a user-provided Forge path) has no
+        // sidecar — the update check must treat that as "unknown", not "up to date".
+        let dest = std::env::temp_dir().join("mamo-connector-asset-meta-test-missing");
+        let _ = std::fs::remove_dir_all(&dest);
+        std::fs::create_dir_all(&dest).unwrap();
+        let jar_path = dest.join("forge-gui-desktop-2.0.14-SNAPSHOT-jar-with-dependencies.jar");
+        std::fs::write(&jar_path, b"fake jar").unwrap();
+
+        assert_eq!(read_asset_meta_updated_at(&jar_path), None);
 
         let _ = std::fs::remove_dir_all(&dest);
     }

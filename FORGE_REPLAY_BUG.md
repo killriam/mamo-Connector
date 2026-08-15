@@ -1,5 +1,33 @@
 # Forge Replay Launching Bug & Fix Details
 
+> **ACTUALLY RESOLVED — confirmed 2026-08-15, corrects the addendum directly below.** The Forge
+> side traced this precisely: `replay-features-latest` as published 2026-08-14T08:55:25Z (built
+> from commit `0c4e5c556df`) genuinely contains the `case "replay"` patch — confirmed by direct
+> binary inspection, not by trusting the release notes' "Built from" text. The build this repo's
+> addendum tested (file-dated 2026-08-13 20:20) was from the very first push of the fix
+> (`2b0beea`) and genuinely didn't have it yet; a second release went out the next day from a
+> later commit and that one does. So there was no CI/distribution-pipeline problem as speculated
+> below — just an old local jar that predated the fix by about half a day, on a rolling tag with
+> no way to ask for "the version from before" once a newer one replaces it.
+>
+> **The real remaining bug was entirely on the mamo-Connector side**, and *is* now fixed here:
+> `check_forge_update_available` (`src/ui.rs`) compared the local and remote jar by **filename
+> only**. Since `replay-features-latest`'s asset name is a fixed `-SNAPSHOT-` string that never
+> changes between builds, that comparison could **never** detect a same-named republish — it's
+> why the fixed 2026-08-14 build sat published for a full day while this install's stale
+> 2026-08-13 jar was never flagged as out of date, and would have stayed silently stale
+> indefinitely. Fixed by recording each download's GitHub `updated_at` asset timestamp in a
+> sidecar file (`download.rs`'s `write_asset_meta`/`read_asset_meta_updated_at`,
+> `<jar>.source.json`) and comparing *that* instead of the filename. A jar with no sidecar
+> (downloaded before this fix, or a user-provided Forge path) is treated as "unknown, might be
+> stale" rather than silently assumed current. Regression-covered by
+> `download::tests::asset_meta_round_trips_through_sidecar_file` /
+> `asset_meta_is_none_when_sidecar_missing`.
+>
+> **Anyone still hitting the original crash just needs a fresh download** — delete the local jar
+> (or use the Settings tab's Forge update flow, once it picks up the corrected check above) so
+> `download_forge_jar`/`download_forge_portable` re-fetches the current, genuinely-patched build.
+
 > **REGRESSED IN THE DISTRIBUTED BUILD — 2026-08-15.** Despite the "RESOLVED" note directly
 > below, a real replay-mode launch on a live install still failed exactly as originally
 > described: the Connector logged `"Forge launched in replay mode."` (green checkmark, PID
