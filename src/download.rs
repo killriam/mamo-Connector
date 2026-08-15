@@ -271,25 +271,43 @@ pub async fn download_forge_portable(
     Ok(jar_path)
 }
 
-/// Downloads just the standalone JAR into `dest_dir`, replacing any existing one — used to
-/// update an install that already has `res/` from a previous `download_forge_portable` call.
+/// Downloads just the standalone JAR into `dest_dir` **under a staging filename**
+/// (`<name>.update`) rather than replacing the live jar directly — used by the background
+/// auto-updater to update an install that already has `res/` from a previous
+/// `download_forge_portable` call. Downloading in place used to risk writing over a jar Forge
+/// might currently have open; the caller now finalizes the swap itself (rename staged → live)
+/// once it has confirmed Forge isn't running — see `finalize_staged_forge_jar`.
 ///
 /// Calls `on_progress` after each received chunk. Checks `cancelled` before each chunk — if
 /// set, deletes the partial file and returns an error.
 ///
-/// Returns the path to the downloaded JAR on success.
-pub async fn download_forge_jar(
+/// Returns the staged file's path and the resolved asset info (needed to write the sidecar
+/// metadata once finalized) on success.
+pub async fn download_forge_jar_staged(
     dest_dir: &Path,
     on_progress: impl Fn(DownloadUpdate) + Send + Sync + 'static,
     cancelled: Arc<AtomicBool>,
-) -> Result<PathBuf> {
+) -> Result<(PathBuf, ForgeAsset)> {
     let asset = resolve_forge_jar_url()
         .await
         .context("Could not resolve Forge JAR download URL")?;
-    let jar_path =
-        download_to_file(&asset.download_url, dest_dir, &asset.name, &on_progress, &cancelled).await?;
-    write_asset_meta(&jar_path, &asset);
-    Ok(jar_path)
+    let staging_name = format!("{}.update", asset.name);
+    let staged_path =
+        download_to_file(&asset.download_url, dest_dir, &staging_name, &on_progress, &cancelled).await?;
+    Ok((staged_path, asset))
+}
+
+/// Swaps a staged download (from `download_forge_jar_staged`) into place as `dest_dir/<asset
+/// name>`, replacing whatever's there, and records the sidecar metadata. Caller is responsible
+/// for confirming Forge isn't currently running before calling this — an atomic rename is safe
+/// against a *closed* Forge's next launch reading a half-written file, but not against a
+/// *currently open* Forge that might still be reading from the path being replaced.
+pub fn finalize_staged_forge_jar(dest_dir: &Path, staged_path: &Path, asset: &ForgeAsset) -> Result<PathBuf> {
+    let final_path = dest_dir.join(&asset.name);
+    std::fs::rename(staged_path, &final_path)
+        .with_context(|| format!("Failed to move staged Forge update into place at {:?}", final_path))?;
+    write_asset_meta(&final_path, asset);
+    Ok(final_path)
 }
 
 #[cfg(test)]
@@ -391,6 +409,37 @@ mod tests {
         std::fs::write(&jar_path, b"fake jar").unwrap();
 
         assert_eq!(read_asset_meta_updated_at(&jar_path), None);
+
+        let _ = std::fs::remove_dir_all(&dest);
+    }
+
+    #[test]
+    fn finalize_staged_forge_jar_moves_file_into_place_and_writes_meta() {
+        let dest = std::env::temp_dir().join("mamo-connector-finalize-test");
+        let _ = std::fs::remove_dir_all(&dest);
+        std::fs::create_dir_all(&dest).unwrap();
+
+        let asset = ForgeAsset {
+            download_url: "https://example.com/forge.jar".to_string(),
+            name: "forge-gui-desktop-2.0.14-SNAPSHOT-jar-with-dependencies.jar".to_string(),
+            updated_at: "2026-08-14T08:55:25Z".to_string(),
+        };
+        let staged_path = dest.join(format!("{}.update", asset.name));
+        std::fs::write(&staged_path, b"new jar contents").unwrap();
+        // An old "live" jar already sitting at the destination — finalize must replace it.
+        let final_path_expected = dest.join(&asset.name);
+        std::fs::write(&final_path_expected, b"old jar contents").unwrap();
+
+        let final_path =
+            finalize_staged_forge_jar(&dest, &staged_path, &asset).expect("finalize should succeed");
+
+        assert_eq!(final_path, final_path_expected);
+        assert!(!staged_path.exists(), "staged file should have been moved, not copied");
+        assert_eq!(std::fs::read(&final_path).unwrap(), b"new jar contents");
+        assert_eq!(
+            read_asset_meta_updated_at(&final_path),
+            Some("2026-08-14T08:55:25Z".to_string())
+        );
 
         let _ = std::fs::remove_dir_all(&dest);
     }

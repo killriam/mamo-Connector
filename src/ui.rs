@@ -72,13 +72,26 @@ struct UpdateCheckState {
     dismissed: bool,
 }
 
+/// A downloaded-but-not-yet-installed Forge update, waiting for Forge to not be running so it
+/// can be safely swapped into place (see the periodic check in `update()`).
+#[derive(Clone)]
+struct StagedForgeUpdate {
+    staged_path: std::path::PathBuf,
+    asset: crate::download::ForgeAsset,
+}
+
 /// State for the background MaMo Forge update check — only meaningful when the configured
 /// Forge install is one the Connector downloaded itself (see `is_connector_managed_forge`).
+/// The whole flow is automatic: detecting an update starts the download immediately (no click),
+/// and it's installed the moment Forge is confirmed not running — a click is only ever needed
+/// to dismiss an error or to ask for an out-of-schedule check ("Check now").
 #[derive(Clone, Default)]
 struct ForgeUpdateCheckState {
-    /// Some(asset_name) when a different build is currently published than the one we have
-    /// downloaded locally.
-    available_asset_name: Option<String>,
+    /// Set once a background download finishes and is staged, waiting to be swapped in.
+    staged: Option<StagedForgeUpdate>,
+    /// True while a check or download is actively in flight — guards against starting a second
+    /// one (e.g. from "Check now") while one's already running.
+    busy: bool,
     dismissed: bool,
 }
 
@@ -374,9 +387,10 @@ fn is_connector_managed_forge(forge_path: &str, forge_download_dir: &std::path::
 }
 
 /// Compare the locally-downloaded MaMo Forge jar against whatever's currently published under
-/// the `replay-features-latest` tag. Returns `Some(asset_name)` when a different build is
-/// available, `None` when they already match or the check couldn't complete (offline, GitHub
-/// unreachable, etc. — fails silently, this is a best-effort background check).
+/// the `replay-features-latest` tag. Returns `Some(asset)` when a different build is available
+/// (with everything needed to immediately start downloading it), `None` when they already match
+/// or the check couldn't complete (offline, GitHub unreachable, etc. — fails silently, this is a
+/// best-effort background check).
 ///
 /// Compares GitHub's per-asset `updated_at` timestamp, not the filename: `replay-features-latest`
 /// is a rolling tag that gets re-published from a new commit under the exact same (fixed
@@ -385,18 +399,99 @@ fn is_connector_managed_forge(forge_path: &str, forge_download_dir: &std::path::
 /// a full day while a stale local jar was never flagged as out of date. An older download with no
 /// recorded `updated_at` (predates this fix, or a user-provided Forge path outside our management)
 /// is treated as "unknown, assume an update may be available" rather than silently assumed current.
-async fn check_forge_update_available() -> Option<String> {
+async fn check_forge_update_available() -> Option<crate::download::ForgeAsset> {
     let local_jar = crate::forge::resolve_latest_forge_jar(&forge_download_dir())?;
     let local_updated_at = crate::download::read_asset_meta_updated_at(&local_jar);
 
-    // The update path only ever re-fetches the standalone JAR (see start_forge_update /
-    // download_forge_jar) — compare against that asset, not the portable zip.
+    // The update path only ever re-fetches the standalone JAR (see start_forge_auto_update /
+    // download_forge_jar_staged) — compare against that asset, not the portable zip.
     let remote = crate::download::resolve_forge_jar_url().await.ok()?;
 
     match local_updated_at {
         Some(updated_at) if updated_at == remote.updated_at => None,
-        _ => Some(remote.name),
+        _ => Some(remote),
     }
+}
+
+/// Checks for a MaMo Forge update and, if one's available, immediately downloads it to a
+/// staging file — no click required. Shared between the 5s-after-startup background check
+/// (`LauncherApp::new`) and the Settings tab's "Check now" button. Reports progress through
+/// `forge_update_progress` (the same field the download itself reports through) and leaves a
+/// finished download in `forge_update_check.staged` for the periodic tick in `update()` to
+/// swap into place once Forge is confirmed not running (`finalize_staged_forge_update_if_ready`).
+async fn run_forge_update_check_and_download(
+    forge_update_check: Arc<Mutex<ForgeUpdateCheckState>>,
+    forge_update_progress: Arc<Mutex<Option<DownloadProgress>>>,
+    cancelled: Arc<AtomicBool>,
+    ctx: egui::Context,
+) {
+    if let Ok(mut s) = forge_update_check.lock() {
+        s.busy = true;
+    }
+    ctx.request_repaint();
+
+    let found = check_forge_update_available().await;
+    let Some(asset) = found else {
+        if let Ok(mut s) = forge_update_check.lock() {
+            s.busy = false;
+        }
+        log::info!("MaMo Forge is up to date (or check could not complete)");
+        ctx.request_repaint();
+        return;
+    };
+
+    log::info!("MaMo Forge update available: {} — downloading in background", asset.name);
+    cancelled.store(false, Ordering::Relaxed);
+    *forge_update_progress.lock().unwrap() = Some(DownloadProgress::default());
+    ctx.request_repaint();
+
+    let dest_dir = forge_download_dir();
+    let progress_bg = Arc::clone(&forge_update_progress);
+    let ctx_progress = ctx.clone();
+    let outcome = crate::download::download_forge_jar_staged(
+        &dest_dir,
+        move |update| {
+            if let Ok(mut guard) = progress_bg.lock() {
+                let entry = guard.get_or_insert_with(DownloadProgress::default);
+                entry.bytes_done = update.bytes_done;
+                entry.total_bytes = update.total_bytes;
+                entry.status_text = format_download_status(update.bytes_done, update.total_bytes);
+            }
+            ctx_progress.request_repaint();
+        },
+        cancelled,
+    )
+    .await;
+
+    match outcome {
+        Ok((staged_path, downloaded_asset)) => {
+            log::info!("MaMo Forge update downloaded — will install once Forge is closed");
+            if let Ok(mut s) = forge_update_check.lock() {
+                s.staged = Some(StagedForgeUpdate { staged_path, asset: downloaded_asset });
+                s.busy = false;
+            }
+            *forge_update_progress.lock().unwrap() = None;
+        }
+        Err(e) if e.to_string().contains("cancelled") => {
+            if let Ok(mut s) = forge_update_check.lock() {
+                s.busy = false;
+            }
+            *forge_update_progress.lock().unwrap() = None;
+        }
+        Err(e) => {
+            log::error!("MaMo Forge update download failed: {e}");
+            if let Ok(mut p) = forge_update_progress.lock() {
+                if let Some(ref mut prog) = *p {
+                    prog.finished = true;
+                    prog.error = Some(e.to_string());
+                }
+            }
+            if let Ok(mut s) = forge_update_check.lock() {
+                s.busy = false;
+            }
+        }
+    }
+    ctx.request_repaint();
 }
 
 /// Whether a MaMo Forge jar is already sitting in the download directory from a previous run.
@@ -623,7 +718,7 @@ pub fn launch(
             ].into();
             cc.egui_ctx.set_style(style);
             
-            Ok(Box::new(LauncherApp::new(state.clone())))
+            Ok(Box::new(LauncherApp::new(state.clone(), cc.egui_ctx.clone())))
         }),
     ).map_err(|e| anyhow::anyhow!("Failed to run native app: {}", e))?;
 
@@ -698,7 +793,7 @@ struct LauncherApp {
 }
 
 impl LauncherApp {
-    fn new(state: AppState) -> Self {
+    fn new(state: AppState, ctx: egui::Context) -> Self {
         // Load settings
         let mut settings = Settings::load().unwrap_or_default();
         
@@ -859,23 +954,26 @@ impl LauncherApp {
 
         // Kick off background MaMo Forge update check — only meaningful when the configured
         // Forge install is the Connector's own managed download, not a user-provided one.
+        // Finding an update immediately starts downloading it too (see
+        // run_forge_update_check_and_download) — no click required; a click is only ever
+        // needed to dismiss an error or trigger an out-of-schedule "Check now".
         let forge_update_check = Arc::new(Mutex::new(ForgeUpdateCheckState::default()));
+        let forge_update_progress: Arc<Mutex<Option<DownloadProgress>>> = Arc::new(Mutex::new(None));
+        let forge_update_cancelled = Arc::new(AtomicBool::new(false));
         if is_connector_managed_forge(settings.forge_path.as_deref().unwrap_or(""), &forge_download_dir()) {
             let forge_update_check_bg = Arc::clone(&forge_update_check);
+            let forge_update_progress_bg = Arc::clone(&forge_update_progress);
+            let forge_update_cancelled_bg = Arc::clone(&forge_update_cancelled);
+            let ctx_bg = ctx.clone();
             std::thread::spawn(move || {
                 std::thread::sleep(std::time::Duration::from_secs(5));
                 let runtime = tokio::runtime::Runtime::new().unwrap();
-                runtime.block_on(async {
-                    match check_forge_update_available().await {
-                        Some(asset_name) => {
-                            log::info!("MaMo Forge update available: {asset_name}");
-                            if let Ok(mut s) = forge_update_check_bg.lock() {
-                                s.available_asset_name = Some(asset_name);
-                            }
-                        }
-                        None => log::info!("MaMo Forge is up to date (or check could not complete)"),
-                    }
-                });
+                runtime.block_on(run_forge_update_check_and_download(
+                    forge_update_check_bg,
+                    forge_update_progress_bg,
+                    forge_update_cancelled_bg,
+                    ctx_bg,
+                ));
             });
         }
 
@@ -903,8 +1001,8 @@ impl LauncherApp {
             forge_local_decks: Vec::new(),
             update_check,
             forge_update_check,
-            forge_update_progress: Arc::new(Mutex::new(None)),
-            forge_update_cancelled: Arc::new(AtomicBool::new(false)),
+            forge_update_progress,
+            forge_update_cancelled,
             show_setup_wizard: forge_not_configured,
             wizard,
             wizard_requested,
@@ -1001,8 +1099,9 @@ impl eframe::App for LauncherApp {
         if !self.show_setup_wizard && now.duration_since(self.last_pending_check).as_millis() > 500 {
             self.last_pending_check = now;
             self.check_pending_commands(ctx);
+            self.finalize_staged_forge_update_if_ready();
         }
-        
+
         // Auto gamelog scanning after deeplink Forge launch
         // Two-phase detection: first track launcher PID, then switch to window-based
         // detection since forge.exe is a launcher that spawns java.exe and exits.
@@ -1192,13 +1291,19 @@ impl eframe::App for LauncherApp {
                 });
                 ui.separator();
 
-                // MaMo Forge update banner — only ever populated for Connector-managed installs
-                let (forge_update_asset, forge_update_dismissed) = {
+                // MaMo Forge update banner — only ever populated for Connector-managed installs.
+                // Fully automatic: an update starts downloading the moment it's detected, and
+                // installs itself the moment Forge is confirmed closed (finalize_staged_forge_
+                // update_if_ready). This banner is purely informational — its only interactive
+                // controls are Cancel (mid-download) and dismiss (error only).
+                let (forge_busy, forge_staged, forge_update_dismissed) = {
                     let s = self.forge_update_check.lock().unwrap();
-                    (s.available_asset_name.clone(), s.dismissed)
+                    (s.busy, s.staged.is_some(), s.dismissed)
                 };
                 let forge_update_progress = self.forge_update_progress.lock().unwrap().clone();
-                if !forge_update_dismissed && (forge_update_asset.is_some() || forge_update_progress.is_some()) {
+                if !forge_update_dismissed
+                    && (forge_busy || forge_staged || forge_update_progress.is_some())
+                {
                     egui::Frame::default()
                         .fill(egui::Color32::from_rgb(205, 232, 255))
                         .inner_margin(egui::Margin::symmetric(8.0, 4.0))
@@ -1214,7 +1319,7 @@ impl eframe::App for LauncherApp {
                                     } else {
                                         ui.label(
                                             egui::RichText::new(format!(
-                                                "⬆ Updating MaMo Forge… {}",
+                                                "⬆ Downloading MaMo Forge update… {}",
                                                 format_download_status(prog.bytes_done, prog.total_bytes)
                                             ))
                                             .color(egui::Color32::from_rgb(0, 90, 158))
@@ -1224,18 +1329,23 @@ impl eframe::App for LauncherApp {
                                             self.forge_update_cancelled.store(true, Ordering::Relaxed);
                                         }
                                     }
-                                } else if let Some(ref asset_name) = forge_update_asset {
+                                } else if forge_staged {
                                     ui.label(
-                                        egui::RichText::new(format!("⬆ MaMo Forge update available ({asset_name})"))
+                                        egui::RichText::new("⬆ MaMo Forge update ready — installs automatically once Forge is closed")
                                             .color(egui::Color32::from_rgb(0, 90, 158))
                                             .small(),
                                     );
-                                    if ui.small_button("Update").clicked() {
-                                        self.start_forge_update(ctx);
-                                    }
+                                } else if forge_busy {
+                                    ui.label(
+                                        egui::RichText::new("🔄 Checking for a MaMo Forge update…")
+                                            .color(egui::Color32::GRAY)
+                                            .small(),
+                                    );
                                 }
                                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                    if ui.small_button("✕").clicked() {
+                                    if forge_update_progress.as_ref().map(|p| p.error.is_some()).unwrap_or(false)
+                                        && ui.small_button("✕").clicked()
+                                    {
                                         self.forge_update_check.lock().unwrap().dismissed = true;
                                     }
                                 });
@@ -2026,76 +2136,57 @@ impl LauncherApp {
         });
     }
 
-    /// Re-download MaMo Forge in place from the Home tab's update banner. Unlike
-    /// `start_forge_download` (wizard first-run flow), this never touches `forge_path` or the
-    /// wizard state — a Connector-managed install's `forge_path` already points at the download
-    /// directory itself, and `launch_forge`'s directory-resolution logic (`resolve_latest_forge_jar`)
-    /// automatically picks up the newest jar on the next launch, so replacing the file is enough.
-    fn start_forge_update(&mut self, ctx: &egui::Context) {
-        let forge_dir = forge_download_dir();
-
-        self.forge_update_cancelled.store(false, Ordering::Relaxed);
-        *self.forge_update_progress.lock().unwrap() = Some(DownloadProgress::default());
-
-        let progress_out = Arc::clone(&self.forge_update_progress);
-        let cancelled = Arc::clone(&self.forge_update_cancelled);
+    /// "Check now" — runs the same check-and-auto-download `LauncherApp::new`'s 5s-after-startup
+    /// timer already runs, on demand. Guarded by `busy` so a click while one's already in
+    /// flight (background or otherwise) doesn't start a second, redundant fetch.
+    fn trigger_forge_update_check(&mut self, ctx: &egui::Context) {
+        if self.forge_update_check.lock().unwrap().busy {
+            return;
+        }
         let forge_update_check = Arc::clone(&self.forge_update_check);
-        let activity_log = self.activity_log.clone();
-        let ctx_progress = ctx.clone();
-        let ctx_end = ctx.clone();
-
+        let forge_update_progress = Arc::clone(&self.forge_update_progress);
+        let cancelled = Arc::clone(&self.forge_update_cancelled);
+        let ctx = ctx.clone();
         std::thread::spawn(move || {
             let runtime = tokio::runtime::Runtime::new().unwrap();
-            let progress_bg = Arc::clone(&progress_out);
-            let outcome = runtime.block_on(async {
-                crate::download::download_forge_jar(
-                    &forge_dir,
-                    move |update| {
-                        if let Ok(mut guard) = progress_bg.lock() {
-                            let entry = guard.get_or_insert_with(DownloadProgress::default);
-                            entry.bytes_done = update.bytes_done;
-                            entry.total_bytes = update.total_bytes;
-                            entry.status_text = format_download_status(update.bytes_done, update.total_bytes);
-                        }
-                        ctx_progress.request_repaint();
-                    },
-                    cancelled,
-                )
-                .await
-            });
+            runtime.block_on(run_forge_update_check_and_download(
+                forge_update_check,
+                forge_update_progress,
+                cancelled,
+                ctx,
+            ));
+        });
+    }
 
-            match outcome {
-                Ok(_jar_path) => {
-                    if let Ok(mut log) = activity_log.lock() {
-                        log.log_success("MaMo Forge updated successfully.");
-                    }
-                    forge_update_check.lock().unwrap().available_asset_name = None;
-                    if let Ok(mut p) = progress_out.lock() {
-                        if let Some(ref mut prog) = *p {
-                            prog.finished = true;
-                        }
-                    }
-                }
-                Err(e) if e.to_string().contains("cancelled") => {
-                    if let Ok(mut log) = activity_log.lock() {
-                        log.log_info("MaMo Forge update cancelled.");
-                    }
-                    *progress_out.lock().unwrap() = None;
-                }
-                Err(e) => {
-                    if let Ok(mut log) = activity_log.lock() {
-                        log.log_error(format!("MaMo Forge update failed: {e}"));
-                    }
-                    if let Ok(mut p) = progress_out.lock() {
-                        if let Some(ref mut prog) = *p {
-                            prog.finished = true;
-                            prog.error = Some(e.to_string());
-                        }
-                    }
+    /// Swaps a fully-downloaded, staged MaMo Forge update into place the moment Forge is
+    /// confirmed not running — called from the same 500ms tick `check_pending_commands` already
+    /// runs on. Unlike the old click-triggered `start_forge_update` this replaced, downloading
+    /// happens automatically the moment an update is detected (`run_forge_update_check_and_download`);
+    /// this step only ever does a fast local rename, deferred as many ticks as it takes for
+    /// Forge to close, so it never risks overwriting a jar Forge might still have open.
+    fn finalize_staged_forge_update_if_ready(&mut self) {
+        let staged = self.forge_update_check.lock().unwrap().staged.clone();
+        let Some(staged) = staged else { return };
+        if crate::forge::is_forge_window_open() {
+            return; // still running — try again on the next tick
+        }
+
+        let forge_dir = forge_download_dir();
+        match crate::download::finalize_staged_forge_jar(&forge_dir, &staged.staged_path, &staged.asset) {
+            Ok(_final_path) => {
+                if let Ok(mut log) = self.activity_log.lock() {
+                    log.log_success("MaMo Forge updated to the latest build.");
                 }
             }
-            ctx_end.request_repaint();
-        });
+            Err(e) => {
+                if let Ok(mut log) = self.activity_log.lock() {
+                    log.log_error(format!("Failed to install downloaded MaMo Forge update: {e}"));
+                }
+            }
+        }
+        // Clear either way — a failed rename (e.g. Forge opened again in the instant between
+        // the check above and now) will simply be re-detected and re-downloaded next check.
+        self.forge_update_check.lock().unwrap().staged = None;
     }
 
     fn render_setup_wizard(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
@@ -4834,12 +4925,15 @@ impl LauncherApp {
                     ui.label(egui::RichText::new("Forge").strong());
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if forge_path_valid {
-                            let (forge_update_asset, forge_update_dismissed) = {
+                            let (forge_busy, forge_active) = {
                                 let s = self.forge_update_check.lock().unwrap();
-                                (s.available_asset_name.clone(), s.dismissed)
+                                (s.busy, s.staged.is_some())
                             };
-                            if forge_update_asset.is_some() && !forge_update_dismissed {
-                                ui.label(egui::RichText::new("⬆ Update available").color(egui::Color32::from_rgb(0, 90, 158)));
+                            let downloading = self.forge_update_progress.lock().unwrap().is_some();
+                            if downloading || forge_active {
+                                ui.label(egui::RichText::new("⬆ Updating").color(egui::Color32::from_rgb(0, 90, 158)));
+                            } else if forge_busy {
+                                ui.label(egui::RichText::new("🔄 Checking…").color(egui::Color32::GRAY));
                             } else {
                                 ui.label(egui::RichText::new("✓ Configured").color(egui::Color32::from_rgb(0, 128, 0)));
                             }
@@ -4962,42 +5056,49 @@ impl LauncherApp {
                     }
                 });
 
-                // Update controls for a Connector-managed Forge install — mirrors the top
-                // banner but stays here, non-dismissible, so it's never missed for long.
+                // Update status for a Connector-managed Forge install — fully automatic (see the
+                // top banner's doc comment), so there's nothing to click here except "Check now"
+                // and, on error, dismiss. Stays visible even when idle so "Check now" is always
+                // reachable, unlike the top banner which only shows while something's happening.
                 if is_connector_managed_forge(&forge_path_input, &forge_download_dir()) {
-                    let (forge_update_asset, forge_update_dismissed) = {
+                    let (forge_busy, forge_staged, forge_update_dismissed) = {
                         let s = self.forge_update_check.lock().unwrap();
-                        (s.available_asset_name.clone(), s.dismissed)
+                        (s.busy, s.staged.is_some(), s.dismissed)
                     };
                     let forge_update_progress = self.forge_update_progress.lock().unwrap().clone();
-                    if forge_update_progress.is_some() || (forge_update_asset.is_some() && !forge_update_dismissed) {
-                        ui.add_space(8.0);
-                        egui::Frame::default()
-                            .fill(egui::Color32::from_rgb(205, 232, 255))
-                            .inner_margin(egui::Margin::same(8.0))
-                            .rounding(6.0)
-                            .show(ui, |ui| {
+                    ui.add_space(8.0);
+                    egui::Frame::default()
+                        .fill(egui::Color32::from_rgb(205, 232, 255))
+                        .inner_margin(egui::Margin::same(8.0))
+                        .rounding(6.0)
+                        .show(ui, |ui| {
+                            ui.horizontal(|ui| {
                                 if let Some(ref prog) = forge_update_progress {
                                     if let Some(ref err) = prog.error {
-                                        ui.label(egui::RichText::new(format!("✗ MaMo Forge update failed: {err}")).color(egui::Color32::from_rgb(176, 0, 32)));
-                                    } else {
-                                        ui.horizontal(|ui| {
-                                            ui.label(egui::RichText::new(format!("⬆ Updating MaMo Forge… {}", format_download_status(prog.bytes_done, prog.total_bytes))).color(egui::Color32::from_rgb(0, 90, 158)));
-                                            if !prog.finished && ui.small_button("Cancel").clicked() {
-                                                self.forge_update_cancelled.store(true, Ordering::Relaxed);
+                                        if !forge_update_dismissed {
+                                            ui.label(egui::RichText::new(format!("✗ MaMo Forge update failed: {err}")).color(egui::Color32::from_rgb(176, 0, 32)));
+                                            if ui.small_button("✕").clicked() {
+                                                self.forge_update_check.lock().unwrap().dismissed = true;
                                             }
-                                        });
-                                    }
-                                } else if let Some(ref asset_name) = forge_update_asset {
-                                    ui.horizontal(|ui| {
-                                        ui.label(egui::RichText::new(format!("⬆ MaMo Forge update available ({asset_name})")).color(egui::Color32::from_rgb(0, 90, 158)));
-                                        if ui.small_button("Update").clicked() {
-                                            self.start_forge_update(ctx);
                                         }
-                                    });
+                                    } else {
+                                        ui.label(egui::RichText::new(format!("⬆ Downloading MaMo Forge update… {}", format_download_status(prog.bytes_done, prog.total_bytes))).color(egui::Color32::from_rgb(0, 90, 158)));
+                                        if !prog.finished && ui.small_button("Cancel").clicked() {
+                                            self.forge_update_cancelled.store(true, Ordering::Relaxed);
+                                        }
+                                    }
+                                } else if forge_staged {
+                                    ui.label(egui::RichText::new("⬆ Update ready — installs automatically once Forge is closed").color(egui::Color32::from_rgb(0, 90, 158)));
+                                } else if forge_busy {
+                                    ui.label(egui::RichText::new("🔄 Checking for a MaMo Forge update…").color(egui::Color32::GRAY));
+                                } else {
+                                    ui.label(egui::RichText::new("MaMo Forge is up to date.").color(egui::Color32::from_rgb(0, 128, 0)));
+                                    if ui.small_button("🔄 Check now").clicked() {
+                                        self.trigger_forge_update_check(ctx);
+                                    }
                                 }
                             });
-                    }
+                        });
                 }
             });
 

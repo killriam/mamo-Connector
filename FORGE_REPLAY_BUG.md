@@ -26,7 +26,17 @@
 >
 > **Anyone still hitting the original crash just needs a fresh download** — delete the local jar
 > (or use the Settings tab's Forge update flow, once it picks up the corrected check above) so
-> `download_forge_jar`/`download_forge_portable` re-fetches the current, genuinely-patched build.
+> `download_forge_jar_staged`/`download_forge_portable` re-fetches the current, genuinely-patched
+> build.
+>
+> **Follow-up, same day:** the corrected check above only fixed *detection* — updating was still
+> a manual click on a dismissible banner, so a user could plausibly detect-then-dismiss-then-
+> forget and stay stale anyway. `check_forge_update_available` finding an update now starts
+> downloading it immediately in the background (`run_forge_update_check_and_download`), no click
+> required, and it's swapped into place (`finalize_staged_forge_update_if_ready`, an atomic
+> rename of a staged file) the moment Forge is confirmed not running — never overwriting a jar
+> Forge might have open. A "🔄 Check now" button (Settings tab) covers wanting an out-of-schedule
+> check without waiting for the 5s-after-startup timer or a restart.
 
 > **REGRESSED IN THE DISTRIBUTED BUILD — 2026-08-15.** Despite the "RESOLVED" note directly
 > below, a real replay-mode launch on a live install still failed exactly as originally
