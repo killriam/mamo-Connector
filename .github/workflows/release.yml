@@ -46,6 +46,33 @@ jobs:
         working-directory: mamo-Connector
         run: cargo build --release
 
+      - name: Sign executable
+        if: "${{ secrets.SIGNING_CERTIFICATE_BASE64 != '' && secrets.SIGNING_CERTIFICATE_PASSWORD != '' }}"
+        shell: pwsh
+        run: |
+          # 1. Decode PFX certificate from base64
+          $certBase64 = "${{ secrets.SIGNING_CERTIFICATE_BASE64 }}"
+          $certPassword = "${{ secrets.SIGNING_CERTIFICATE_PASSWORD }}"
+          $certBytes = [System.Convert]::FromBase64String($certBase64)
+          $certPath = Join-Path $env:TEMP "cert.pfx"
+          [System.IO.File]::WriteAllBytes($certPath, $certBytes)
+
+          # 2. Find signtool.exe inside Windows SDK
+          $signtool = (Get-ChildItem -Path "C:\Program Files (x86)\Windows Kits" -Recurse -Filter "signtool.exe" | Select-Object -First 1).FullName
+          if (-not $signtool) {
+              Write-Error "signtool.exe not found!"
+              exit 1
+          }
+          Write-Host "Found signtool at: $signtool"
+
+          # 3. Sign executable with timestamp server
+          $targetExe = "mamo-Connector\target\release\mamo-connector.exe"
+          Write-Host "Signing executable: $targetExe"
+          & $signtool sign /f $certPath /p $certPassword /tr http://timestamp.digicert.com /td sha256 /fd sha256 $targetExe
+
+          # 4. Clean up certificate file
+          Remove-Item -Force $certPath
+
       - name: Rename artifact
         shell: pwsh
         run: |
