@@ -1262,7 +1262,7 @@ pub async fn create_deck_from_mamo_with_progress(
             let playable: Vec<_> = scenarios.into_iter().filter(|s| s.playable_in_forge()).collect();
             if !playable.is_empty() {
                 log(&format!("Syncing {} scenario(s) for Forge...", playable.len()));
-                let log_dir = get_game_log_directory();
+                let scenario_dir = get_scenario_directory();
                 for sc in &playable {
                     if let Ok(bundle) = fetch_forge_scenario_bundle(deck_id, &sc.id).await {
                         let scenario_id_tag = format!("scenario-{}", sc.id);
@@ -1270,7 +1270,7 @@ pub async fn create_deck_from_mamo_with_progress(
                         if let Some(scenario_obj) = sc_json.get_mut("scenario").and_then(|s| s.as_object_mut()) {
                             scenario_obj.insert("id".to_string(), serde_json::Value::String(scenario_id_tag.clone()));
                         }
-                        if let Ok(ref dir) = log_dir {
+                        if let Ok(ref dir) = scenario_dir {
                             let _ = fs::create_dir_all(dir);
                             if let Ok(json_str) = serde_json::to_string_pretty(&sc_json) {
                                 let _ = fs::write(dir.join(format!("{}.json", scenario_id_tag)), &json_str);
@@ -1314,11 +1314,11 @@ pub async fn create_deck_from_mamo(deck_id: &str) -> Result<DeckCreationResult> 
 
 // ==================== Forge Scenario Export ====================
 
-/// Returns the Forge game-log directory where scenario JSON files are placed.
+/// Returns the Forge game scenario directory where scenario JSON files are placed.
 /// Forge's CSubmenuScenario scans this directory for `*.json` scenario files.
-/// Windows: %APPDATA%\Forge\games\gamelogs\
-/// macOS/Linux: ~/.forge/games/gamelogs/
-fn get_game_log_directory() -> Result<PathBuf> {
+/// Windows: %APPDATA%\Forge\games\scenarios\
+/// macOS/Linux: ~/.forge/games/scenarios/
+fn get_scenario_directory() -> Result<PathBuf> {
     let base = if cfg!(windows) {
         if let Some(appdata) = std::env::var_os("APPDATA") {
             PathBuf::from(appdata)
@@ -1330,7 +1330,7 @@ fn get_game_log_directory() -> Result<PathBuf> {
             .ok_or_else(|| anyhow::anyhow!("HOME environment variable not found"))?;
         PathBuf::from(home).join(".forge")
     };
-    Ok(base.join("Forge").join("games").join("gamelogs"))
+    Ok(base.join("Forge").join("games").join("scenarios"))
 }
 
 /// Bundle returned by the backend forge-scenario export endpoint.
@@ -1388,22 +1388,22 @@ pub async fn create_deck_and_scenario_for_forge(deck_id: &str, scenario_id: &str
         .context("Failed to write scenario .dck file")?;
     info!("Scenario deck written: {:?}", deck_path);
 
-    // Write Forge scenario JSON to the game-log directory under both scenario-<id>.json
+    // Write Forge scenario JSON to the scenario directory under both scenario-<id>.json
     // and Scenario_<deck_name>.json so Forge can find it by Scenario= tag or by deck name.
-    let log_dir = get_game_log_directory()?;
-    if !log_dir.exists() {
-        fs::create_dir_all(&log_dir)
-            .with_context(|| format!("Failed to create game-log directory: {:?}", log_dir))?;
+    let scenario_dir = get_scenario_directory()?;
+    if !scenario_dir.exists() {
+        fs::create_dir_all(&scenario_dir)
+            .with_context(|| format!("Failed to create scenario directory: {:?}", scenario_dir))?;
     }
     let scenario_json_str = serde_json::to_string_pretty(&scenario_json)
         .context("Failed to serialise scenario JSON")?;
 
-    let id_json_path = log_dir.join(format!("{}.json", scenario_id_tag));
+    let id_json_path = scenario_dir.join(format!("{}.json", scenario_id_tag));
     fs::write(&id_json_path, &scenario_json_str)
         .with_context(|| format!("Failed to write scenario JSON to {:?}", id_json_path))?;
     info!("Scenario JSON (by ID) written: {:?}", id_json_path);
 
-    let deck_json_path = log_dir.join(format!("Scenario_{}.json", sanitized_deck_name));
+    let deck_json_path = scenario_dir.join(format!("Scenario_{}.json", sanitized_deck_name));
     fs::write(&deck_json_path, &scenario_json_str)
         .with_context(|| format!("Failed to write scenario JSON to {:?}", deck_json_path))?;
     info!("Scenario JSON (by deck name) written: {:?}", deck_json_path);
@@ -2474,13 +2474,13 @@ mod tests {
         assert!(deck_content.contains("[Main]"));
         println!("✅ .dck written: {:?}", deck_path);
 
-        let log_dir = get_game_log_directory().expect("should resolve gamelog directory");
+        let scenario_dir = get_scenario_directory().expect("should resolve scenario directory");
         let deck_name_stem = deck_path
             .file_stem()
             .expect("deck path should have a file stem")
             .to_string_lossy()
             .to_string();
-        let scenario_json_path = log_dir.join(format!("Scenario_{}.json", deck_name_stem));
+        let scenario_json_path = scenario_dir.join(format!("Scenario_{}.json", deck_name_stem));
         assert!(
             scenario_json_path.exists(),
             "expected scenario JSON at {:?}",
