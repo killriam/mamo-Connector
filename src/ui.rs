@@ -72,6 +72,7 @@ struct UpdateCheckState {
     asset: Option<crate::download::ConnectorAsset>,
     staged_path: Option<std::path::PathBuf>,
     is_downloading: bool,
+    busy: bool,
     dismissed: bool,
     error: Option<String>,
 }
@@ -2355,6 +2356,49 @@ impl LauncherApp {
                 cancelled,
                 ctx,
             ));
+        });
+    }
+
+    /// "Check now" for MaMo Connector updates — runs on-demand GitHub release check.
+    fn trigger_connector_update_check(&mut self, ctx: &egui::Context) {
+        {
+            let mut s = self.update_check.lock().unwrap();
+            if s.busy || s.is_downloading {
+                return;
+            }
+            s.busy = true;
+            s.error = None;
+        }
+        let update_check = Arc::clone(&self.update_check);
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let runtime = tokio::runtime::Runtime::new().unwrap();
+            runtime.block_on(async {
+                match crate::download::resolve_connector_release_asset().await {
+                    Ok(asset) => {
+                        let is_newer = is_newer_version(&asset.version, env!("CARGO_PKG_VERSION"));
+                        if let Ok(mut s) = update_check.lock() {
+                            s.busy = false;
+                            if is_newer {
+                                s.available_version = Some(asset.version.clone());
+                                s.asset = Some(asset);
+                                s.dismissed = false;
+                            } else {
+                                s.available_version = None;
+                                s.asset = None;
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        log::error!("Connector update check failed: {e}");
+                        if let Ok(mut s) = update_check.lock() {
+                            s.busy = false;
+                            s.error = Some(e.to_string());
+                        }
+                    }
+                }
+                ctx.request_repaint();
+            });
         });
     }
 
@@ -5306,13 +5350,15 @@ impl LauncherApp {
 
             // ── MaMo Connector itself ────────────────────────────────────
             ui.group(|ui| {
-                let (update_ver, staged_path, is_downloading, dismissed) = {
+                let (update_ver, staged_path, is_downloading, is_busy, dismissed, update_err) = {
                     let s = self.update_check.lock().unwrap();
                     (
                         s.available_version.clone(),
                         s.staged_path.clone(),
                         s.is_downloading,
+                        s.busy,
                         s.dismissed,
+                        s.error.clone(),
                     )
                 };
                 ui.horizontal(|ui| {
@@ -5322,6 +5368,8 @@ impl LauncherApp {
                             render_status_pill(ui, "Ready to restart", PillStatus::Success);
                         } else if is_downloading {
                             render_status_pill(ui, "Downloading…", PillStatus::Warning);
+                        } else if is_busy {
+                            render_status_pill(ui, "Checking…", PillStatus::Neutral);
                         } else if update_ver.is_some() && !dismissed {
                             render_status_pill(ui, "Update available", PillStatus::Warning);
                         } else {
@@ -5330,7 +5378,21 @@ impl LauncherApp {
                     });
                 });
                 ui.add_space(4.0);
-                ui.label(egui::RichText::new(format!("You're on v{}", env!("CARGO_PKG_VERSION"))).small().weak());
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new(format!("You're on v{}", env!("CARGO_PKG_VERSION"))).small().weak());
+                    if !is_downloading && staged_path.is_none() {
+                        if is_busy {
+                            ui.spinner();
+                        } else if ui.small_button("Check now").clicked() {
+                            self.trigger_connector_update_check(ctx);
+                        }
+                    }
+                });
+
+                if let Some(ref err) = update_err {
+                    ui.add_space(4.0);
+                    ui.label(egui::RichText::new(format!("Update check failed: {err}")).small().color(egui::Color32::from_rgb(176, 0, 32)));
+                }
 
                 if let Some(ref staged) = staged_path {
                     let ver = update_ver.as_deref().unwrap_or("new");
