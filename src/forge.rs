@@ -783,10 +783,28 @@ pub fn launch_forge_replay(replay_path: &str) -> Result<ForgeLaunchResult> {
     )
 }
 
+/// Helper to read a .dck file and extract the internal deck Name from its metadata header.
+/// This is crucial because Windows filenames are sanitized (e.g., replacing colons with underscores),
+/// but Forge matches the CLI --deck parameter against the internal "Name=" metadata.
+fn extract_deck_name_from_file(path_str: &str) -> Option<String> {
+    let path = PathBuf::from(path_str);
+    if path.exists() && path.is_file() {
+        if let Ok(content) = std::fs::read_to_string(&path) {
+            for line in content.lines() {
+                if line.starts_with("Name=") {
+                    return Some(line["Name=".len()..].trim().to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
 /// Launch Forge using the path from settings.
 ///
 /// `deck_path` and `deck2_path` may be full file-system paths (e.g. `.../decks/MyDeck.dck`)
-/// or plain deck names. The file stem is extracted and passed to Forge as `--deck` / `--deck2`.
+/// or plain deck names. The internal deck name is extracted from the .dck file header if possible,
+/// falling back to the file stem, and passed to Forge as `--deck` / `--deck2`.
 pub fn launch_forge_from_settings(deck_path: Option<&str>, deck2_path: Option<&str>) -> Result<ForgeLaunchResult> {
     // Log if Forge is already running, but do not skip launch
     if is_forge_window_open() {
@@ -809,18 +827,22 @@ pub fn launch_forge_from_settings(deck_path: Option<&str>, deck2_path: Option<&s
         }
     };
 
-    // Extract deck names (file stems) from paths so Forge receives the display name.
+    // Extract deck names (internal Name or file stem) from paths so Forge receives the matching identifier.
     let deck_name = deck_path.map(|p| {
-        PathBuf::from(p)
-            .file_stem()
-            .map(|s| s.to_string_lossy().to_string())
-            .unwrap_or_else(|| p.to_string())
+        extract_deck_name_from_file(p).unwrap_or_else(|| {
+            PathBuf::from(p)
+                .file_stem()
+                .map(|s| s.to_string_lossy().to_string())
+                .unwrap_or_else(|| p.to_string())
+        })
     });
     let deck2_name = deck2_path.map(|p| {
-        PathBuf::from(p)
-            .file_stem()
-            .map(|s| s.to_string_lossy().to_string())
-            .unwrap_or_else(|| p.to_string())
+        extract_deck_name_from_file(p).unwrap_or_else(|| {
+            PathBuf::from(p)
+                .file_stem()
+                .map(|s| s.to_string_lossy().to_string())
+                .unwrap_or_else(|| p.to_string())
+        })
     });
 
     launch_forge(&forge_path, deck_name.as_deref(), deck2_name.as_deref())
