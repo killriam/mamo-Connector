@@ -24,3 +24,4 @@ target
 *.pfx
 *.cer
 *signing-base64.txt
+!docs/mamo-signing.cer
