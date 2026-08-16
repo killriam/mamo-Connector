@@ -1321,29 +1321,23 @@ pub async fn create_deck_and_scenario_for_forge(deck_id: &str, scenario_id: &str
     let bundle = fetch_forge_scenario_bundle(deck_id, scenario_id).await
         .context("Failed to fetch Forge scenario bundle from MaMo API")?;
 
-    let scenario_title = bundle.scenario_json
-        .get("scenario")
-        .and_then(|s| s.get("title"))
-        .and_then(|t| t.as_str())
-        .filter(|t| !t.is_empty());
+    let scenario_id_tag = format!("scenario-{}", scenario_id);
+    let sanitized_deck_name = sanitize_filename(&bundle.deck_name);
 
-    let scenario_deck_name = if let Some(title) = scenario_title {
-        format!("Scenario - {} ({})", bundle.deck_name, title)
-    } else {
-        format!("Scenario - {}", bundle.deck_name)
-    };
+    // Update scenario JSON to ensure scenario.id matches the Scenario= metadata tag
+    let mut scenario_json = bundle.scenario_json.clone();
+    if let Some(scenario_obj) = scenario_json.get_mut("scenario").and_then(|s| s.as_object_mut()) {
+        scenario_obj.insert("id".to_string(), serde_json::Value::String(scenario_id_tag.clone()));
+    }
 
-    let sanitized_deck_name = sanitize_filename(&scenario_deck_name);
-
-    // Ensure the metadata Name line in the .dck file matches the sanitized filename stem
-    // so Forge's internal deck name equals the CLI --deck argument.
+    // Ensure the metadata has Name= and Scenario=<id> so Forge displays and selects the Scenario dropdown
     let mut dck_content = bundle.dck.clone();
     if let Some(pos) = dck_content.find("Name=") {
         if let Some(end_line) = dck_content[pos..].find('\n') {
-            dck_content.replace_range(pos..pos + end_line, &format!("Name={}", sanitized_deck_name));
+            dck_content.replace_range(pos..pos + end_line, &format!("Name={}\nScenario={}", sanitized_deck_name, scenario_id_tag));
         }
     } else if dck_content.contains("[metadata]") {
-        dck_content = dck_content.replace("[metadata]\n", &format!("[metadata]\nName={}\n", sanitized_deck_name));
+        dck_content = dck_content.replace("[metadata]\n", &format!("[metadata]\nName={}\nScenario={}\n", sanitized_deck_name, scenario_id_tag));
     }
 
     // Write ordered .dck file
@@ -1351,22 +1345,28 @@ pub async fn create_deck_and_scenario_for_forge(deck_id: &str, scenario_id: &str
         .context("Failed to write scenario .dck file")?;
     info!("Scenario deck written: {:?}", deck_path);
 
-    // Write Forge scenario JSON to the game-log directory
+    // Write Forge scenario JSON to the game-log directory under both scenario-<id>.json
+    // and Scenario_<deck_name>.json so Forge can find it by Scenario= tag or by deck name.
     let log_dir = get_game_log_directory()?;
     if !log_dir.exists() {
         fs::create_dir_all(&log_dir)
             .with_context(|| format!("Failed to create game-log directory: {:?}", log_dir))?;
     }
-    let scenario_file_name = format!("Scenario_{}.json", sanitized_deck_name);
-    let scenario_path = log_dir.join(&scenario_file_name);
-    let scenario_json_str = serde_json::to_string_pretty(&bundle.scenario_json)
+    let scenario_json_str = serde_json::to_string_pretty(&scenario_json)
         .context("Failed to serialise scenario JSON")?;
-    fs::write(&scenario_path, &scenario_json_str)
-        .with_context(|| format!("Failed to write scenario JSON to {:?}", scenario_path))?;
-    info!("Scenario JSON written: {:?}", scenario_path);
+
+    let id_json_path = log_dir.join(format!("{}.json", scenario_id_tag));
+    fs::write(&id_json_path, &scenario_json_str)
+        .with_context(|| format!("Failed to write scenario JSON to {:?}", id_json_path))?;
+    info!("Scenario JSON (by ID) written: {:?}", id_json_path);
+
+    let deck_json_path = log_dir.join(format!("Scenario_{}.json", sanitized_deck_name));
+    fs::write(&deck_json_path, &scenario_json_str)
+        .with_context(|| format!("Failed to write scenario JSON to {:?}", deck_json_path))?;
+    info!("Scenario JSON (by deck name) written: {:?}", deck_json_path);
 
     Ok(DeckCreationResult::success(
-        format!("Scenario deck '{}' and scenario file written for Forge", scenario_deck_name),
+        format!("Scenario deck '{}' and scenario file written for Forge", bundle.deck_name),
         deck_path,
     ))
 }
