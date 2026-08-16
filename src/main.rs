@@ -41,14 +41,16 @@ fn check_single_instance() -> Option<std::fs::File> {
     let _ = fs::create_dir_all(&config_dir);
     let lock_path = config_dir.join("instance.lock");
     
-    // Try to create/open the lock file with exclusive access
-    match fs::OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(true)
-        .open(&lock_path)
-    {
-        Ok(file) => {
+    // Try to obtain the lock, retrying for up to 1 second (10 x 100ms)
+    // to allow a restarting/exiting parent process to release its handle.
+    for _ in 0..10 {
+        let file_attempt = fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&lock_path);
+
+        if let Ok(file) = file_attempt {
             #[cfg(windows)]
             {
                 use std::os::windows::io::AsRawHandle;
@@ -58,22 +60,19 @@ fn check_single_instance() -> Option<std::fs::File> {
                 let locked = unsafe { LockFile(handle as *mut _, 0, 0, 1, 0) };
                 
                 if locked != 0 {
-                    // Successfully locked - we are the primary instance
-                    Some(file)
-                } else {
-                    // Another instance has the lock
-                    None
+                    return Some(file);
                 }
             }
             
             #[cfg(not(windows))]
             {
-                // On non-Windows, just use file existence (less robust but works)
-                Some(file)
+                return Some(file);
             }
         }
-        Err(_) => None,
+        
+        std::thread::sleep(std::time::Duration::from_millis(100));
     }
+    None
 }
 
 #[tokio::main]
