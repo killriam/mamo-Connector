@@ -283,6 +283,101 @@
             text-decoration: underline;
         }
 
+        /* Trust Certificate Section */
+        .trust-section {
+            padding: 80px 0;
+            border-top: 1px solid var(--border-color);
+        }
+
+        .trust-card {
+            background: var(--card-bg);
+            border: 1px solid var(--border-color);
+            border-radius: 12px;
+            padding: 32px;
+            margin-top: 24px;
+            backdrop-filter: blur(10px);
+        }
+
+        .trust-card h3 {
+            font-size: 22px;
+            margin-bottom: 12px;
+            color: #fff;
+        }
+
+        .trust-card p {
+            color: var(--text-muted);
+            margin-bottom: 20px;
+        }
+
+        .trust-methods {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 24px;
+            margin-top: 24px;
+        }
+
+        @media (max-width: 768px) {
+            .trust-methods {
+                grid-template-columns: 1fr;
+            }
+        }
+
+        .method-box {
+            background: rgba(255, 255, 255, 0.01);
+            border: 1px solid rgba(255, 255, 255, 0.03);
+            border-radius: 8px;
+            padding: 24px;
+        }
+
+        .method-box h4 {
+            font-size: 16px;
+            margin-bottom: 14px;
+            color: var(--accent-primary);
+        }
+
+        .method-box ol {
+            padding-left: 20px;
+            color: var(--text-muted);
+            font-size: 14px;
+        }
+
+        .method-box ol li {
+            margin-bottom: 12px;
+        }
+
+        .code-block {
+            background: #060911;
+            border: 1px solid rgba(255, 255, 255, 0.05);
+            border-radius: 6px;
+            padding: 14px;
+            font-family: Consolas, monospace;
+            font-size: 12px;
+            color: #34d399;
+            overflow-x: auto;
+            margin: 8px 0;
+            white-space: pre-wrap;
+            word-break: break-all;
+        }
+
+        .download-cert-btn {
+            display: inline-flex;
+            align-items: center;
+            gap: 8px;
+            background: linear-gradient(135deg, var(--accent-primary), var(--accent-secondary));
+            color: white;
+            text-decoration: none;
+            padding: 12px 24px;
+            border-radius: 6px;
+            font-weight: 600;
+            font-size: 14px;
+            transition: opacity 0.2s;
+            margin-top: 8px;
+        }
+
+        .download-cert-btn:hover {
+            opacity: 0.9;
+        }
+
         /* Responsive Layout */
         @media (max-width: 768px) {
             .hero-title {
@@ -360,6 +455,42 @@
                     <div class="step-content">
                         <h4>Automated Hand-off</h4>
                         <p>The browser hands off the request to the local MaMo Connector, which sets up the local deck files and boots the Forge game client instantly.</p>
+                    </div>
+                </div>
+            </div>
+        </section>
+
+        <section class="trust-section">
+            <h2 class="section-title">Security & Code Signing</h2>
+            <div class="trust-card">
+                <h3>Trusting the Self-Signed Certificate</h3>
+                <p>
+                    Because the MaMo Connector companion app registers custom protocol links (<code>mamoConnector://</code>), Windows Defender SmartScreen or Smart App Control (SAC) may flag the installation. While our application to the SignPath Foundation for a publicly trusted open-source signing certificate is pending review, we sign our releases using a secure self-signed certificate issued to the <strong>MaMo Connector Team</strong>.
+                </p>
+                <p>
+                    To run the connector without any Windows security prompts, blocks, or "Unknown Publisher" warnings, you can download and trust our public key certificate locally on your machine:
+                </p>
+
+                <a href="./mamo-signing.cer" class="download-cert-btn">
+                    📥 Download Public Certificate (mamo-signing.cer)
+                </a>
+
+                <div class="trust-methods">
+                    <div class="method-box">
+                        <h4>Method 1: PowerShell (Fastest)</h4>
+                        <p>Open a PowerShell terminal <strong>as Administrator</strong> in the folder where you downloaded the certificate and execute:</p>
+                        <div class="code-block">Import-Certificate -FilePath .\mamo-signing.cer -CertStoreLocation Cert:\LocalMachine\Root
+Import-Certificate -FilePath .\mamo-signing.cer -CertStoreLocation Cert:\LocalMachine\TrustedPublisher</div>
+                    </div>
+                    <div class="method-box">
+                        <h4>Method 2: Graphical Import Wizard</h4>
+                        <ol>
+                            <li>Double-click the downloaded <code>mamo-signing.cer</code> file and click <strong>Install Certificate...</strong></li>
+                            <li>Choose <strong>Local Machine</strong> as the store location and click <strong>Next</strong>.</li>
+                            <li>Select <strong>Place all certificates in the following store</strong> and click <strong>Browse</strong>.</li>
+                            <li>Choose <strong>Trusted Root Certification Authorities</strong> and click <strong>OK</strong> -> <strong>Next</strong> -> <strong>Finish</strong>.</li>
+                            <li>Double-click the certificate file again, repeat the wizard, but choose <strong>Trusted Publishers</strong> as the store.</li>
+                        </ol>
                     </div>
                 </div>
             </div>
