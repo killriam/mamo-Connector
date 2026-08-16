@@ -327,43 +327,60 @@ pub fn preview_scan(
     Ok(preview_results)
 }
 
-/// Read and parse a game log file
+/// Read and parse a game log file (supports plain text/JSON, raw gzip, and base64-encoded gzip)
 pub fn read_game_log(path: &Path) -> Result<GameLogContent> {
-    let raw = fs::read_to_string(path)
-        .with_context(|| format!("Failed to read file: {:?}", path))?;
-    
-    // Forge (and other Java apps) sometimes write replay files as base64(gzip(JSON)).
-    // The base64-encoded gzip header always starts with "H4sI". Detect and unwrap
-    // transparently so the rest of the pipeline always sees plain JSON.
-    let content = if raw.trim_start().starts_with("H4sI") {
-        let trimmed = raw.trim();
-        match BASE64_STANDARD.decode(trimmed) {
-            Ok(compressed) => {
-                let mut decoder = GzDecoder::new(compressed.as_slice());
-                let mut decompressed = String::new();
-                match decoder.read_to_string(&mut decompressed) {
-                    Ok(_) => decompressed,
-                    Err(_) => raw, // not valid gzip — pass through as-is
-                }
-            }
-            Err(_) => raw, // not valid base64 — pass through as-is
+    // Attempt read, with a brief retry for files temporarily locked by Forge/simulation
+    let mut bytes_result = fs::read(path);
+    if bytes_result.is_err() {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        bytes_result = fs::read(path);
+    }
+    let bytes = bytes_result.with_context(|| format!("Failed to read file: {:?}", path))?;
+
+    if bytes.is_empty() {
+        anyhow::bail!("File {:?} is empty (0 bytes)", path);
+    }
+
+    // Check if raw gzip (magic bytes 0x1F, 0x8B)
+    let content = if bytes.starts_with(&[0x1f, 0x8b]) {
+        let mut decoder = GzDecoder::new(bytes.as_slice());
+        let mut decompressed = String::new();
+        match decoder.read_to_string(&mut decompressed) {
+            Ok(_) => decompressed,
+            Err(_) => String::from_utf8_lossy(&bytes).to_string(),
         }
     } else {
-        raw
+        let text = String::from_utf8_lossy(&bytes);
+        if text.trim_start().starts_with("H4sI") {
+            let trimmed = text.trim();
+            match BASE64_STANDARD.decode(trimmed) {
+                Ok(compressed) => {
+                    let mut decoder = GzDecoder::new(compressed.as_slice());
+                    let mut decompressed = String::new();
+                    match decoder.read_to_string(&mut decompressed) {
+                        Ok(_) => decompressed,
+                        Err(_) => text.to_string(),
+                    }
+                }
+                Err(_) => text.to_string(),
+            }
+        } else {
+            text.to_string()
+        }
     };
-    
+
     let metadata = fs::metadata(path)
         .with_context(|| format!("Failed to get file metadata: {:?}", path))?;
-    
+
     let filename = path.file_name()
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_else(|| "unknown".to_string());
-    
+
     let modified = metadata.modified()
         .ok()
         .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
         .map(|d| d.as_secs());
-    
+
     Ok(GameLogContent {
         filename,
         content,
@@ -954,7 +971,7 @@ pub async fn process_new_logs_with_filter(
                 summary.failed_uploads += 1;
                 summary.results.push(GameLogProcessResult::failed(
                     filename.clone(),
-                    format!("Failed to read file: {}", e),
+                    format!("{e}"),
                 ));
                 continue;
             }
@@ -1464,5 +1481,81 @@ mod tests {
         );
         assert!(!failed.success);
         assert_eq!(failed.message, "Error message");
+    }
+
+    #[test]
+    fn test_read_game_log_plain_text() {
+        let temp_dir = std::env::temp_dir().join("mamo-test-gamelog-plain");
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        std::fs::create_dir_all(&temp_dir).unwrap();
+
+        let file_path = temp_dir.join("replay_plain.json");
+        std::fs::write(&file_path, b"{\"game\": \"data\"}").unwrap();
+
+        let res = read_game_log(&file_path).expect("plain text should read successfully");
+        assert_eq!(res.filename, "replay_plain.json");
+        assert_eq!(res.content, "{\"game\": \"data\"}");
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_read_game_log_raw_gzip() {
+        use flate2::write::GzEncoder;
+        use flate2::Compression;
+
+        let temp_dir = std::env::temp_dir().join("mamo-test-gamelog-gzip");
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        std::fs::create_dir_all(&temp_dir).unwrap();
+
+        let file_path = temp_dir.join("replay_gzip.json");
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(b"{\"gzipped\": true}").unwrap();
+        let compressed = encoder.finish().unwrap();
+        std::fs::write(&file_path, compressed).unwrap();
+
+        let res = read_game_log(&file_path).expect("raw gzip should decompress successfully");
+        assert_eq!(res.content, "{\"gzipped\": true}");
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_read_game_log_base64_gzip() {
+        use base64::prelude::*;
+        use flate2::write::GzEncoder;
+        use flate2::Compression;
+
+        let temp_dir = std::env::temp_dir().join("mamo-test-gamelog-b64-gzip");
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        std::fs::create_dir_all(&temp_dir).unwrap();
+
+        let file_path = temp_dir.join("replay_b64.json");
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(b"{\"b64\": true}").unwrap();
+        let compressed = encoder.finish().unwrap();
+        let b64 = BASE64_STANDARD.encode(&compressed);
+        std::fs::write(&file_path, b64).unwrap();
+
+        let res = read_game_log(&file_path).expect("base64 gzip should decompress successfully");
+        assert_eq!(res.content, "{\"b64\": true}");
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_read_game_log_empty_file() {
+        let temp_dir = std::env::temp_dir().join("mamo-test-gamelog-empty");
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        std::fs::create_dir_all(&temp_dir).unwrap();
+
+        let file_path = temp_dir.join("empty.json");
+        std::fs::write(&file_path, b"").unwrap();
+
+        let res = read_game_log(&file_path);
+        assert!(res.is_err());
+        assert!(res.unwrap_err().to_string().contains("empty"));
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
     }
 }
