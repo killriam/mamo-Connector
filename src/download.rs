@@ -310,6 +310,194 @@ pub fn finalize_staged_forge_jar(dest_dir: &Path, staged_path: &Path, asset: &Fo
     Ok(final_path)
 }
 
+const CONNECTOR_RELEASES_API: &str =
+    "https://api.github.com/repos/killriam/mamo-Connector/releases/latest";
+
+/// A resolved GitHub release asset for MaMo Connector desktop app.
+#[derive(Debug, Clone)]
+pub struct ConnectorAsset {
+    pub version: String,
+    pub download_url: String,
+    pub name: String,
+    pub size: Option<u64>,
+}
+
+/// Resolves the latest release asset for MaMo Connector.
+pub async fn resolve_connector_release_asset() -> Result<ConnectorAsset> {
+    let client = reqwest::Client::builder()
+        .user_agent("mamo-connector-update-check")
+        .timeout(std::time::Duration::from_secs(10))
+        .build()?;
+
+    let resp: serde_json::Value = client
+        .get(CONNECTOR_RELEASES_API)
+        .send()
+        .await
+        .context("Failed to reach GitHub releases API for MaMo Connector")?
+        .json()
+        .await
+        .context("Failed to parse GitHub releases API response for MaMo Connector")?;
+
+    let tag = resp["tag_name"]
+        .as_str()
+        .ok_or_else(|| anyhow::anyhow!("No tag_name in release response"))?
+        .trim_start_matches('v')
+        .to_string();
+
+    let assets = resp["assets"]
+        .as_array()
+        .filter(|a| !a.is_empty())
+        .context("No release assets found in MaMo Connector release")?;
+
+    // Look for Windows executable asset (e.g. mamo-connector-v0.3.8-windows-x64.exe or any .exe)
+    let asset = assets
+        .iter()
+        .find(|a| {
+            a["name"]
+                .as_str()
+                .map(|n| n.ends_with(".exe") && (n.contains("windows") || n.contains("connector")))
+                .unwrap_or(false)
+        })
+        .or_else(|| {
+            assets.iter().find(|a| a["name"].as_str().map(|n| n.ends_with(".exe")).unwrap_or(false))
+        })
+        .context("No suitable executable asset found in release")?;
+
+    let download_url = asset["browser_download_url"]
+        .as_str()
+        .context("Asset is missing browser_download_url")?
+        .to_string();
+
+    let name = asset["name"]
+        .as_str()
+        .context("Asset is missing name")?
+        .to_string();
+
+    let size = asset["size"].as_u64();
+
+    Ok(ConnectorAsset {
+        version: tag,
+        download_url,
+        name,
+        size,
+    })
+}
+
+/// Directory where staged MaMo Connector updates are downloaded.
+pub fn connector_updates_dir() -> PathBuf {
+    dirs::data_local_dir()
+        .unwrap_or_else(std::env::temp_dir)
+        .join("mamo-connector")
+        .join("updates")
+}
+
+/// Downloads the MaMo Connector binary to a staged file in the updates folder.
+pub async fn download_connector_update_staged(
+    asset: &ConnectorAsset,
+    on_progress: impl Fn(DownloadUpdate) + Send + Sync,
+    cancelled: Arc<AtomicBool>,
+) -> Result<PathBuf> {
+    let dest_dir = connector_updates_dir();
+    let temp_name = format!("{}.staged", asset.name);
+    let staged_path = download_to_file(
+        &asset.download_url,
+        &dest_dir,
+        &temp_name,
+        &on_progress,
+        &cancelled,
+    )
+    .await?;
+
+    let final_path = dest_dir.join(&asset.name);
+    if final_path.exists() {
+        let _ = std::fs::remove_file(&final_path);
+    }
+    std::fs::rename(&staged_path, &final_path)
+        .with_context(|| format!("Failed to move staged connector update into place at {:?}", final_path))?;
+
+    Ok(final_path)
+}
+
+/// Removes stale `.old` backup executables or temporary `.staged` files from previous updates.
+pub fn cleanup_old_connector_backups() {
+    if let Ok(current_exe) = std::env::current_exe() {
+        let old_exe = current_exe.with_extension("exe.old");
+        if old_exe.exists() {
+            let _ = std::fs::remove_file(&old_exe);
+        }
+        let old_exe2 = current_exe.with_extension("old");
+        if old_exe2.exists() {
+            let _ = std::fs::remove_file(&old_exe2);
+        }
+    }
+    let updates_dir = connector_updates_dir();
+    if let Ok(entries) = std::fs::read_dir(&updates_dir) {
+        for entry in entries.flatten() {
+            if let Some(ext) = entry.path().extension() {
+                if ext == "staged" {
+                    let _ = std::fs::remove_file(entry.path());
+                }
+            }
+        }
+    }
+}
+
+/// Swaps the currently running Connector executable with `new_exe_path` and relaunches the app.
+pub fn apply_connector_update_and_restart(new_exe_path: &Path) -> Result<()> {
+    let current_exe = std::env::current_exe().context("Failed to get current executable path")?;
+
+    #[cfg(windows)]
+    {
+        let old_backup = current_exe.with_extension("exe.old");
+        if old_backup.exists() {
+            let _ = std::fs::remove_file(&old_backup);
+        }
+
+        // On Windows, a running executable can be renamed even while executing
+        if let Err(e) = std::fs::rename(&current_exe, &old_backup) {
+            log::warn!("Failed to rename running exe to .old ({e}); falling back to direct launch");
+            let args: Vec<String> = std::env::args().skip(1).collect();
+            std::process::Command::new(new_exe_path)
+                .args(&args)
+                .spawn()
+                .context("Failed to spawn new connector process from updates dir")?;
+            std::process::exit(0);
+        }
+
+        // Copy the new binary into the target current_exe path
+        if let Err(e) = std::fs::copy(new_exe_path, &current_exe) {
+            log::warn!("Failed to copy new executable to {:?}: {e}; launching from updates dir", current_exe);
+            // Restore original name if copy fails
+            let _ = std::fs::rename(&old_backup, &current_exe);
+            let args: Vec<String> = std::env::args().skip(1).collect();
+            std::process::Command::new(new_exe_path)
+                .args(&args)
+                .spawn()
+                .context("Failed to spawn new connector process from updates dir")?;
+            std::process::exit(0);
+        }
+
+        // Launch the updated executable in place
+        let args: Vec<String> = std::env::args().skip(1).collect();
+        std::process::Command::new(&current_exe)
+            .args(&args)
+            .spawn()
+            .context("Failed to launch updated executable")?;
+
+        std::process::exit(0);
+    }
+
+    #[cfg(not(windows))]
+    {
+        let args: Vec<String> = std::env::args().skip(1).collect();
+        std::process::Command::new(new_exe_path)
+            .args(&args)
+            .spawn()
+            .context("Failed to launch updated executable")?;
+        std::process::exit(0);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -481,5 +669,23 @@ mod tests {
         assert!(leftover_zips.is_empty(), "zip should be removed after extraction, found: {leftover_zips:?}");
 
         let _ = std::fs::remove_dir_all(&dest);
+    }
+
+    #[test]
+    fn connector_updates_dir_creates_valid_path() {
+        let dir = connector_updates_dir();
+        assert!(dir.ends_with("updates"));
+    }
+
+    #[test]
+    fn cleanup_old_connector_backups_cleans_staged_files() {
+        let updates_dir = connector_updates_dir();
+        let _ = std::fs::create_dir_all(&updates_dir);
+        let test_staged = updates_dir.join("test-mamo-update.exe.staged");
+        std::fs::write(&test_staged, b"dummy staged").unwrap();
+        assert!(test_staged.exists());
+
+        cleanup_old_connector_backups();
+        assert!(!test_staged.exists(), "cleanup should remove stale .staged files");
     }
 }

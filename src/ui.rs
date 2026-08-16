@@ -64,12 +64,16 @@ struct SyncState {
     add_name_input: String,
 }
 
-/// State for the background version check
+/// State for the background version check and in-app update
 #[derive(Clone, Default)]
 struct UpdateCheckState {
     /// Some(version_string) when a newer release is available
     available_version: Option<String>,
+    asset: Option<crate::download::ConnectorAsset>,
+    staged_path: Option<std::path::PathBuf>,
+    is_downloading: bool,
     dismissed: bool,
+    error: Option<String>,
 }
 
 /// A downloaded-but-not-yet-installed Forge update, waiting for Forge to not be running so it
@@ -271,26 +275,6 @@ impl Default for SetupWizardState {
             java_status: None,
         }
     }
-}
-
-/// Fetch the tag_name of the latest GitHub release (strips leading 'v')
-async fn fetch_latest_release_version() -> anyhow::Result<String> {
-    let client = reqwest::Client::builder()
-        .user_agent("mamo-connector-update-check")
-        .timeout(std::time::Duration::from_secs(10))
-        .build()?;
-    let resp: serde_json::Value = client
-        .get("https://api.github.com/repos/killriam/mamo-Connector/releases/latest")
-        .send()
-        .await?
-        .json()
-        .await?;
-    let tag = resp["tag_name"]
-        .as_str()
-        .ok_or_else(|| anyhow::anyhow!("no tag_name in response"))?
-        .trim_start_matches('v')
-        .to_string();
-    Ok(tag)
 }
 
 /// Human-readable download progress string: "42.3 MB / 156.0 MB (27%)" or "42.3 MB"
@@ -763,6 +747,10 @@ struct LauncherApp {
     forge_local_decks: Vec<String>,
     /// Background version check result
     update_check: Arc<Mutex<UpdateCheckState>>,
+    /// Live progress while an in-place Connector update download is running
+    connector_update_progress: Arc<Mutex<Option<DownloadProgress>>>,
+    /// Set by the Connector update banner's Cancel button
+    connector_update_cancelled: Arc<AtomicBool>,
     /// Background MaMo Forge update check result
     forge_update_check: Arc<Mutex<ForgeUpdateCheckState>>,
     /// Live progress while an in-place Forge update download is running (Home tab banner)
@@ -933,19 +921,27 @@ impl LauncherApp {
             java_status: None,
         };
 
+        // Clean up any stale .old backup binaries or unfinished .staged files
+        crate::download::cleanup_old_connector_backups();
+
         // Kick off background update check — doesn't block startup
         let update_check = Arc::new(Mutex::new(UpdateCheckState::default()));
+        let connector_update_progress: Arc<Mutex<Option<DownloadProgress>>> = Arc::new(Mutex::new(None));
+        let connector_update_cancelled = Arc::new(AtomicBool::new(false));
         {
             let update_check_bg = Arc::clone(&update_check);
+            let ctx_bg = ctx.clone();
             std::thread::spawn(move || {
                 std::thread::sleep(std::time::Duration::from_secs(5));
                 let runtime = tokio::runtime::Runtime::new().unwrap();
                 runtime.block_on(async {
-                    if let Ok(ver) = fetch_latest_release_version().await {
-                        if is_newer_version(&ver, env!("CARGO_PKG_VERSION")) {
+                    if let Ok(asset) = crate::download::resolve_connector_release_asset().await {
+                        if is_newer_version(&asset.version, env!("CARGO_PKG_VERSION")) {
                             if let Ok(mut s) = update_check_bg.lock() {
-                                s.available_version = Some(ver);
+                                s.available_version = Some(asset.version.clone());
+                                s.asset = Some(asset);
                             }
+                            ctx_bg.request_repaint();
                         }
                     }
                 });
@@ -1000,6 +996,8 @@ impl LauncherApp {
             scenario_picker: Arc::new(Mutex::new(ScenarioPickerState::default())),
             forge_local_decks: Vec::new(),
             update_check,
+            connector_update_progress,
+            connector_update_cancelled,
             forge_update_check,
             forge_update_progress,
             forge_update_cancelled,
@@ -1243,13 +1241,101 @@ impl eframe::App for LauncherApp {
                 ui.visuals_mut().override_text_color = Some(egui::Color32::BLACK);
                 ui.visuals_mut().panel_fill = egui::Color32::WHITE;
 
-                // Update available banner (render even during setup wizard)
-                let (update_ver, already_dismissed) = {
+                // Connector update banner (render even during setup wizard)
+                let (update_ver, staged_path, is_downloading, update_err, already_dismissed) = {
                     let s = self.update_check.lock().unwrap();
-                    (s.available_version.clone(), s.dismissed)
+                    (
+                        s.available_version.clone(),
+                        s.staged_path.clone(),
+                        s.is_downloading,
+                        s.error.clone(),
+                        s.dismissed,
+                    )
                 };
                 if !already_dismissed {
-                    if let Some(ref ver) = update_ver {
+                    if let Some(ref staged) = staged_path {
+                        let ver = update_ver.as_deref().unwrap_or("new");
+                        egui::Frame::default()
+                            .fill(egui::Color32::from_rgb(212, 237, 218))
+                            .inner_margin(egui::Margin::symmetric(8.0, 4.0))
+                            .show(ui, |ui| {
+                                ui.horizontal(|ui| {
+                                    ui.label(
+                                        egui::RichText::new(format!("✨ Update v{ver} ready"))
+                                            .color(egui::Color32::from_rgb(21, 87, 36))
+                                            .small()
+                                            .strong(),
+                                    );
+                                    if ui.small_button("Restart Now").clicked() {
+                                        if let Err(e) = crate::download::apply_connector_update_and_restart(staged) {
+                                            log::error!("Failed to restart and apply update: {e}");
+                                            if let Ok(mut s) = self.update_check.lock() {
+                                                s.error = Some(format!("Restart failed: {e}"));
+                                            }
+                                        }
+                                    }
+                                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                        if ui.small_button("✕").clicked() {
+                                            self.update_check.lock().unwrap().dismissed = true;
+                                        }
+                                    });
+                                });
+                            });
+                        ui.add_space(2.0);
+                    } else if is_downloading {
+                        let ver = update_ver.as_deref().unwrap_or("");
+                        let status_text = self
+                            .connector_update_progress
+                            .lock()
+                            .unwrap()
+                            .as_ref()
+                            .map(|p| p.status_text.clone())
+                            .unwrap_or_else(|| "Downloading update…".to_string());
+                        egui::Frame::default()
+                            .fill(egui::Color32::from_rgb(226, 227, 229))
+                            .inner_margin(egui::Margin::symmetric(8.0, 4.0))
+                            .show(ui, |ui| {
+                                ui.horizontal(|ui| {
+                                    ui.spinner();
+                                    ui.label(
+                                        egui::RichText::new(format!("⏳ v{ver}: {status_text}"))
+                                            .color(egui::Color32::BLACK)
+                                            .small(),
+                                    );
+                                    if ui.small_button("Cancel").clicked() {
+                                        self.connector_update_cancelled.store(true, Ordering::SeqCst);
+                                    }
+                                });
+                            });
+                        ui.add_space(2.0);
+                    } else if let Some(ref err) = update_err {
+                        egui::Frame::default()
+                            .fill(egui::Color32::from_rgb(248, 215, 218))
+                            .inner_margin(egui::Margin::symmetric(8.0, 4.0))
+                            .show(ui, |ui| {
+                                ui.horizontal(|ui| {
+                                    ui.label(
+                                        egui::RichText::new(format!("⚠ Update error: {err}"))
+                                            .color(egui::Color32::from_rgb(114, 28, 36))
+                                            .small(),
+                                    );
+                                    if ui.small_button("Retry").clicked() {
+                                        self.trigger_connector_update_download(ctx);
+                                    }
+                                    if ui.small_button("Browser Download").clicked() {
+                                        let _ = std::process::Command::new("cmd")
+                                            .args(["/c", "start", "https://github.com/killriam/mamo-Connector/releases/latest"])
+                                            .spawn();
+                                    }
+                                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                        if ui.small_button("✕").clicked() {
+                                            self.update_check.lock().unwrap().dismissed = true;
+                                        }
+                                    });
+                                });
+                            });
+                        ui.add_space(2.0);
+                    } else if let Some(ref ver) = update_ver {
                         egui::Frame::default()
                             .fill(egui::Color32::from_rgb(255, 243, 205))
                             .inner_margin(egui::Margin::symmetric(8.0, 4.0))
@@ -1260,10 +1346,8 @@ impl eframe::App for LauncherApp {
                                             .color(egui::Color32::from_rgb(133, 100, 4))
                                             .small(),
                                     );
-                                    if ui.small_button("Download").clicked() {
-                                        let _ = std::process::Command::new("cmd")
-                                            .args(["/c", "start", "https://github.com/killriam/mamo-Connector/releases/latest"])
-                                            .spawn();
+                                    if ui.small_button("Download & Install").clicked() {
+                                        self.trigger_connector_update_download(ctx);
                                     }
                                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                                         if ui.small_button("✕").clicked() {
@@ -2133,6 +2217,85 @@ impl LauncherApp {
             };
             *result_bg.lock().unwrap() = Some(terminal);
             ctx_end.request_repaint();
+        });
+    }
+
+    /// Triggers an on-demand download of the latest MaMo Connector release in the background.
+    fn trigger_connector_update_download(&mut self, ctx: &egui::Context) {
+        let asset = {
+            let mut s = self.update_check.lock().unwrap();
+            if s.is_downloading {
+                return;
+            }
+            s.is_downloading = true;
+            s.error = None;
+            s.asset.clone()
+        };
+
+        let Some(asset) = asset else {
+            if let Ok(mut s) = self.update_check.lock() {
+                s.is_downloading = false;
+                s.error = Some("No update asset metadata found".to_string());
+            }
+            return;
+        };
+
+        self.connector_update_cancelled.store(false, Ordering::Relaxed);
+        *self.connector_update_progress.lock().unwrap() = Some(DownloadProgress::default());
+
+        let update_check_bg = Arc::clone(&self.update_check);
+        let progress_bg = Arc::clone(&self.connector_update_progress);
+        let cancelled_bg = Arc::clone(&self.connector_update_cancelled);
+        let ctx_progress = ctx.clone();
+
+        std::thread::spawn(move || {
+            let runtime = tokio::runtime::Runtime::new().unwrap();
+            runtime.block_on(async {
+                let progress_cb = Arc::clone(&progress_bg);
+                let ctx_cb = ctx_progress.clone();
+                let outcome = crate::download::download_connector_update_staged(
+                    &asset,
+                    move |update| {
+                        if let Ok(mut guard) = progress_cb.lock() {
+                            let entry = guard.get_or_insert_with(DownloadProgress::default);
+                            entry.bytes_done = update.bytes_done;
+                            entry.total_bytes = update.total_bytes;
+                            entry.status_text = format_download_status(update.bytes_done, update.total_bytes);
+                        }
+                        ctx_cb.request_repaint();
+                    },
+                    cancelled_bg,
+                )
+                .await;
+
+                match outcome {
+                    Ok(staged_path) => {
+                        log::info!("MaMo Connector update downloaded to {:?}", staged_path);
+                        if let Ok(mut s) = update_check_bg.lock() {
+                            s.staged_path = Some(staged_path);
+                            s.is_downloading = false;
+                            s.error = None;
+                        }
+                        *progress_bg.lock().unwrap() = None;
+                    }
+                    Err(e) if e.to_string().contains("cancelled") => {
+                        log::info!("MaMo Connector update download cancelled");
+                        if let Ok(mut s) = update_check_bg.lock() {
+                            s.is_downloading = false;
+                        }
+                        *progress_bg.lock().unwrap() = None;
+                    }
+                    Err(e) => {
+                        log::error!("Failed to download MaMo Connector update: {e}");
+                        if let Ok(mut s) = update_check_bg.lock() {
+                            s.is_downloading = false;
+                            s.error = Some(e.to_string());
+                        }
+                        *progress_bg.lock().unwrap() = None;
+                    }
+                }
+                ctx_progress.request_repaint();
+            });
         });
     }
 
@@ -5106,14 +5269,23 @@ impl LauncherApp {
 
             // ── MaMo Connector itself ────────────────────────────────────
             ui.group(|ui| {
+                let (update_ver, staged_path, is_downloading, dismissed) = {
+                    let s = self.update_check.lock().unwrap();
+                    (
+                        s.available_version.clone(),
+                        s.staged_path.clone(),
+                        s.is_downloading,
+                        s.dismissed,
+                    )
+                };
                 ui.horizontal(|ui| {
                     ui.label(egui::RichText::new("MaMo Connector").strong());
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        let (update_ver, dismissed) = {
-                            let s = self.update_check.lock().unwrap();
-                            (s.available_version.clone(), s.dismissed)
-                        };
-                        if update_ver.is_some() && !dismissed {
+                        if staged_path.is_some() {
+                            ui.label(egui::RichText::new("✨ Ready to restart").color(egui::Color32::from_rgb(0, 128, 0)).strong());
+                        } else if is_downloading {
+                            ui.label(egui::RichText::new("⏳ Downloading…").color(egui::Color32::from_rgb(133, 100, 4)));
+                        } else if update_ver.is_some() && !dismissed {
                             ui.label(egui::RichText::new("⬆ Update available").color(egui::Color32::from_rgb(133, 100, 4)));
                         } else {
                             ui.label(egui::RichText::new("✓ Up to date").color(egui::Color32::from_rgb(0, 128, 0)));
@@ -5123,12 +5295,41 @@ impl LauncherApp {
                 ui.add_space(4.0);
                 ui.label(egui::RichText::new(format!("You're on v{}", env!("CARGO_PKG_VERSION"))).small().weak());
 
-                let update_ver = self.update_check.lock().unwrap().available_version.clone();
-                if let Some(ver) = update_ver {
+                if let Some(ref staged) = staged_path {
+                    let ver = update_ver.as_deref().unwrap_or("new");
+                    ui.add_space(6.0);
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new(format!("v{ver} has been downloaded and is ready")).color(egui::Color32::from_rgb(0, 128, 0)));
+                        if ui.button("Restart & Apply").clicked() {
+                            if let Err(e) = crate::download::apply_connector_update_and_restart(staged) {
+                                log::error!("Failed to restart and apply update: {e}");
+                            }
+                        }
+                    });
+                } else if is_downloading {
+                    let status_text = self
+                        .connector_update_progress
+                        .lock()
+                        .unwrap()
+                        .as_ref()
+                        .map(|p| p.status_text.clone())
+                        .unwrap_or_else(|| "Downloading…".to_string());
+                    ui.add_space(6.0);
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label(status_text);
+                        if ui.small_button("Cancel").clicked() {
+                            self.connector_update_cancelled.store(true, Ordering::SeqCst);
+                        }
+                    });
+                } else if let Some(ref ver) = update_ver {
                     ui.add_space(6.0);
                     ui.horizontal(|ui| {
                         ui.label(egui::RichText::new(format!("v{ver} is available")).color(egui::Color32::from_rgb(133, 100, 4)));
-                        if ui.button("Update now").clicked() {
+                        if ui.button("Download & Install").clicked() {
+                            self.trigger_connector_update_download(ctx);
+                        }
+                        if ui.small_button("View on GitHub").clicked() {
                             let _ = std::process::Command::new("cmd")
                                 .args(["/c", "start", "https://github.com/killriam/mamo-Connector/releases/latest"])
                                 .spawn();
