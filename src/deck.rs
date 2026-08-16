@@ -1255,6 +1255,49 @@ pub async fn create_deck_from_mamo_with_progress(
     }
     
     log(&format!("Deck saved to: {:?}", deck_path));
+
+    // Also sync any playable scenarios for this deck so Forge's Scenario dropdown has them ready
+    if let Ok(settings) = Settings::load() {
+        if let Ok(scenarios) = crate::gamelog::fetch_deck_scenarios(&settings.gamelog_config, deck_id).await {
+            let playable: Vec<_> = scenarios.into_iter().filter(|s| s.playable_in_forge()).collect();
+            if !playable.is_empty() {
+                log(&format!("Syncing {} scenario(s) for Forge...", playable.len()));
+                let log_dir = get_game_log_directory();
+                for sc in &playable {
+                    if let Ok(bundle) = fetch_forge_scenario_bundle(deck_id, &sc.id).await {
+                        let scenario_id_tag = format!("scenario-{}", sc.id);
+                        let mut sc_json = bundle.scenario_json.clone();
+                        if let Some(scenario_obj) = sc_json.get_mut("scenario").and_then(|s| s.as_object_mut()) {
+                            scenario_obj.insert("id".to_string(), serde_json::Value::String(scenario_id_tag.clone()));
+                        }
+                        if let Ok(ref dir) = log_dir {
+                            let _ = fs::create_dir_all(dir);
+                            if let Ok(json_str) = serde_json::to_string_pretty(&sc_json) {
+                                let _ = fs::write(dir.join(format!("{}.json", scenario_id_tag)), &json_str);
+                                let sanitized_name = sanitize_filename(deck_name);
+                                let _ = fs::write(dir.join(format!("Scenario_{}.json", sanitized_name)), &json_str);
+                            }
+                        }
+                    }
+                }
+                // If the .dck file didn't have a Scenario= tag yet, attach the first scenario
+                if !body.contains("Scenario=") {
+                    if let Some(first_sc) = playable.first() {
+                        let scenario_id_tag = format!("scenario-{}", first_sc.id);
+                        let mut updated_body = body.clone();
+                        if let Some(pos) = updated_body.find("Name=") {
+                            if let Some(end_line) = updated_body[pos..].find('\n') {
+                                updated_body.replace_range(pos..pos + end_line, &format!("Name={}\nScenario={}", deck_name, scenario_id_tag));
+                            }
+                        } else if updated_body.contains("[metadata]") {
+                            updated_body = updated_body.replace("[metadata]\n", &format!("[metadata]\nName={}\nScenario={}\n", deck_name, scenario_id_tag));
+                        }
+                        let _ = write_deck_file(deck_name, &updated_body).await;
+                    }
+                }
+            }
+        }
+    }
     
     Ok(DeckCreationResult::success(
         format!("Successfully created MaMo deck '{}' at {:?}", deck_name, deck_path),
