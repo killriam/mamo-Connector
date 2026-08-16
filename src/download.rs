@@ -418,7 +418,8 @@ pub async fn download_connector_update_staged(
     Ok(final_path)
 }
 
-/// Removes stale `.old` backup executables or temporary `.staged` files from previous updates.
+/// Removes stale `.old` backup executables or temporary `.staged` files from previous updates,
+/// and cleans up old downloaded release binaries keeping at most the 2 newest versions.
 pub fn cleanup_old_connector_backups() {
     if let Ok(current_exe) = std::env::current_exe() {
         let old_exe = current_exe.with_extension("exe.old");
@@ -432,11 +433,32 @@ pub fn cleanup_old_connector_backups() {
     }
     let updates_dir = connector_updates_dir();
     if let Ok(entries) = std::fs::read_dir(&updates_dir) {
+        let mut exe_files: Vec<(PathBuf, std::time::SystemTime)> = Vec::new();
         for entry in entries.flatten() {
-            if let Some(ext) = entry.path().extension() {
-                if ext == "staged" {
-                    let _ = std::fs::remove_file(entry.path());
+            let path = entry.path();
+            if path.is_file() {
+                if let Some(ext) = path.extension() {
+                    if ext == "staged" {
+                        let _ = std::fs::remove_file(&path);
+                    } else if ext == "exe" {
+                        if let Ok(metadata) = std::fs::metadata(&path) {
+                            if let Ok(modified) = metadata.modified() {
+                                exe_files.push((path, modified));
+                            }
+                        }
+                    }
                 }
+            }
+        }
+
+        // Sort by modification time, oldest first
+        exe_files.sort_by_key(|x| x.1);
+
+        // Keep at most 2 update executables (the current/latest updates) and prune the rest
+        if exe_files.len() > 2 {
+            let to_delete_count = exe_files.len() - 2;
+            for i in 0..to_delete_count {
+                let _ = std::fs::remove_file(&exe_files[i].0);
             }
         }
     }
