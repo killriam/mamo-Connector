@@ -299,6 +299,51 @@ fn is_newer_version(remote: &str, current: &str) -> bool {
     parse(remote) > parse(current)
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PillStatus {
+    Success,
+    Warning,
+    Error,
+    Neutral,
+}
+
+fn render_status_pill(ui: &mut egui::Ui, text: &str, status: PillStatus) {
+    let (bg_color, fg_color, dot_color) = match status {
+        PillStatus::Success => (
+            egui::Color32::from_rgb(220, 245, 225),
+            egui::Color32::from_rgb(20, 110, 40),
+            egui::Color32::from_rgb(34, 160, 60),
+        ),
+        PillStatus::Warning => (
+            egui::Color32::from_rgb(255, 243, 205),
+            egui::Color32::from_rgb(133, 100, 4),
+            egui::Color32::from_rgb(200, 140, 0),
+        ),
+        PillStatus::Error => (
+            egui::Color32::from_rgb(253, 232, 232),
+            egui::Color32::from_rgb(176, 0, 32),
+            egui::Color32::from_rgb(210, 30, 30),
+        ),
+        PillStatus::Neutral => (
+            egui::Color32::from_rgb(240, 240, 245),
+            egui::Color32::from_rgb(80, 80, 95),
+            egui::Color32::from_rgb(130, 130, 145),
+        ),
+    };
+
+    egui::Frame::default()
+        .fill(bg_color)
+        .rounding(10.0)
+        .inner_margin(egui::Margin::symmetric(8.0, 3.0))
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 4.0;
+                ui.label(egui::RichText::new("●").color(dot_color).size(8.0));
+                ui.label(egui::RichText::new(text).color(fg_color).small().strong());
+            });
+        });
+}
+
 /// True when a deeplink is an evaluation launch (playtest/launch-forge/simulate) that arrived
 /// with no deck reference at all — neither a MaMo backend `deck_id` nor a power-user
 /// `deck_path` (the escape hatch `handle_launch_forge_with_logger` offers for launching an
@@ -1973,22 +2018,22 @@ impl LauncherApp {
                     .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(220, 220, 230))))
                 .show(ctx, |ui| {
                     ui.horizontal(|ui| {
-                        if ui.small_button("▲ Activity").clicked() {
+                        if ui.small_button("▴ Show Activity").clicked() {
                             self.activity_panel_collapsed = false;
                         }
                         // Show latest entry inline
                         if let Ok(log) = self.activity_log.lock() {
                             if let Some(entry) = log.entries.first() {
-                                let color = if entry.is_error {
-                                    egui::Color32::from_rgb(176, 0, 32)
+                                let (text_color, prefix) = if entry.is_error {
+                                    (egui::Color32::from_rgb(176, 0, 32), "[ERR]")
                                 } else if entry.is_success {
-                                    egui::Color32::from_rgb(0, 128, 0)
+                                    (egui::Color32::from_rgb(0, 128, 0), "[OK]")
                                 } else {
-                                    egui::Color32::GRAY
+                                    (egui::Color32::GRAY, "[INFO]")
                                 };
-                                let prefix = if entry.is_error { "❌" } else if entry.is_success { "✅" } else { "ℹ️" };
+                                
                                 ui.label(egui::RichText::new(format!("{} {} {}", entry.timestamp, prefix, entry.message))
-                                    .small().color(color));
+                                    .small().color(text_color));
                             }
                         }
                     });
@@ -2007,7 +2052,7 @@ impl LauncherApp {
                 .show(ctx, |ui| {
                     // Header row
                     ui.horizontal(|ui| {
-                        if ui.small_button("▼ Activity").clicked() {
+                        if ui.small_button("▾ Hide Activity").clicked() {
                             self.activity_panel_collapsed = true;
                         }
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -2035,20 +2080,12 @@ impl LauncherApp {
                                                 .monospace().small()
                                                 .color(egui::Color32::GRAY));
 
-                                            let color = if entry.is_error {
-                                                egui::Color32::from_rgb(176, 0, 32)
+                                            let (color, prefix) = if entry.is_error {
+                                                (egui::Color32::from_rgb(176, 0, 32), "[ERR] ")
                                             } else if entry.is_success {
-                                                egui::Color32::from_rgb(0, 128, 0)
+                                                (egui::Color32::from_rgb(0, 128, 0), "[OK] ")
                                             } else {
-                                                egui::Color32::BLACK
-                                            };
-
-                                            let prefix = if entry.is_error {
-                                                "❌ "
-                                            } else if entry.is_success {
-                                                "✅ "
-                                            } else {
-                                                "ℹ️ "
+                                                (egui::Color32::BLACK, "[INFO] ")
                                             };
 
                                             ui.label(egui::RichText::new(format!("{}{}", prefix, &entry.message))
@@ -2977,13 +3014,13 @@ impl LauncherApp {
                         // Registration status (compact)
                         let reg_text = match self.state.registration.status {
                             RegistrationStatus::Registered => {
-                                egui::RichText::new("🔗 Deeplink OK").small().color(egui::Color32::from_rgb(0, 128, 0))
+                                egui::RichText::new("Deeplink OK").small().color(egui::Color32::from_rgb(0, 128, 0)).strong()
                             }
                             RegistrationStatus::Failed => {
-                                egui::RichText::new("🔗 Deeplink FAIL").small().color(egui::Color32::from_rgb(176, 0, 32))
+                                egui::RichText::new("Deeplink FAIL").small().color(egui::Color32::from_rgb(176, 0, 32)).strong()
                             }
                             RegistrationStatus::Skipped => {
-                                egui::RichText::new("🔗 Deeplink N/A").small().color(egui::Color32::from_rgb(196, 112, 0))
+                                egui::RichText::new("Deeplink N/A").small().color(egui::Color32::from_rgb(196, 112, 0))
                             }
                         };
                         ui.label(reg_text);
@@ -3012,7 +3049,7 @@ impl LauncherApp {
                     };
                     if forge_configured {
                         let is_launching = *self.is_launching_selected_deck.lock().unwrap();
-                        let label = if is_launching { "⏳ Launching…" } else { "🎮 Launch Forge" };
+                        let label = if is_launching { "Launching…" } else { "Launch Forge" };
                         if ui.add_enabled(!is_launching, egui::Button::new(label)).clicked() {
                             match self.selected_account_deck.clone() {
                                 None => {
@@ -3028,7 +3065,7 @@ impl LauncherApp {
                             }
                         }
                     } else {
-                        ui.add_enabled(false, egui::Button::new("🎮 Launch Forge"));
+                        ui.add_enabled(false, egui::Button::new("Launch Forge"));
                         if ui.small_button("Configure Forge →").clicked() {
                             self.current_tab = Tab::Setup;
                         }
@@ -3039,7 +3076,7 @@ impl LauncherApp {
                         let state = self.gamelog_state.lock().unwrap();
                         (state.is_scanning, state.directory_valid, state.is_retrying_failed)
                     };
-                    if ui.add_enabled(!is_scanning && directory_valid, egui::Button::new("📋 Upload Logs")).clicked() {
+                    if ui.add_enabled(!is_scanning && directory_valid, egui::Button::new("Upload Logs")).clicked() {
                         self.start_gamelog_scan(ctx);
                     }
                     if is_scanning {
@@ -3048,7 +3085,7 @@ impl LauncherApp {
                     }
 
                     // Retry Failed button — triggers backend re-parse of parse_failed logs
-                    if ui.add_enabled(!is_retrying_failed, egui::Button::new("🔄 Retry Failed")).clicked() {
+                    if ui.add_enabled(!is_retrying_failed, egui::Button::new("Retry Failed")).clicked() {
                         self.start_reparse_failed(ctx);
                     }
                     if is_retrying_failed {
@@ -5030,9 +5067,9 @@ impl LauncherApp {
                     ui.label(egui::RichText::new("MaMo account").strong());
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if has_token {
-                            ui.label(egui::RichText::new("✓ Connected").color(egui::Color32::from_rgb(0, 128, 0)));
+                            render_status_pill(ui, "Connected", PillStatus::Success);
                         } else {
-                            ui.label(egui::RichText::new("Not connected").color(egui::Color32::from_rgb(176, 0, 32)));
+                            render_status_pill(ui, "Not connected", PillStatus::Error);
                         }
                     });
                 });
@@ -5073,7 +5110,7 @@ impl LauncherApp {
                             let mut state = self.settings_state.lock().unwrap();
                             state.auth_token_input = token_input;
                         }
-                        if ui.button("💾 Save").clicked() {
+                        if ui.button("Save").clicked() {
                             self.save_auth_token();
                         }
                     });
@@ -5094,14 +5131,14 @@ impl LauncherApp {
                             };
                             let downloading = self.forge_update_progress.lock().unwrap().is_some();
                             if downloading || forge_active {
-                                ui.label(egui::RichText::new("⬆ Updating").color(egui::Color32::from_rgb(0, 90, 158)));
+                                render_status_pill(ui, "Updating", PillStatus::Neutral);
                             } else if forge_busy {
-                                ui.label(egui::RichText::new("🔄 Checking…").color(egui::Color32::GRAY));
+                                render_status_pill(ui, "Checking…", PillStatus::Neutral);
                             } else {
-                                ui.label(egui::RichText::new("✓ Configured").color(egui::Color32::from_rgb(0, 128, 0)));
+                                render_status_pill(ui, "Configured", PillStatus::Success);
                             }
                         } else {
-                            ui.label(egui::RichText::new("Not configured").color(egui::Color32::from_rgb(176, 0, 32)));
+                            render_status_pill(ui, "Not configured", PillStatus::Error);
                         }
                     });
                 });
@@ -5122,15 +5159,15 @@ impl LauncherApp {
                     }
                     if !forge_path_input.is_empty() {
                         if forge_path_valid {
-                            ui.label(egui::RichText::new("✓").color(egui::Color32::from_rgb(0, 128, 0)));
+                            ui.label(egui::RichText::new("OK").color(egui::Color32::from_rgb(0, 128, 0)).small().strong());
                         } else {
-                            ui.label(egui::RichText::new("✗").color(egui::Color32::from_rgb(176, 0, 32)));
+                            ui.label(egui::RichText::new("Invalid").color(egui::Color32::from_rgb(176, 0, 32)).small().strong());
                         }
                     }
                 });
                 ui.add_space(5.0);
                 ui.horizontal(|ui| {
-                    if ui.button("🔍 Auto-detect").clicked() {
+                    if ui.button("Auto-detect").clicked() {
                         if let Some(path) = get_default_forge_path() {
                             let path_str = path.to_string_lossy().to_string();
                             let mut state = self.settings_state.lock().unwrap();
@@ -5142,7 +5179,7 @@ impl LauncherApp {
                             state.status_message = Some("Could not find Forge installation automatically.".to_string());
                         }
                     }
-                    if ui.button("📁 Browse…").clicked() {
+                    if ui.button("Browse…").clicked() {
                         let dialog = FileDialog::new()
                             .add_filter("Forge Executable", &["exe", "jar", "bat"])
                             .add_filter("All Files", &["*"])
@@ -5160,7 +5197,7 @@ impl LauncherApp {
                             });
                         }
                     }
-                    if ui.button("📂 Folder…").clicked() {
+                    if ui.button("Folder…").clicked() {
                         if let Some(folder) = rfd::FileDialog::new()
                             .set_title("Select Forge Directory (e.g. forge-gui-desktop/target/)")
                             .pick_folder()
@@ -5179,7 +5216,7 @@ impl LauncherApp {
                             });
                         }
                     }
-                    if ui.button("💾 Save").clicked() {
+                    if ui.button("Save").clicked() {
                         self.save_forge_settings();
                     }
                 });
@@ -5190,7 +5227,7 @@ impl LauncherApp {
                         if let Some(jar) = resolve_latest_forge_jar(p) {
                             ui.add_space(3.0);
                             ui.label(
-                                egui::RichText::new(format!("→  {}", jar.file_name().unwrap_or_default().to_string_lossy()))
+                                egui::RichText::new(format!("└─  {}", jar.file_name().unwrap_or_default().to_string_lossy()))
                                     .color(egui::Color32::from_rgb(80, 130, 200))
                                     .small(),
                             );
@@ -5207,7 +5244,7 @@ impl LauncherApp {
 
                 ui.add_space(5.0);
                 ui.horizontal(|ui| {
-                    if ui.add_enabled(forge_path_valid, egui::Button::new("🚀 Test Launch Forge")).clicked() {
+                    if ui.add_enabled(forge_path_valid, egui::Button::new("Test Launch Forge")).clicked() {
                         match launch_forge_from_settings(None, None) {
                             Ok(result) => self.settings_state.lock().unwrap().status_message = Some(result.message),
                             Err(e) => self.settings_state.lock().unwrap().status_message = Some(format!("Launch failed: {}", e)),
@@ -5239,24 +5276,24 @@ impl LauncherApp {
                                 if let Some(ref prog) = forge_update_progress {
                                     if let Some(ref err) = prog.error {
                                         if !forge_update_dismissed {
-                                            ui.label(egui::RichText::new(format!("✗ MaMo Forge update failed: {err}")).color(egui::Color32::from_rgb(176, 0, 32)));
+                                            ui.label(egui::RichText::new(format!("MaMo Forge update failed: {err}")).color(egui::Color32::from_rgb(176, 0, 32)));
                                             if ui.small_button("✕").clicked() {
                                                 self.forge_update_check.lock().unwrap().dismissed = true;
                                             }
                                         }
                                     } else {
-                                        ui.label(egui::RichText::new(format!("⬆ Downloading MaMo Forge update… {}", format_download_status(prog.bytes_done, prog.total_bytes))).color(egui::Color32::from_rgb(0, 90, 158)));
+                                        ui.label(egui::RichText::new(format!("Downloading MaMo Forge update… {}", format_download_status(prog.bytes_done, prog.total_bytes))).color(egui::Color32::from_rgb(0, 90, 158)));
                                         if !prog.finished && ui.small_button("Cancel").clicked() {
                                             self.forge_update_cancelled.store(true, Ordering::Relaxed);
                                         }
                                     }
                                 } else if forge_staged {
-                                    ui.label(egui::RichText::new("⬆ Update ready — installs automatically once Forge is closed").color(egui::Color32::from_rgb(0, 90, 158)));
+                                    ui.label(egui::RichText::new("Update ready — installs automatically once Forge is closed").color(egui::Color32::from_rgb(0, 90, 158)));
                                 } else if forge_busy {
-                                    ui.label(egui::RichText::new("🔄 Checking for a MaMo Forge update…").color(egui::Color32::GRAY));
+                                    ui.label(egui::RichText::new("Checking for a MaMo Forge update…").color(egui::Color32::GRAY));
                                 } else {
                                     ui.label(egui::RichText::new("MaMo Forge is up to date.").color(egui::Color32::from_rgb(0, 128, 0)));
-                                    if ui.small_button("🔄 Check now").clicked() {
+                                    if ui.small_button("Check now").clicked() {
                                         self.trigger_forge_update_check(ctx);
                                     }
                                 }
@@ -5282,13 +5319,13 @@ impl LauncherApp {
                     ui.label(egui::RichText::new("MaMo Connector").strong());
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if staged_path.is_some() {
-                            ui.label(egui::RichText::new("✨ Ready to restart").color(egui::Color32::from_rgb(0, 128, 0)).strong());
+                            render_status_pill(ui, "Ready to restart", PillStatus::Success);
                         } else if is_downloading {
-                            ui.label(egui::RichText::new("⏳ Downloading…").color(egui::Color32::from_rgb(133, 100, 4)));
+                            render_status_pill(ui, "Downloading…", PillStatus::Warning);
                         } else if update_ver.is_some() && !dismissed {
-                            ui.label(egui::RichText::new("⬆ Update available").color(egui::Color32::from_rgb(133, 100, 4)));
+                            render_status_pill(ui, "Update available", PillStatus::Warning);
                         } else {
-                            ui.label(egui::RichText::new("✓ Up to date").color(egui::Color32::from_rgb(0, 128, 0)));
+                            render_status_pill(ui, "Up to date", PillStatus::Success);
                         }
                     });
                 });
