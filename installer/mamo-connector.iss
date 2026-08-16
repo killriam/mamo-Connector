@@ -2,7 +2,7 @@
 ; Download Inno Setup from: https://jrsoftware.org/isinfo.php
 
 #define MyAppName "Mamo Connector"
-#define MyAppVersion "0.3.11"
+#define MyAppVersion "0.3.12"
 #define MyAppPublisher "Mamo Connector Team"
 #define MyAppURL "https://github.com/killriam/mamo-Connector"
 #define MyAppExeName "mamo-connector.exe"
