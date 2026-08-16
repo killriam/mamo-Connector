@@ -1321,8 +1321,33 @@ pub async fn create_deck_and_scenario_for_forge(deck_id: &str, scenario_id: &str
     let bundle = fetch_forge_scenario_bundle(deck_id, scenario_id).await
         .context("Failed to fetch Forge scenario bundle from MaMo API")?;
 
+    let scenario_title = bundle.scenario_json
+        .get("scenario")
+        .and_then(|s| s.get("title"))
+        .and_then(|t| t.as_str())
+        .filter(|t| !t.is_empty());
+
+    let scenario_deck_name = if let Some(title) = scenario_title {
+        format!("Scenario - {} ({})", bundle.deck_name, title)
+    } else {
+        format!("Scenario - {}", bundle.deck_name)
+    };
+
+    let sanitized_deck_name = sanitize_filename(&scenario_deck_name);
+
+    // Ensure the metadata Name line in the .dck file matches the sanitized filename stem
+    // so Forge's internal deck name equals the CLI --deck argument.
+    let mut dck_content = bundle.dck.clone();
+    if let Some(pos) = dck_content.find("Name=") {
+        if let Some(end_line) = dck_content[pos..].find('\n') {
+            dck_content.replace_range(pos..pos + end_line, &format!("Name={}", sanitized_deck_name));
+        }
+    } else if dck_content.contains("[metadata]") {
+        dck_content = dck_content.replace("[metadata]\n", &format!("[metadata]\nName={}\n", sanitized_deck_name));
+    }
+
     // Write ordered .dck file
-    let (deck_path, _) = write_deck_file(&bundle.deck_name, &bundle.dck).await
+    let (deck_path, _) = write_deck_file(&sanitized_deck_name, &dck_content).await
         .context("Failed to write scenario .dck file")?;
     info!("Scenario deck written: {:?}", deck_path);
 
@@ -1332,7 +1357,7 @@ pub async fn create_deck_and_scenario_for_forge(deck_id: &str, scenario_id: &str
         fs::create_dir_all(&log_dir)
             .with_context(|| format!("Failed to create game-log directory: {:?}", log_dir))?;
     }
-    let scenario_file_name = format!("Scenario_{}.json", sanitize_filename(&bundle.deck_name));
+    let scenario_file_name = format!("Scenario_{}.json", sanitized_deck_name);
     let scenario_path = log_dir.join(&scenario_file_name);
     let scenario_json_str = serde_json::to_string_pretty(&bundle.scenario_json)
         .context("Failed to serialise scenario JSON")?;
@@ -1341,7 +1366,7 @@ pub async fn create_deck_and_scenario_for_forge(deck_id: &str, scenario_id: &str
     info!("Scenario JSON written: {:?}", scenario_path);
 
     Ok(DeckCreationResult::success(
-        format!("Scenario deck '{}' and scenario file written for Forge", bundle.deck_name),
+        format!("Scenario deck '{}' and scenario file written for Forge", scenario_deck_name),
         deck_path,
     ))
 }
