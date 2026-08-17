@@ -268,6 +268,7 @@ pub async fn download_forge_portable(
     let jar_path = crate::forge::resolve_latest_forge_jar(dest_dir)
         .context("Extracted MaMo Forge bundle but couldn't find a Forge jar inside it")?;
     write_asset_meta(&jar_path, &asset);
+    cleanup_old_forge_jars(dest_dir, &jar_path);
     Ok(jar_path)
 }
 
@@ -307,7 +308,42 @@ pub fn finalize_staged_forge_jar(dest_dir: &Path, staged_path: &Path, asset: &Fo
     std::fs::rename(staged_path, &final_path)
         .with_context(|| format!("Failed to move staged Forge update into place at {:?}", final_path))?;
     write_asset_meta(&final_path, asset);
+    cleanup_old_forge_jars(dest_dir, &final_path);
     Ok(final_path)
+}
+
+/// Cleans up any old Forge JAR files (matching `forge-gui-desktop-*-jar-with-dependencies.jar`)
+/// in `dest_dir` except for the one specified by `keep_path`. Also removes their corresponding
+/// `<jar>.source.json` sidecar files.
+pub fn cleanup_old_forge_jars(dest_dir: &Path, keep_path: &Path) {
+    let entries = match std::fs::read_dir(dest_dir) {
+        Ok(entries) => entries,
+        Err(e) => {
+            log::warn!("Failed to read Forge directory for cleanup: {e}");
+            return;
+        }
+    };
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_file() && path != keep_path {
+            if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                let name_lower = name.to_lowercase();
+                if name_lower.starts_with("forge-gui-desktop-")
+                    && name_lower.ends_with("-jar-with-dependencies.jar")
+                {
+                    log::info!("Pruning old Forge JAR: {:?}", path);
+                    if let Err(e) = std::fs::remove_file(&path) {
+                        log::warn!("Failed to delete old Forge JAR {:?}: {e}", path);
+                    }
+                    let meta_path = asset_meta_path(&path);
+                    if meta_path.exists() {
+                        let _ = std::fs::remove_file(&meta_path);
+                    }
+                }
+            }
+        }
+    }
 }
 
 const CONNECTOR_RELEASES_API: &str =
@@ -709,5 +745,36 @@ mod tests {
 
         cleanup_old_connector_backups();
         assert!(!test_staged.exists(), "cleanup should remove stale .staged files");
+    }
+
+    #[test]
+    fn cleanup_old_forge_jars_removes_other_jars_and_metadata() {
+        let dest = std::env::temp_dir().join("mamo-connector-cleanup-forge-jars-test");
+        let _ = std::fs::remove_dir_all(&dest);
+        std::fs::create_dir_all(&dest).unwrap();
+
+        let old_jar = dest.join("forge-gui-desktop-2.0.14-SNAPSHOT-08.13-2020-jar-with-dependencies.jar");
+        std::fs::write(&old_jar, b"old jar").unwrap();
+        let old_meta = dest.join("forge-gui-desktop-2.0.14-SNAPSHOT-08.13-2020-jar-with-dependencies.jar.source.json");
+        std::fs::write(&old_meta, b"{}").unwrap();
+
+        let new_jar = dest.join("forge-gui-desktop-2.0.14-SNAPSHOT-08.17-0710-jar-with-dependencies.jar");
+        std::fs::write(&new_jar, b"new jar").unwrap();
+        let new_meta = dest.join("forge-gui-desktop-2.0.14-SNAPSHOT-08.17-0710-jar-with-dependencies.jar.source.json");
+        std::fs::write(&new_meta, b"{}").unwrap();
+
+        // Also a non-forge jar that should not be deleted
+        let random_file = dest.join("random.txt");
+        std::fs::write(&random_file, b"should keep").unwrap();
+
+        cleanup_old_forge_jars(&dest, &new_jar);
+
+        assert!(!old_jar.exists(), "old jar should be cleaned up");
+        assert!(!old_meta.exists(), "old metadata sidecar should be cleaned up");
+        assert!(new_jar.exists(), "new jar should be kept");
+        assert!(new_meta.exists(), "new metadata should be kept");
+        assert!(random_file.exists(), "unrelated file should be kept");
+
+        let _ = std::fs::remove_dir_all(&dest);
     }
 }
