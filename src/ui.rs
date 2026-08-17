@@ -460,64 +460,92 @@ async fn run_forge_update_check_and_download(
     }
     ctx.request_repaint();
 
-    let found = check_forge_update_available().await;
-    let Some(asset) = found else {
-        if let Ok(mut s) = forge_update_check.lock() {
-            s.busy = false;
-        }
-        log::info!("MaMo Forge is up to date (or check could not complete)");
+    // Loop to support jumping over versions and re-downloading if a newer build is published
+    // while the download is in flight (rare case).
+    const MAX_DOWNLOAD_ATTEMPTS: usize = 5;
+    let mut attempts = 0;
+
+    while attempts < MAX_DOWNLOAD_ATTEMPTS {
+        attempts += 1;
+
+        let found = check_forge_update_available().await;
+        let Some(asset) = found else {
+            if let Ok(mut s) = forge_update_check.lock() {
+                s.busy = false;
+            }
+            log::info!("MaMo Forge is up to date (or check could not complete)");
+            ctx.request_repaint();
+            return;
+        };
+
+        log::info!("MaMo Forge update available: {} — downloading in background", asset.name);
+        cancelled.store(false, Ordering::Relaxed);
+        *forge_update_progress.lock().unwrap() = Some(DownloadProgress::default());
         ctx.request_repaint();
-        return;
-    };
 
-    log::info!("MaMo Forge update available: {} — downloading in background", asset.name);
-    cancelled.store(false, Ordering::Relaxed);
-    *forge_update_progress.lock().unwrap() = Some(DownloadProgress::default());
-    ctx.request_repaint();
-
-    let dest_dir = forge_download_dir();
-    let progress_bg = Arc::clone(&forge_update_progress);
-    let ctx_progress = ctx.clone();
-    let outcome = crate::download::download_forge_jar_staged(
-        &dest_dir,
-        move |update| {
-            if let Ok(mut guard) = progress_bg.lock() {
-                let entry = guard.get_or_insert_with(DownloadProgress::default);
-                entry.bytes_done = update.bytes_done;
-                entry.total_bytes = update.total_bytes;
-                entry.status_text = format_download_status(update.bytes_done, update.total_bytes);
-            }
-            ctx_progress.request_repaint();
-        },
-        cancelled,
-    )
-    .await;
-
-    match outcome {
-        Ok((staged_path, downloaded_asset)) => {
-            log::info!("MaMo Forge update downloaded — will install once Forge is closed");
-            if let Ok(mut s) = forge_update_check.lock() {
-                s.staged = Some(StagedForgeUpdate { staged_path, asset: downloaded_asset });
-                s.busy = false;
-            }
-            *forge_update_progress.lock().unwrap() = None;
-        }
-        Err(e) if e.to_string().contains("cancelled") => {
-            if let Ok(mut s) = forge_update_check.lock() {
-                s.busy = false;
-            }
-            *forge_update_progress.lock().unwrap() = None;
-        }
-        Err(e) => {
-            log::error!("MaMo Forge update download failed: {e}");
-            if let Ok(mut p) = forge_update_progress.lock() {
-                if let Some(ref mut prog) = *p {
-                    prog.finished = true;
-                    prog.error = Some(e.to_string());
+        let dest_dir = forge_download_dir();
+        let progress_bg = Arc::clone(&forge_update_progress);
+        let ctx_progress = ctx.clone();
+        let cancelled_clone = Arc::clone(&cancelled);
+        let outcome = crate::download::download_forge_jar_staged(
+            &dest_dir,
+            move |update| {
+                if let Ok(mut guard) = progress_bg.lock() {
+                    let entry = guard.get_or_insert_with(DownloadProgress::default);
+                    entry.bytes_done = update.bytes_done;
+                    entry.total_bytes = update.total_bytes;
+                    entry.status_text = format_download_status(update.bytes_done, update.total_bytes);
                 }
+                ctx_progress.request_repaint();
+            },
+            cancelled_clone,
+        )
+        .await;
+
+        match outcome {
+            Ok((staged_path, downloaded_asset)) => {
+                log::info!("MaMo Forge update downloaded: {}", downloaded_asset.name);
+
+                // Check if an even newer version was published while downloading (rare case)
+                if let Ok(latest_remote) = crate::download::resolve_forge_jar_url().await {
+                    if latest_remote.updated_at != downloaded_asset.updated_at {
+                        log::warn!(
+                            "A newer MaMo Forge build ({}) was published during download of {}; re-downloading latest build...",
+                            latest_remote.name,
+                            downloaded_asset.name
+                        );
+                        let _ = std::fs::remove_file(&staged_path);
+                        continue;
+                    }
+                }
+
+                log::info!("MaMo Forge update downloaded — will install once Forge is closed");
+                if let Ok(mut s) = forge_update_check.lock() {
+                    s.staged = Some(StagedForgeUpdate { staged_path, asset: downloaded_asset });
+                    s.busy = false;
+                }
+                *forge_update_progress.lock().unwrap() = None;
+                break;
             }
-            if let Ok(mut s) = forge_update_check.lock() {
-                s.busy = false;
+            Err(e) if e.to_string().contains("cancelled") => {
+                if let Ok(mut s) = forge_update_check.lock() {
+                    s.busy = false;
+                }
+                *forge_update_progress.lock().unwrap() = None;
+                break;
+            }
+            Err(e) => {
+                log::error!("MaMo Forge update download failed: {e}");
+                if let Ok(mut p) = forge_update_progress.lock() {
+                    if let Some(ref mut prog) = *p {
+                        prog.finished = true;
+                        prog.error = Some(e.to_string());
+                    }
+                }
+                if let Ok(mut s) = forge_update_check.lock() {
+                    s.busy = false;
+                }
+                break;
             }
         }
     }

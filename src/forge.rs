@@ -229,26 +229,28 @@ pub fn get_default_forge_path() -> Option<PathBuf> {
 }
 
 /// Scan a directory for the latest `forge-gui-desktop-*-jar-with-dependencies.jar`.
-/// Returns the JAR with the most-recent modification time, or `None` if none found.
+/// Returns the latest JAR (sorted by version-bearing filename and modification time), or `None` if none found.
 pub fn resolve_latest_forge_jar(dir: &std::path::Path) -> Option<PathBuf> {
     let entries = std::fs::read_dir(dir).ok()?;
-    let mut candidates: Vec<(PathBuf, std::time::SystemTime)> = entries
+    let mut candidates: Vec<(PathBuf, String, std::time::SystemTime)> = entries
         .filter_map(|e| e.ok())
         .filter_map(|e| {
             let path = e.path();
-            let name = path.file_name()?.to_string_lossy().to_lowercase();
-            if name.starts_with("forge-gui-desktop-")
-                && name.ends_with("-jar-with-dependencies.jar")
+            let name = path.file_name()?.to_string_lossy().to_string();
+            let name_lower = name.to_lowercase();
+            if name_lower.starts_with("forge-gui-desktop-")
+                && name_lower.ends_with("-jar-with-dependencies.jar")
             {
-                let modified = e.metadata().ok()?.modified().ok()?;
-                Some((path, modified))
+                let modified = e.metadata().ok()?.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+                Some((path, name_lower, modified))
             } else {
                 None
             }
         })
         .collect();
-    candidates.sort_by(|a, b| b.1.cmp(&a.1)); // newest first
-    candidates.into_iter().next().map(|(p, _)| p)
+    // Sort descending: highest version/timestamp in filename first, fallback to newest modified time.
+    candidates.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| b.2.cmp(&a.2)));
+    candidates.into_iter().next().map(|(p, _, _)| p)
 }
 
 /// Validate that a Forge path is valid
@@ -1077,5 +1079,29 @@ mod tests {
             spawn_and_verify(cmd, "launched", None, "test".to_string()).expect("spawn should succeed");
         assert!(result.success, "message was: {}", result.message);
         assert_eq!(result.message, "launched");
+    }
+
+    #[test]
+    fn resolve_latest_forge_jar_picks_latest_when_multiple_versions_exist() {
+        let dest = std::env::temp_dir().join("mamo-connector-resolve-forge-jars-test");
+        let _ = std::fs::remove_dir_all(&dest);
+        std::fs::create_dir_all(&dest).unwrap();
+
+        let v1_jar = dest.join("forge-gui-desktop-2.0.14-SNAPSHOT-08.13-2020-jar-with-dependencies.jar");
+        let v2_jar = dest.join("forge-gui-desktop-2.0.14-SNAPSHOT-08.17-1341-jar-with-dependencies.jar");
+        let v3_jar = dest.join("forge-gui-desktop-2.0.15-SNAPSHOT-08.18-0900-jar-with-dependencies.jar");
+
+        std::fs::write(&v1_jar, b"v1").unwrap();
+        std::fs::write(&v2_jar, b"v2").unwrap();
+        std::fs::write(&v3_jar, b"v3").unwrap();
+
+        let resolved = resolve_latest_forge_jar(&dest).expect("should resolve latest jar");
+        assert_eq!(resolved, v3_jar);
+
+        let _ = std::fs::remove_file(&v3_jar);
+        let resolved_v2 = resolve_latest_forge_jar(&dest).expect("should resolve v2 jar");
+        assert_eq!(resolved_v2, v2_jar);
+
+        let _ = std::fs::remove_dir_all(&dest);
     }
 }

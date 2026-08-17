@@ -52,9 +52,25 @@ async fn resolve_forge_asset_url(matches: impl Fn(&str) -> bool) -> Result<Forge
         .filter(|a| !a.is_empty())
         .context("No release assets found — the forge build may not have run yet")?;
 
-    let asset = assets
+    let mut matching: Vec<&serde_json::Value> = assets
         .iter()
-        .find(|a| a["name"].as_str().map(&matches).unwrap_or(false))
+        .filter(|a| a["name"].as_str().map(&matches).unwrap_or(false))
+        .collect();
+
+    // Sort descending by updated_at and name so we always pick the newest asset if multiple exist
+    matching.sort_by(|a, b| {
+        let time_a = a["updated_at"].as_str().unwrap_or("");
+        let time_b = b["updated_at"].as_str().unwrap_or("");
+        time_b.cmp(time_a).then_with(|| {
+            let name_a = a["name"].as_str().unwrap_or("");
+            let name_b = b["name"].as_str().unwrap_or("");
+            name_b.cmp(name_a)
+        })
+    });
+
+    let asset = matching
+        .first()
+        .copied()
         .or_else(|| assets.first())
         .context("No suitable asset found in release")?;
 
@@ -267,7 +283,8 @@ pub async fn download_forge_portable(
 
     let jar_path = crate::forge::resolve_latest_forge_jar(dest_dir)
         .context("Extracted MaMo Forge bundle but couldn't find a Forge jar inside it")?;
-    write_asset_meta(&jar_path, &asset);
+    let jar_meta_asset = resolve_forge_jar_url().await.unwrap_or_else(|_| asset.clone());
+    write_asset_meta(&jar_path, &jar_meta_asset);
     cleanup_old_forge_jars(dest_dir, &jar_path);
     Ok(jar_path)
 }
