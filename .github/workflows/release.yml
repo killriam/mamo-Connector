@@ -47,12 +47,15 @@ jobs:
         run: cargo build --release
 
       - name: Sign executable
-        if: "${{ secrets.SIGNING_CERTIFICATE_BASE64 != '' && secrets.SIGNING_CERTIFICATE_PASSWORD != '' }}"
+        env:
+          SIGNING_CERTIFICATE_BASE64: ${{ secrets.SIGNING_CERTIFICATE_BASE64 }}
+          SIGNING_CERTIFICATE_PASSWORD: ${{ secrets.SIGNING_CERTIFICATE_PASSWORD }}
+        if: ${{ env.SIGNING_CERTIFICATE_BASE64 != '' && env.SIGNING_CERTIFICATE_PASSWORD != '' }}
         shell: pwsh
         run: |
           # 1. Decode PFX certificate from base64
-          $certBase64 = "${{ secrets.SIGNING_CERTIFICATE_BASE64 }}"
-          $certPassword = "${{ secrets.SIGNING_CERTIFICATE_PASSWORD }}"
+          $certBase64 = "$env:SIGNING_CERTIFICATE_BASE64"
+          $certPassword = "$env:SIGNING_CERTIFICATE_PASSWORD"
           $certBytes = [System.Convert]::FromBase64String($certBase64)
           $certPath = Join-Path $env:TEMP "cert.pfx"
           [System.IO.File]::WriteAllBytes($certPath, $certBytes)
