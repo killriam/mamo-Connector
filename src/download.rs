@@ -7,6 +7,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 const FORGE_RELEASES_API: &str =
     "https://api.github.com/repos/killriam/forge/releases/tags/replay-features-latest";
+const FORGE_EXPANDED_ASSETS_URL: &str =
+    "https://github.com/killriam/forge/releases/expanded_assets/replay-features-latest";
 
 /// Progress update sent from the download thread to the UI on each chunk.
 pub struct DownloadUpdate {
@@ -16,7 +18,7 @@ pub struct DownloadUpdate {
 
 /// A resolved GitHub release asset — enough to download it and, later, tell whether the server
 /// has since republished a different build under the same name.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ForgeAsset {
     pub download_url: String,
     pub name: String,
@@ -30,66 +32,124 @@ pub struct ForgeAsset {
     pub updated_at: String,
 }
 
+/// Parses release asset entries from GitHub's expanded_assets HTML page.
+/// This endpoint requires no GitHub authentication and is not subject to GitHub's REST API rate limits.
+pub fn parse_expanded_assets_html(html: &str) -> Vec<ForgeAsset> {
+    let mut assets = Vec::new();
+    for block in html.split("<li") {
+        let Some(download_href) = block.split("href=\"").nth(1).and_then(|s| s.split('"').next()) else {
+            continue;
+        };
+        if !download_href.contains("/releases/download/") {
+            continue;
+        }
+        let name = download_href.rsplit('/').next().unwrap_or("").to_string();
+        if name.is_empty() {
+            continue;
+        }
+        let download_url = if download_href.starts_with("http") {
+            download_href.to_string()
+        } else {
+            format!("https://github.com{}", download_href)
+        };
+        let updated_at = block
+            .split("datetime=\"")
+            .nth(1)
+            .and_then(|s| s.split('"').next())
+            .unwrap_or("")
+            .to_string();
+        assets.push(ForgeAsset {
+            download_url,
+            name,
+            updated_at,
+        });
+    }
+    assets
+}
+
+fn select_matching_forge_asset(
+    assets: Vec<ForgeAsset>,
+    matches: &impl Fn(&str) -> bool,
+) -> Option<ForgeAsset> {
+    let mut matching: Vec<ForgeAsset> = assets.into_iter().filter(|a| matches(&a.name)).collect();
+
+    // Sort descending by updated_at and name so we always pick the newest asset if multiple exist
+    matching.sort_by(|a, b| {
+        b.updated_at
+            .cmp(&a.updated_at)
+            .then_with(|| b.name.cmp(&a.name))
+    });
+
+    matching.into_iter().next()
+}
+
 /// Resolves a release asset whose name satisfies `matches`, falling back to the first asset if
-/// none match.
+/// none match. Tries the GitHub REST API first, and automatically falls back to scraping
+/// expanded_assets HTML if the API is rate-limited (HTTP 403) or fails.
 async fn resolve_forge_asset_url(matches: impl Fn(&str) -> bool) -> Result<ForgeAsset> {
     let client = reqwest::Client::builder()
         .user_agent("mamo-connector-forge-downloader")
         .timeout(std::time::Duration::from_secs(15))
         .build()?;
 
-    let resp: serde_json::Value = client
-        .get(FORGE_RELEASES_API)
+    // 1. Try GitHub REST API first
+    let api_result: Result<Vec<ForgeAsset>> = async {
+        let resp: serde_json::Value = client
+            .get(FORGE_RELEASES_API)
+            .send()
+            .await
+            .context("Failed to reach GitHub releases API")?
+            .json()
+            .await
+            .context("Failed to parse GitHub releases API response")?;
+
+        let assets = resp["assets"]
+            .as_array()
+            .filter(|a| !a.is_empty())
+            .context("No release assets found in API response")?;
+
+        let mut list = Vec::new();
+        for a in assets {
+            if let (Some(download_url), Some(name), Some(updated_at)) = (
+                a["browser_download_url"].as_str(),
+                a["name"].as_str(),
+                a["updated_at"].as_str(),
+            ) {
+                list.push(ForgeAsset {
+                    download_url: download_url.to_string(),
+                    name: name.to_string(),
+                    updated_at: updated_at.to_string(),
+                });
+            }
+        }
+        Ok(list)
+    }
+    .await;
+
+    if let Ok(assets) = api_result {
+        if let Some(asset) = select_matching_forge_asset(assets, &matches) {
+            return Ok(asset);
+        }
+    } else if let Err(ref e) = api_result {
+        log::warn!("GitHub REST API check failed ({e}); falling back to expanded_assets web endpoint");
+    }
+
+    // 2. Fallback: Parse expanded_assets HTML (unauthenticated web endpoint, not subject to API rate limits)
+    let html_resp = client
+        .get(FORGE_EXPANDED_ASSETS_URL)
         .send()
         .await
-        .context("Failed to reach GitHub releases API")?
-        .json()
+        .context("Failed to reach GitHub expanded assets page")?
+        .text()
         .await
-        .context("Failed to parse GitHub releases API response")?;
+        .context("Failed to read GitHub expanded assets HTML")?;
 
-    let assets = resp["assets"]
-        .as_array()
-        .filter(|a| !a.is_empty())
-        .context("No release assets found — the forge build may not have run yet")?;
+    let parsed_assets = parse_expanded_assets_html(&html_resp);
+    if let Some(asset) = select_matching_forge_asset(parsed_assets, &matches) {
+        return Ok(asset);
+    }
 
-    let mut matching: Vec<&serde_json::Value> = assets
-        .iter()
-        .filter(|a| a["name"].as_str().map(&matches).unwrap_or(false))
-        .collect();
-
-    // Sort descending by updated_at and name so we always pick the newest asset if multiple exist
-    matching.sort_by(|a, b| {
-        let time_a = a["updated_at"].as_str().unwrap_or("");
-        let time_b = b["updated_at"].as_str().unwrap_or("");
-        time_b.cmp(time_a).then_with(|| {
-            let name_a = a["name"].as_str().unwrap_or("");
-            let name_b = b["name"].as_str().unwrap_or("");
-            name_b.cmp(name_a)
-        })
-    });
-
-    let asset = matching
-        .first()
-        .copied()
-        .or_else(|| assets.first())
-        .context("No suitable asset found in release")?;
-
-    let download_url = asset["browser_download_url"]
-        .as_str()
-        .context("Asset is missing browser_download_url")?
-        .to_string();
-
-    let name = asset["name"]
-        .as_str()
-        .context("Asset is missing name")?
-        .to_string();
-
-    let updated_at = asset["updated_at"]
-        .as_str()
-        .context("Asset is missing updated_at")?
-        .to_string();
-
-    Ok(ForgeAsset { download_url, name, updated_at })
+    anyhow::bail!("No suitable Forge asset found matching criteria in release")
 }
 
 /// Resolves the portable bundle (JAR + `res/` resources) — what a fresh install needs, since
@@ -365,6 +425,8 @@ pub fn cleanup_old_forge_jars(dest_dir: &Path, keep_path: &Path) {
 
 const CONNECTOR_RELEASES_API: &str =
     "https://api.github.com/repos/killriam/mamo-Connector/releases/latest";
+const CONNECTOR_LATEST_RELEASE_URL: &str =
+    "https://github.com/killriam/mamo-Connector/releases/latest";
 
 /// A resolved GitHub release asset for MaMo Connector desktop app.
 #[derive(Debug, Clone)]
@@ -382,58 +444,117 @@ pub async fn resolve_connector_release_asset() -> Result<ConnectorAsset> {
         .timeout(std::time::Duration::from_secs(10))
         .build()?;
 
-    let resp: serde_json::Value = client
-        .get(CONNECTOR_RELEASES_API)
-        .send()
-        .await
-        .context("Failed to reach GitHub releases API for MaMo Connector")?
-        .json()
-        .await
-        .context("Failed to parse GitHub releases API response for MaMo Connector")?;
+    // 1. Try GitHub REST API
+    let api_result: Result<ConnectorAsset> = async {
+        let resp: serde_json::Value = client
+            .get(CONNECTOR_RELEASES_API)
+            .send()
+            .await
+            .context("Failed to reach GitHub releases API for MaMo Connector")?
+            .json()
+            .await
+            .context("Failed to parse GitHub releases API response for MaMo Connector")?;
 
-    let tag = resp["tag_name"]
-        .as_str()
-        .ok_or_else(|| anyhow::anyhow!("No tag_name in release response"))?
-        .trim_start_matches('v')
-        .to_string();
+        let tag = resp["tag_name"]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("No tag_name in release response"))?
+            .trim_start_matches('v')
+            .to_string();
 
-    let assets = resp["assets"]
-        .as_array()
-        .filter(|a| !a.is_empty())
-        .context("No release assets found in MaMo Connector release")?;
+        let assets = resp["assets"]
+            .as_array()
+            .filter(|a| !a.is_empty())
+            .context("No release assets found in MaMo Connector release")?;
 
-    // Look for Windows executable asset (e.g. mamo-connector-v0.3.8-windows-x64.exe or any .exe)
-    let asset = assets
-        .iter()
-        .find(|a| {
-            a["name"]
-                .as_str()
-                .map(|n| n.ends_with(".exe") && (n.contains("windows") || n.contains("connector")))
-                .unwrap_or(false)
+        // Look for Windows executable asset (e.g. mamo-connector-v0.3.8-windows-x64.exe or any .exe)
+        let asset = assets
+            .iter()
+            .find(|a| {
+                a["name"]
+                    .as_str()
+                    .map(|n| n.ends_with(".exe") && (n.contains("windows") || n.contains("connector")))
+                    .unwrap_or(false)
+            })
+            .or_else(|| {
+                assets.iter().find(|a| a["name"].as_str().map(|n| n.ends_with(".exe")).unwrap_or(false))
+            })
+            .context("No suitable executable asset found in release")?;
+
+        let download_url = asset["browser_download_url"]
+            .as_str()
+            .context("Asset is missing browser_download_url")?
+            .to_string();
+
+        let name = asset["name"]
+            .as_str()
+            .context("Asset is missing name")?
+            .to_string();
+
+        let size = asset["size"].as_u64();
+
+        Ok(ConnectorAsset {
+            version: tag,
+            download_url,
+            name,
+            size,
         })
-        .or_else(|| {
-            assets.iter().find(|a| a["name"].as_str().map(|n| n.ends_with(".exe")).unwrap_or(false))
-        })
-        .context("No suitable executable asset found in release")?;
+    }
+    .await;
 
-    let download_url = asset["browser_download_url"]
-        .as_str()
-        .context("Asset is missing browser_download_url")?
-        .to_string();
+    match api_result {
+        Ok(asset) => Ok(asset),
+        Err(e) => {
+            log::warn!("MaMo Connector API check failed ({e}); falling back to web scraping");
 
-    let name = asset["name"]
-        .as_str()
-        .context("Asset is missing name")?
-        .to_string();
+            // Web fallback: GET /releases/latest redirects to /releases/tag/vX.Y.Z
+            let redirect_resp = client
+                .get(CONNECTOR_LATEST_RELEASE_URL)
+                .send()
+                .await
+                .context("Failed to fetch latest connector release page")?;
 
-    let size = asset["size"].as_u64();
+            let final_url = redirect_resp.url().as_str();
+            let tag = final_url
+                .rsplit("/tag/")
+                .next()
+                .unwrap_or("")
+                .trim_matches('/')
+                .trim_start_matches('v')
+                .to_string();
 
-    Ok(ConnectorAsset {
-        version: tag,
-        download_url,
-        name,
-        size,
-    })
+            if tag.is_empty() {
+                anyhow::bail!("Could not resolve latest connector release tag from redirect: {final_url}");
+            }
+
+            let expanded_url = format!(
+                "https://github.com/killriam/mamo-Connector/releases/expanded_assets/v{tag}"
+            );
+            let html = client
+                .get(&expanded_url)
+                .send()
+                .await
+                .context("Failed to fetch connector expanded assets HTML")?
+                .text()
+                .await
+                .context("Failed to read connector expanded assets HTML")?;
+
+            let assets = parse_expanded_assets_html(&html);
+            let exe_asset = assets
+                .into_iter()
+                .find(|a| {
+                    a.name.ends_with(".exe")
+                        && (a.name.contains("windows") || a.name.contains("connector"))
+                })
+                .context("No suitable executable asset found in connector release")?;
+
+            Ok(ConnectorAsset {
+                version: tag,
+                download_url: exe_asset.download_url,
+                name: exe_asset.name,
+                size: None,
+            })
+        }
+    }
 }
 
 /// Directory where staged MaMo Connector updates are downloaded.
@@ -705,6 +826,38 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dest);
+    }
+
+    #[test]
+    fn parse_expanded_assets_html_extracts_correct_assets() {
+        let sample_html = r#"
+        <li class="Box-row">
+            <a href="/killriam/forge/releases/download/replay-features-latest/CHANGES.txt" class="Truncate">CHANGES.txt</a>
+            <relative-time datetime="2026-08-18T04:37:16Z">2026-08-18T04:37:16Z</relative-time>
+        </li>
+        <li class="Box-row">
+            <a href="/killriam/forge/releases/download/replay-features-latest/forge-gui-desktop-2.0.14-SNAPSHOT-08.18-0436-jar-with-dependencies.jar" class="Truncate">jar</a>
+            <relative-time datetime="2026-08-18T04:37:25Z">2026-08-18T04:37:25Z</relative-time>
+        </li>
+        <li class="Box-row">
+            <a href="/killriam/forge/releases/download/replay-features-latest/MaMoForge-portable.zip" class="Truncate">zip</a>
+            <relative-time datetime="2026-08-18T04:37:33Z">2026-08-18T04:37:33Z</relative-time>
+        </li>
+        "#;
+
+        let assets = parse_expanded_assets_html(sample_html);
+        assert_eq!(assets.len(), 3);
+        assert_eq!(assets[1].name, "forge-gui-desktop-2.0.14-SNAPSHOT-08.18-0436-jar-with-dependencies.jar");
+        assert_eq!(assets[1].download_url, "https://github.com/killriam/forge/releases/download/replay-features-latest/forge-gui-desktop-2.0.14-SNAPSHOT-08.18-0436-jar-with-dependencies.jar");
+        assert_eq!(assets[1].updated_at, "2026-08-18T04:37:25Z");
+
+        let matched_jar = select_matching_forge_asset(assets.clone(), &|n| n.ends_with("-jar-with-dependencies.jar"));
+        assert!(matched_jar.is_some());
+        assert_eq!(matched_jar.unwrap().name, "forge-gui-desktop-2.0.14-SNAPSHOT-08.18-0436-jar-with-dependencies.jar");
+
+        let matched_zip = select_matching_forge_asset(assets, &|n| n.ends_with(".zip"));
+        assert!(matched_zip.is_some());
+        assert_eq!(matched_zip.unwrap().name, "MaMoForge-portable.zip");
     }
 
     /// Real network test against the live killriam/forge release — not run by default (slow,

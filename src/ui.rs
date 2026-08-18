@@ -417,10 +417,9 @@ fn is_connector_managed_forge(forge_path: &str, forge_download_dir: &std::path::
 }
 
 /// Compare the locally-downloaded MaMo Forge jar against whatever's currently published under
-/// the `replay-features-latest` tag. Returns `Some(asset)` when a different build is available
-/// (with everything needed to immediately start downloading it), `None` when they already match
-/// or the check couldn't complete (offline, GitHub unreachable, etc. — fails silently, this is a
-/// best-effort background check).
+/// the `replay-features-latest` tag. Returns `Ok(Some(asset))` when a different build is available
+/// (with everything needed to immediately start downloading it), `Ok(None)` when they already match,
+/// or `Err(msg)` if the check failed.
 ///
 /// Compares GitHub's per-asset `updated_at` timestamp, not the filename: `replay-features-latest`
 /// is a rolling tag that gets re-published from a new commit under the exact same (fixed
@@ -429,17 +428,22 @@ fn is_connector_managed_forge(forge_path: &str, forge_download_dir: &std::path::
 /// a full day while a stale local jar was never flagged as out of date. An older download with no
 /// recorded `updated_at` (predates this fix, or a user-provided Forge path outside our management)
 /// is treated as "unknown, assume an update may be available" rather than silently assumed current.
-async fn check_forge_update_available() -> Option<crate::download::ForgeAsset> {
-    let local_jar = crate::forge::resolve_latest_forge_jar(&forge_download_dir())?;
+async fn check_forge_update_available() -> Result<Option<crate::download::ForgeAsset>, String> {
+    let local_jar = match crate::forge::resolve_latest_forge_jar(&forge_download_dir()) {
+        Some(j) => j,
+        None => return Ok(None),
+    };
     let local_updated_at = crate::download::read_asset_meta_updated_at(&local_jar);
 
     // The update path only ever re-fetches the standalone JAR (see start_forge_auto_update /
     // download_forge_jar_staged) — compare against that asset, not the portable zip.
-    let remote = crate::download::resolve_forge_jar_url().await.ok()?;
+    let remote = crate::download::resolve_forge_jar_url()
+        .await
+        .map_err(|e| e.to_string())?;
 
     match local_updated_at {
-        Some(updated_at) if updated_at == remote.updated_at => None,
-        _ => Some(remote),
+        Some(updated_at) if updated_at == remote.updated_at => Ok(None),
+        _ => Ok(Some(remote)),
     }
 }
 
@@ -468,14 +472,32 @@ async fn run_forge_update_check_and_download(
     while attempts < MAX_DOWNLOAD_ATTEMPTS {
         attempts += 1;
 
-        let found = check_forge_update_available().await;
-        let Some(asset) = found else {
-            if let Ok(mut s) = forge_update_check.lock() {
-                s.busy = false;
+        let check_res = check_forge_update_available().await;
+        let asset = match check_res {
+            Ok(Some(asset)) => asset,
+            Ok(None) => {
+                if let Ok(mut s) = forge_update_check.lock() {
+                    s.busy = false;
+                }
+                *forge_update_progress.lock().unwrap() = None;
+                log::info!("MaMo Forge is up to date");
+                ctx.request_repaint();
+                return;
             }
-            log::info!("MaMo Forge is up to date (or check could not complete)");
-            ctx.request_repaint();
-            return;
+            Err(e) => {
+                log::warn!("MaMo Forge update check failed: {e}");
+                if let Ok(mut p) = forge_update_progress.lock() {
+                    let mut prog = DownloadProgress::default();
+                    prog.finished = true;
+                    prog.error = Some(format!("Check failed: {e}"));
+                    *p = Some(prog);
+                }
+                if let Ok(mut s) = forge_update_check.lock() {
+                    s.busy = false;
+                }
+                ctx.request_repaint();
+                return;
+            }
         };
 
         log::info!("MaMo Forge update available: {} — downloading in background", asset.name);
@@ -2369,9 +2391,15 @@ impl LauncherApp {
     /// timer already runs, on demand. Guarded by `busy` so a click while one's already in
     /// flight (background or otherwise) doesn't start a second, redundant fetch.
     fn trigger_forge_update_check(&mut self, ctx: &egui::Context) {
-        if self.forge_update_check.lock().unwrap().busy {
-            return;
+        {
+            let mut s = self.forge_update_check.lock().unwrap();
+            if s.busy {
+                return;
+            }
+            s.busy = true;
+            s.dismissed = false;
         }
+        *self.forge_update_progress.lock().unwrap() = None;
         let forge_update_check = Arc::clone(&self.forge_update_check);
         let forge_update_progress = Arc::clone(&self.forge_update_progress);
         let cancelled = Arc::clone(&self.forge_update_cancelled);
