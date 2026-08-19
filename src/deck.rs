@@ -1269,6 +1269,7 @@ pub async fn create_deck_from_mamo_with_progress(
                         let mut sc_json = bundle.scenario_json.clone();
                         if let Some(scenario_obj) = sc_json.get_mut("scenario").and_then(|s| s.as_object_mut()) {
                             scenario_obj.insert("id".to_string(), serde_json::Value::String(scenario_id_tag.clone()));
+                            scenario_obj.insert("deck_id".to_string(), serde_json::Value::String(deck_name.to_string()));
                         }
                         if let Ok(ref dir) = scenario_dir {
                             let _ = fs::create_dir_all(dir);
@@ -1280,20 +1281,22 @@ pub async fn create_deck_from_mamo_with_progress(
                         }
                     }
                 }
-                // If the .dck file didn't have a Scenario= tag yet, attach the first scenario
-                if !body.contains("Scenario=") {
-                    if let Some(first_sc) = playable.first() {
-                        let scenario_id_tag = format!("scenario-{}", first_sc.id);
-                        let mut updated_body = body.clone();
-                        if let Some(pos) = updated_body.find("Name=") {
-                            if let Some(end_line) = updated_body[pos..].find('\n') {
-                                updated_body.replace_range(pos..pos + end_line, &format!("Name={}\nScenario={}", deck_name, scenario_id_tag));
-                            }
-                        } else if updated_body.contains("[metadata]") {
-                            updated_body = updated_body.replace("[metadata]\n", &format!("[metadata]\nName={}\nScenario={}\n", deck_name, scenario_id_tag));
+                // Attach the most recent scenario to the .dck file's Scenario= metadata
+                if let Some(latest_sc) = playable.first() {
+                    let scenario_id_tag = format!("scenario-{}", latest_sc.id);
+                    let mut updated_body = body.clone();
+                    if let Some(pos) = updated_body.find("Scenario=") {
+                        if let Some(end_line) = updated_body[pos..].find('\n') {
+                            updated_body.replace_range(pos..pos + end_line, &format!("Scenario={}", scenario_id_tag));
                         }
-                        let _ = write_deck_file(deck_name, &updated_body).await;
+                    } else if let Some(pos) = updated_body.find("Name=") {
+                        if let Some(end_line) = updated_body[pos..].find('\n') {
+                            updated_body.replace_range(pos..pos + end_line, &format!("Name={}\nScenario={}", deck_name, scenario_id_tag));
+                        }
+                    } else if updated_body.contains("[metadata]") {
+                        updated_body = updated_body.replace("[metadata]\n", &format!("[metadata]\nName={}\nScenario={}\n", deck_name, scenario_id_tag));
                     }
+                    let _ = write_deck_file(deck_name, &updated_body).await;
                 }
             }
         }
