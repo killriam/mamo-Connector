@@ -14,7 +14,6 @@ use crate::forge::{get_default_forge_path, resolve_latest_forge_jar, validate_fo
 use crate::gamelog::{GameLogConfig, GameLogProcessResult, ScanSummary, get_default_forge_log_directory, validate_directory, scan_directory, load_processed_files, save_processed_files, DeckMappings, fetch_my_decks, suggest_deck_matches, load_cached_decks, save_cached_decks, process_new_logs_with_filter, GameLogFilterOptions, FilePreviewInfo};
 use crate::registration::{RegistrationOutcome, RegistrationStatus};
 use crate::settings::{Settings, SavedLink, SavedLinkType};
-use crate::get_pending_command_path;
 
 #[derive(Clone, PartialEq, Eq)]
 enum Tab {
@@ -586,6 +585,61 @@ fn forge_jar_already_downloaded() -> bool {
         .unwrap_or(false)
 }
 
+/// Represents a requested Forge launch that may need a pre-launch version check
+#[derive(Clone, Debug)]
+enum PendingForgeLaunch {
+    /// Plain launch without deck
+    Plain,
+    /// Account deck from MaMo (needs to be downloaded & launched)
+    AccountDeck(crate::gamelog::UserDeck),
+    /// Scenario deck + scenario json
+    Scenario {
+        deck_id: String,
+        scenario_id: String,
+        scenario_name: String,
+    },
+    /// Local deck stem with curated opponent
+    LocalDeckWithCuratedOpponent {
+        local_stem: String,
+    },
+    /// Deeplink action
+    Deeplink(Deeplink),
+}
+
+/// State of the pre-launch Forge update check and prompt
+#[derive(Clone)]
+enum PreLaunchUpdateState {
+    /// Actively checking remote for an update
+    Checking {
+        started_at: Instant,
+        result_rx: Arc<Mutex<Option<Result<Option<crate::download::ForgeAsset>, String>>>>,
+    },
+    /// Update is available (either staged locally already or remote asset to download)
+    Prompt {
+        asset: crate::download::ForgeAsset,
+        is_staged: bool,
+    },
+    /// Update is currently downloading inside the modal
+    Downloading {
+        asset: crate::download::ForgeAsset,
+        progress: Arc<Mutex<Option<DownloadProgress>>>,
+        cancelled: Arc<AtomicBool>,
+        result: Arc<Mutex<Option<Result<std::path::PathBuf, String>>>>,
+    },
+    /// Download or install failed
+    Failed {
+        error: String,
+        asset: crate::download::ForgeAsset,
+    },
+}
+
+/// Dialog state for pre-launch Forge update confirmation
+#[derive(Clone)]
+struct PreLaunchUpdateDialog {
+    pub launch: PendingForgeLaunch,
+    pub state: PreLaunchUpdateState,
+}
+
 /// State for the Play tab's scenario picker — the saved Starting Hand/Perfect Game scenarios
 /// for whichever deck is currently selected in `selected_account_deck`.
 #[derive(Clone, Default)]
@@ -874,6 +928,8 @@ struct LauncherApp {
     /// Coordinates the single gamelog-scan slot shared by the auto-scan and manual-scan paths —
     /// see `ScanSlot` doc comment
     scan_slot: ScanSlot,
+    /// Pending pre-launch Forge update check or prompt dialog (None = no dialog active)
+    prelaunch_update_dialog: Option<PreLaunchUpdateDialog>,
 }
 
 impl LauncherApp {
@@ -1106,6 +1162,7 @@ impl LauncherApp {
             confirm_action: None,
             play_session: Arc::new(Mutex::new(PlaySession::default())),
             scan_slot: ScanSlot::default(),
+            prelaunch_update_dialog: None,
         }
     }
 }
@@ -1186,6 +1243,75 @@ impl eframe::App for LauncherApp {
                     self.wizard.download_cancelled = None;
                 }
             }
+        }
+
+        // Poll pre-launch Forge update check / download state
+        let mut prelaunch_action: Option<PendingForgeLaunch> = None;
+        if let Some(ref mut dialog) = self.prelaunch_update_dialog {
+            match &mut dialog.state {
+                PreLaunchUpdateState::Checking { started_at, result_rx } => {
+                    let res = result_rx.lock().unwrap().take();
+                    if let Some(res) = res {
+                        match res {
+                            Ok(Some(asset)) => {
+                                dialog.state = PreLaunchUpdateState::Prompt {
+                                    asset,
+                                    is_staged: false,
+                                };
+                            }
+                            Ok(None) => {
+                                // Already up to date! Proceed to launch directly
+                                prelaunch_action = Some(dialog.launch.clone());
+                            }
+                            Err(e) => {
+                                log::info!("Pre-launch Forge update check bypassed ({e}) — launching Forge");
+                                prelaunch_action = Some(dialog.launch.clone());
+                            }
+                        }
+                    } else if started_at.elapsed().as_secs() > 4 {
+                        log::info!("Pre-launch Forge update check timed out — launching Forge");
+                        prelaunch_action = Some(dialog.launch.clone());
+                    }
+                }
+                PreLaunchUpdateState::Downloading { result, asset, .. } => {
+                    let res = result.lock().unwrap().take();
+                    if let Some(res) = res {
+                        match res {
+                            Ok(staged_path) => {
+                                let forge_dir = forge_download_dir();
+                                match crate::download::finalize_staged_forge_jar(&forge_dir, &staged_path, asset) {
+                                    Ok(_) => {
+                                        if let Ok(mut log) = self.activity_log.lock() {
+                                            log.log_success("MaMo Forge updated to latest version.");
+                                        }
+                                    }
+                                    Err(e) => {
+                                        log::error!("Failed to finalize updated Forge jar: {e}");
+                                    }
+                                }
+                                prelaunch_action = Some(dialog.launch.clone());
+                            }
+                            Err(e) if e.contains("cancelled") => {
+                                // Cancelled
+                                self.prelaunch_update_dialog = None;
+                                *self.play_session.lock().unwrap() = PlaySession::Watching;
+                            }
+                            Err(e) => {
+                                dialog.state = PreLaunchUpdateState::Failed {
+                                    error: e,
+                                    asset: asset.clone(),
+                                };
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        if let Some(action) = prelaunch_action {
+            self.prelaunch_update_dialog = None;
+            self.execute_pending_forge_launch(action, ctx);
         }
         
         // Check for pending commands from secondary instances every 500ms - only after setup wizard is completed/closed
@@ -1326,6 +1452,11 @@ impl eframe::App for LauncherApp {
         // Confirm dialog for destructive actions (rendered as a floating window)
         if self.confirm_action.is_some() {
             self.render_confirm_dialog(ctx);
+        }
+
+        // Pre-launch Forge update check / prompt dialog
+        if self.prelaunch_update_dialog.is_some() {
+            self.render_prelaunch_update_dialog(ctx);
         }
 
         // Bottom panel: Activity Log (rendered BEFORE CentralPanel per egui rules)
@@ -1591,7 +1722,6 @@ impl eframe::App for LauncherApp {
 impl LauncherApp {
     /// Process a deeplink with real-time progress logging to the Activity tab
     fn process_deeplink_with_progress(&mut self, deeplink: Deeplink, ctx: &egui::Context) {
-        use crate::commands::{self, SharedLogCollector};
         use log::info;
         
         info!("Processing deeplink with progress: {}", deeplink.raw);
@@ -1624,6 +1754,17 @@ impl LauncherApp {
             ctx.request_repaint();
             return;
         }
+
+        if deeplink_starts_play_session(&deeplink.action) {
+            self.request_forge_launch(PendingForgeLaunch::Deeplink(deeplink), ctx);
+        } else {
+            self.process_deeplink_with_progress_direct(deeplink, ctx);
+        }
+    }
+
+    /// Directly execute a deeplink without checking for Forge updates (e.g. after update prompt is resolved)
+    fn process_deeplink_with_progress_direct(&mut self, deeplink: Deeplink, ctx: &egui::Context) {
+        use crate::commands::{self, SharedLogCollector};
 
         if deeplink_starts_play_session(&deeplink.action) {
             *self.play_session.lock().unwrap() = PlaySession::Launching;
@@ -1752,10 +1893,7 @@ impl LauncherApp {
                 }
             }
 
-            // Track Forge PID for auto gamelog scanning, and move the play session forward —
-            // Playing for a genuine fresh launch, back to Watching for everything else (already
-            // running, a failed launch, or a command that was never about playing in the first
-            // place, e.g. `auth`/`import-user-decks`).
+            // Track Forge PID for auto gamelog scanning, and move the play session forward
             match &result {
                 commands::CommandResult::DeckCreatedAndLaunched(_, forge_result) if forge_result.success => {
                     if let Some(pid) = forge_result.pid {
@@ -1785,7 +1923,7 @@ impl LauncherApp {
 
             // Handle auth token saved result
             if let commands::CommandResult::AuthTokenSaved(ref token) = result {
-                info!("Auth token saved via initial deeplink: {}",
+                log::info!("Auth token saved via deeplink: {}",
                     if token.len() > 20 { format!("{}...", &token[..20]) } else { token.clone() });
                 
                 // Reload settings from disk to get the updated auth_token
@@ -1812,240 +1950,16 @@ impl LauncherApp {
         });
     }
     
-    /// Check for pending commands from secondary instances
+    /// Check if secondary instances sent a command via pending_command.txt
     fn check_pending_commands(&mut self, ctx: &egui::Context) {
-        use crate::commands::{self, SharedLogCollector};
-        use crate::deeplink;
-        use log::info;
-        
-        let pending_path = get_pending_command_path();
+        let pending_path = crate::get_pending_command_path();
         if pending_path.exists() {
-            if let Ok(raw_command) = std::fs::read_to_string(&pending_path) {
-                let raw_command = raw_command.trim();
-                if !raw_command.is_empty() {
-                    info!("Processing pending command: {}", raw_command);
-                    
-                    // Expand activity panel to show progress
-                    self.activity_panel_collapsed = false;
-                    
-                    // Log the incoming command
-                    if let Ok(mut log) = self.activity_log.lock() {
-                        log.log_info(format!("Received command: {}", raw_command));
+            if let Ok(content) = std::fs::read_to_string(&pending_path) {
+                let content = content.trim();
+                if !content.is_empty() {
+                    if let Some(deeplink) = crate::deeplink::parse_deeplink(&[content.to_string()], "mamoConnector://") {
+                        self.process_deeplink_with_progress(deeplink, ctx);
                     }
-                    
-                    // Parse the deeplink
-                    if let Some(deeplink) = deeplink::parse_deeplink(&[raw_command.to_string()], "mamoConnector://") {
-                        // Log what we're doing
-                        if let Ok(mut log) = self.activity_log.lock() {
-                            log.log_info(format!("Processing action: {}", deeplink.action));
-                            if let Some(ref deck_id) = deeplink.deck_id {
-                                log.log_info(format!("Deck ID: {}", deck_id));
-                            }
-                            log.log_info("Starting command execution...");
-                        }
-
-                        // An evaluation launch (playtest/launch-forge/simulate) with no deck id
-                        // means the frontend didn't pin a deck — send the user to the Home tab
-                        // picker (backed by their full MaMo account deck list) instead of
-                        // silently starting Forge deck-less.
-                        if is_deckless_evaluation_action(&deeplink.action, deeplink_has_deck_reference(&deeplink)) {
-                            if let Ok(mut log) = self.activity_log.lock() {
-                                log.log_info("No deck specified — pick one below to launch Forge.");
-                            }
-                            self.current_tab = Tab::Play;
-                            self.decks_fetch_requested.store(true, Ordering::Relaxed);
-                            ctx.request_repaint();
-                        } else {
-                        if deeplink_starts_play_session(&deeplink.action) {
-                            *self.play_session.lock().unwrap() = PlaySession::Launching;
-                        }
-
-                        // Create a log collector for real-time progress updates
-                        let log_collector: SharedLogCollector = Arc::new(Mutex::new(Vec::new()));
-
-                        // Handle the command in a background thread
-                        let settings = self.settings.clone();
-                        let settings_state = self.settings_state.clone();
-                        let activity_log = self.activity_log.clone();
-                        let activity_log_for_polling = self.activity_log.clone();
-                        let forge_pid = self.forge_pid.clone();
-                        let forge_monitoring_since = self.forge_monitoring_since.clone();
-                        let play_session = Arc::clone(&self.play_session);
-                        let log_collector_for_command = log_collector.clone();
-                        let ctx_clone = ctx.clone();
-                        let ctx_for_polling = ctx.clone();
-                        let wizard_requested = Arc::clone(&self.wizard_requested);
-                        let decks_fetch_requested = Arc::clone(&self.decks_fetch_requested);
-
-                        std::thread::spawn(move || {
-                            let runtime = tokio::runtime::Runtime::new().unwrap();
-                            
-                            let result = runtime.block_on(async {
-                                // Spawn a polling task to transfer logs to activity_log in real-time
-                                let collector_for_polling = log_collector.clone();
-                                let poll_handle = tokio::spawn(async move {
-                                    let mut last_len = 0;
-                                    loop {
-                                        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-                                        if let Ok(logs) = collector_for_polling.lock() {
-                                            let current_len = logs.len();
-                                            if current_len > last_len {
-                                                if let Ok(mut activity) = activity_log_for_polling.lock() {
-                                                    for i in last_len..current_len {
-                                                        activity.log_info(&logs[i]);
-                                                    }
-                                                }
-                                                ctx_for_polling.request_repaint();
-                                                last_len = current_len;
-                                            }
-                                        }
-                                    }
-                                });
-                                
-                                let result = commands::handle_command_with_logger(&deeplink, Some(log_collector_for_command)).await;
-                                
-                                // Stop the polling task
-                                poll_handle.abort();
-                                
-                                result
-                            });
-                            
-                            // Log the final result
-                            if let Ok(mut log) = activity_log.lock() {
-                                match &result {
-                                    commands::CommandResult::DeckCreated(deck_result) => {
-                                        if deck_result.success {
-                                            log.log_success(&deck_result.message);
-                                        } else {
-                                            log.log_error(&deck_result.message);
-                                        }
-                                    }
-                                    commands::CommandResult::DeckCreatedAndLaunched(deck_result, forge_result) => {
-                                        if deck_result.success {
-                                            log.log_success(&deck_result.message);
-                                        } else {
-                                            log.log_error(&deck_result.message);
-                                        }
-                                        if forge_result.already_running {
-                                            log.log_success(&forge_result.message);
-                                        } else if forge_result.success {
-                                            log.log_success(&forge_result.message);
-                                        } else {
-                                            log.log_error(&forge_result.message);
-                                            wizard_requested.store(true, Ordering::Relaxed);
-                                        }
-                                    }
-                                    commands::CommandResult::ForgeLaunched(forge_result) => {
-                                        if forge_result.already_running {
-                                            log.log_success(&forge_result.message);
-                                        } else if forge_result.success {
-                                            log.log_success(&forge_result.message);
-                                        } else {
-                                            log.log_error(&forge_result.message);
-                                            wizard_requested.store(true, Ordering::Relaxed);
-                                        }
-                                    }
-                                    commands::CommandResult::AuthTokenSaved(msg) => {
-                                        log.log_success(msg);
-                                    }
-                                    commands::CommandResult::Error(err) => {
-                                        log.log_error(err);
-                                    }
-                                    commands::CommandResult::UnknownAction(action) => {
-                                        log.log_error(format!("Unknown action: {}", action));
-                                    }
-                                    commands::CommandResult::MissingParameters(msg) => {
-                                        log.log_error(format!("Missing parameters: {}", msg));
-                                    }
-                                    commands::CommandResult::UserDecksImported(result) => {
-                                        log.log_info(&result.message);
-                                    }
-                                    commands::CommandResult::UserDecksList(decks) => {
-                                        log.log_info(format!("Found {} decks", decks.len()));
-                                    }
-                                    commands::CommandResult::ReplayGameLaunched(forge_result) => {
-                                        if forge_result.already_running {
-                                            log.log_success(&forge_result.message);
-                                        } else if forge_result.success {
-                                            log.log_success(&forge_result.message);
-                                        } else {
-                                            log.log_error(&forge_result.message);
-                                            wizard_requested.store(true, Ordering::Relaxed);
-                                        }
-                                    }
-                                    commands::CommandResult::SimulationCompleted(sim_result) => {
-                                        if sim_result.success {
-                                            log.log_success(&sim_result.message);
-                                        } else {
-                                            log.log_error(&sim_result.message);
-                                        }
-                                    }
-                                }
-                            }
-
-                            // Track Forge PID for auto gamelog scanning, and move the play
-                            // session forward the same way process_deeplink_with_progress does.
-                            match &result {
-                                commands::CommandResult::DeckCreatedAndLaunched(_, forge_result) if forge_result.success => {
-                                    if let Some(pid) = forge_result.pid {
-                                        *forge_pid.lock().unwrap() = Some(pid);
-                                        *forge_monitoring_since.lock().unwrap() = Some(Instant::now());
-                                    }
-                                    *play_session.lock().unwrap() = if forge_result.already_running { PlaySession::Watching } else { PlaySession::Playing };
-                                }
-                                commands::CommandResult::ForgeLaunched(forge_result) if forge_result.success => {
-                                    if let Some(pid) = forge_result.pid {
-                                        *forge_pid.lock().unwrap() = Some(pid);
-                                        *forge_monitoring_since.lock().unwrap() = Some(Instant::now());
-                                    }
-                                    *play_session.lock().unwrap() = if forge_result.already_running { PlaySession::Watching } else { PlaySession::Playing };
-                                }
-                                commands::CommandResult::ReplayGameLaunched(forge_result) if forge_result.success => {
-                                    if let Some(pid) = forge_result.pid {
-                                        *forge_pid.lock().unwrap() = Some(pid);
-                                        *forge_monitoring_since.lock().unwrap() = Some(Instant::now());
-                                    }
-                                    *play_session.lock().unwrap() = if forge_result.already_running { PlaySession::Watching } else { PlaySession::Playing };
-                                }
-                                _ => {
-                                    *play_session.lock().unwrap() = PlaySession::Watching;
-                                }
-                            }
-
-                            // Handle auth token saved result
-                            if let commands::CommandResult::AuthTokenSaved(ref token) = result {
-                                info!("Auth token saved via pending command: {}",
-                                    if token.len() > 20 { format!("{}...", &token[..20]) } else { token.clone() });
-                                
-                                // Reload settings from disk to get the updated auth_token
-                                if let Ok(reloaded_settings) = crate::settings::Settings::load() {
-                                    // Get the auth token before updating settings
-                                    let auth_token = reloaded_settings.auth_token.clone();
-                                    
-                                    // Update the settings
-                                    if let Ok(mut settings_guard) = settings.lock() {
-                                        *settings_guard = reloaded_settings;
-                                    }
-                                    
-                                    // Update the settings state UI fields with the token we captured
-                                    if let Some(token) = auth_token {
-                                        if let Ok(mut state_guard) = settings_state.lock() {
-                                            state_guard.auth_token_input = token;
-                                            state_guard.status_message = Some("✓ Connected to MaMo".to_string());
-                                        }
-                                    }
-                                }
-
-                                // Load the user's full MaMo deck list automatically now that we're connected
-                                decks_fetch_requested.store(true, Ordering::Relaxed);
-                            }
-
-                            ctx_clone.request_repaint();
-                        });
-                        }
-                    }
-
-                    // Delete the pending command file
                     let _ = std::fs::remove_file(&pending_path);
                 }
             }
@@ -2147,6 +2061,326 @@ impl LauncherApp {
                             }
                         });
                 });
+        }
+    }
+
+    // ==================== Pre-Launch Forge Update Check & Prompt ====================
+
+    /// Request a Forge launch, checking for newer versions first if Connector-managed.
+    fn request_forge_launch(&mut self, launch: PendingForgeLaunch, ctx: &egui::Context) {
+        // If Forge is already open, we can't update open Forge files anyway — launch directly.
+        if crate::forge::is_forge_window_open() {
+            self.execute_pending_forge_launch(launch, ctx);
+            return;
+        }
+
+        // Only Connector-managed installs can be auto-checked & updated
+        let forge_path = {
+            let s = self.settings.lock().unwrap();
+            s.forge_path.clone().unwrap_or_default()
+        };
+        if !is_connector_managed_forge(&forge_path, &forge_download_dir()) {
+            self.execute_pending_forge_launch(launch, ctx);
+            return;
+        }
+
+        // Check if an update is already staged and ready to install
+        let staged = self.forge_update_check.lock().unwrap().staged.clone();
+        if let Some(staged) = staged {
+            self.prelaunch_update_dialog = Some(PreLaunchUpdateDialog {
+                launch,
+                state: PreLaunchUpdateState::Prompt {
+                    asset: staged.asset,
+                    is_staged: true,
+                },
+            });
+            ctx.request_repaint();
+            return;
+        }
+
+        // Start background check with result_rx
+        let result_rx = Arc::new(Mutex::new(None));
+        let result_rx_bg = Arc::clone(&result_rx);
+        let ctx_bg = ctx.clone();
+
+        std::thread::spawn(move || {
+            let runtime = tokio::runtime::Runtime::new().unwrap();
+            let res = runtime.block_on(async {
+                // Cap update check to 4 seconds so a slow network/GitHub doesn't hang launch
+                tokio::select! {
+                    res = check_forge_update_available() => res,
+                    _ = tokio::time::sleep(tokio::time::Duration::from_secs(4)) => {
+                        Err("Update check timed out".to_string())
+                    }
+                }
+            });
+            *result_rx_bg.lock().unwrap() = Some(res);
+            ctx_bg.request_repaint();
+        });
+
+        self.prelaunch_update_dialog = Some(PreLaunchUpdateDialog {
+            launch,
+            state: PreLaunchUpdateState::Checking {
+                started_at: Instant::now(),
+                result_rx,
+            },
+        });
+        ctx.request_repaint();
+    }
+
+    /// Execute the requested Forge launch directly
+    fn execute_pending_forge_launch(&mut self, launch: PendingForgeLaunch, ctx: &egui::Context) {
+        match launch {
+            PendingForgeLaunch::Plain => {
+                let result = launch_forge_from_settings(None, None);
+                self.apply_forge_launch_result(result);
+            }
+            PendingForgeLaunch::AccountDeck(deck) => {
+                self.launch_account_deck_async(deck, ctx);
+            }
+            PendingForgeLaunch::Scenario { deck_id, scenario_id, scenario_name } => {
+                self.launch_scenario_async(deck_id, scenario_id, scenario_name, ctx);
+            }
+            PendingForgeLaunch::LocalDeckWithCuratedOpponent { local_stem } => {
+                self.launch_local_deck_with_curated_opponent_async(local_stem, ctx);
+            }
+            PendingForgeLaunch::Deeplink(deeplink) => {
+                self.process_deeplink_with_progress_direct(deeplink, ctx);
+            }
+        }
+    }
+
+    /// Render pre-launch Forge update confirmation modal
+    fn render_prelaunch_update_dialog(&mut self, ctx: &egui::Context) {
+        let Some(ref mut dialog) = self.prelaunch_update_dialog else { return; };
+        
+        let title = match &dialog.state {
+            PreLaunchUpdateState::Checking { .. } => "Checking for Updates…",
+            PreLaunchUpdateState::Prompt { is_staged: true, .. } => "✨ MaMo Forge Update Ready",
+            PreLaunchUpdateState::Prompt { is_staged: false, .. } => "⬆ MaMo Forge Update Available",
+            PreLaunchUpdateState::Downloading { .. } => "⏳ Updating MaMo Forge…",
+            PreLaunchUpdateState::Failed { .. } => "⚠ Update Failed",
+        };
+
+        let mut action_launch_anyway = false;
+        let mut action_cancel = false;
+        let mut action_start_download = false;
+        let mut action_apply_staged = false;
+
+        egui::Window::new(title)
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                ui.set_min_width(400.0);
+                match &dialog.state {
+                    PreLaunchUpdateState::Checking { .. } => {
+                        ui.horizontal(|ui| {
+                            ui.spinner();
+                            ui.label(egui::RichText::new("Checking if a newer Forge version is available…").small());
+                        });
+                        ui.add_space(14.0);
+                        ui.horizontal(|ui| {
+                            if ui.button("Cancel").clicked() {
+                                action_cancel = true;
+                            }
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                if ui.button("Skip Check & Launch").clicked() {
+                                    action_launch_anyway = true;
+                                }
+                            });
+                        });
+                    }
+                    PreLaunchUpdateState::Prompt { asset, is_staged } => {
+                        let is_staged = *is_staged;
+                        ui.horizontal(|ui| {
+                            ui.label(egui::RichText::new(if is_staged { "✨" } else { "⬆" }).size(28.0));
+                            ui.vertical(|ui| {
+                                if is_staged {
+                                    ui.label(egui::RichText::new("A new MaMo Forge build is downloaded and ready to install.").strong());
+                                } else {
+                                    ui.label(egui::RichText::new("A new MaMo Forge build is available.").strong());
+                                }
+                                ui.label(
+                                    egui::RichText::new(format!("Version: {}", asset.name))
+                                        .color(egui::Color32::from_rgb(0, 90, 158))
+                                        .small(),
+                                );
+                                if !asset.updated_at.is_empty() {
+                                    ui.label(
+                                        egui::RichText::new(format!("Released: {}", asset.updated_at))
+                                            .color(egui::Color32::GRAY)
+                                            .small(),
+                                    );
+                                }
+                            });
+                        });
+                        ui.add_space(12.0);
+                        ui.label("Would you like to update before starting Forge?");
+                        ui.add_space(16.0);
+                        ui.horizontal(|ui| {
+                            if ui.button("Cancel").clicked() {
+                                action_cancel = true;
+                            }
+                            if ui.button("Launch Without Updating").clicked() {
+                                action_launch_anyway = true;
+                            }
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                let btn_text = if is_staged { "Install & Launch" } else { "Update & Launch" };
+                                if ui.add(
+                                    egui::Button::new(egui::RichText::new(btn_text).color(egui::Color32::WHITE).strong())
+                                        .fill(egui::Color32::from_rgb(0, 120, 215)),
+                                ).clicked() {
+                                    if is_staged {
+                                        action_apply_staged = true;
+                                    } else {
+                                        action_start_download = true;
+                                    }
+                                }
+                            });
+                        });
+                    }
+                    PreLaunchUpdateState::Downloading { progress, cancelled, .. } => {
+                        let prog_guard = progress.lock().unwrap();
+                        let (status_text, pct) = match prog_guard.as_ref() {
+                            Some(p) => {
+                                let pct = if let Some(total) = p.total_bytes {
+                                    (p.bytes_done as f32 / total as f32).clamp(0.0, 1.0)
+                                } else {
+                                    0.0
+                                };
+                                (p.status_text.clone(), pct)
+                            }
+                            None => ("Starting download…".to_string(), 0.0),
+                        };
+                        drop(prog_guard);
+
+                        ui.horizontal(|ui| {
+                            ui.spinner();
+                            ui.label(egui::RichText::new("Downloading Forge update…").strong());
+                        });
+                        ui.add_space(8.0);
+                        ui.add(egui::ProgressBar::new(pct).show_percentage());
+                        ui.label(egui::RichText::new(status_text).small().color(egui::Color32::GRAY));
+                        ui.add_space(14.0);
+                        ui.horizontal(|ui| {
+                            if ui.button("Cancel").clicked() {
+                                cancelled.store(true, Ordering::Relaxed);
+                                action_cancel = true;
+                            }
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                if ui.button("Launch Current Version").clicked() {
+                                    cancelled.store(true, Ordering::Relaxed);
+                                    action_launch_anyway = true;
+                                }
+                            });
+                        });
+                    }
+                    PreLaunchUpdateState::Failed { error, .. } => {
+                        ui.horizontal(|ui| {
+                            ui.label(egui::RichText::new("✗").color(egui::Color32::from_rgb(176, 0, 32)).size(24.0));
+                            ui.vertical(|ui| {
+                                ui.label(egui::RichText::new("Failed to update MaMo Forge").strong());
+                                ui.label(egui::RichText::new(error).small().color(egui::Color32::from_rgb(176, 0, 32)));
+                            });
+                        });
+                        ui.add_space(14.0);
+                        ui.horizontal(|ui| {
+                            if ui.button("Cancel").clicked() {
+                                action_cancel = true;
+                            }
+                            if ui.button("Retry").clicked() {
+                                action_start_download = true;
+                            }
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                if ui.button("Launch Without Updating").clicked() {
+                                    action_launch_anyway = true;
+                                }
+                            });
+                        });
+                    }
+                }
+            });
+
+        if action_cancel {
+            self.prelaunch_update_dialog = None;
+            *self.play_session.lock().unwrap() = PlaySession::Watching;
+        } else if action_launch_anyway {
+            let launch = self.prelaunch_update_dialog.take().unwrap().launch;
+            self.execute_pending_forge_launch(launch, ctx);
+        } else if action_apply_staged {
+            let dialog_data = self.prelaunch_update_dialog.take().unwrap();
+            if let PreLaunchUpdateState::Prompt { asset, .. } = dialog_data.state {
+                let staged_path = self.forge_update_check.lock().unwrap().staged.as_ref().map(|s| s.staged_path.clone());
+                if let Some(staged_path) = staged_path {
+                    let forge_dir = forge_download_dir();
+                    match crate::download::finalize_staged_forge_jar(&forge_dir, &staged_path, &asset) {
+                        Ok(_) => {
+                            if let Ok(mut log) = self.activity_log.lock() {
+                                log.log_success("MaMo Forge updated to latest version.");
+                            }
+                        }
+                        Err(e) => {
+                            log::error!("Failed to finalize staged Forge jar: {e}");
+                        }
+                    }
+                }
+                self.forge_update_check.lock().unwrap().staged = None;
+            }
+            self.execute_pending_forge_launch(dialog_data.launch, ctx);
+        } else if action_start_download {
+            let (asset, launch) = match &self.prelaunch_update_dialog {
+                Some(d) => match &d.state {
+                    PreLaunchUpdateState::Prompt { asset, .. } | PreLaunchUpdateState::Failed { asset, .. } => (asset.clone(), d.launch.clone()),
+                    _ => return,
+                },
+                None => return,
+            };
+
+            let progress: Arc<Mutex<Option<DownloadProgress>>> = Arc::new(Mutex::new(Some(DownloadProgress::default())));
+            let cancelled = Arc::new(AtomicBool::new(false));
+            let result: Arc<Mutex<Option<Result<std::path::PathBuf, String>>>> = Arc::new(Mutex::new(None));
+
+            let progress_bg = Arc::clone(&progress);
+            let cancelled_bg = Arc::clone(&cancelled);
+            let result_bg = Arc::clone(&result);
+            let ctx_bg = ctx.clone();
+
+            std::thread::spawn(move || {
+                let runtime = tokio::runtime::Runtime::new().unwrap();
+                let dest_dir = forge_download_dir();
+                let ctx_callback = ctx_bg.clone();
+                let outcome = runtime.block_on(async {
+                    crate::download::download_forge_jar_staged(
+                        &dest_dir,
+                        move |update| {
+                            if let Ok(mut guard) = progress_bg.lock() {
+                                let entry = guard.get_or_insert_with(DownloadProgress::default);
+                                entry.bytes_done = update.bytes_done;
+                                entry.total_bytes = update.total_bytes;
+                                entry.status_text = format_download_status(update.bytes_done, update.total_bytes);
+                            }
+                            ctx_callback.request_repaint();
+                        },
+                        cancelled_bg,
+                    )
+                    .await
+                });
+
+                *result_bg.lock().unwrap() = Some(outcome.map(|(p, _)| p).map_err(|e| e.to_string()));
+                ctx_bg.request_repaint();
+            });
+
+            self.prelaunch_update_dialog = Some(PreLaunchUpdateDialog {
+                launch,
+                state: PreLaunchUpdateState::Downloading {
+                    asset,
+                    progress,
+                    cancelled,
+                    result,
+                },
+            });
+            ctx.request_repaint();
         }
     }
 
@@ -3153,14 +3387,13 @@ impl LauncherApp {
                         if ui.add_enabled(!is_launching, egui::Button::new(label)).clicked() {
                             match self.selected_account_deck.clone() {
                                 None => {
-                                    let result = launch_forge_from_settings(None, None);
-                                    self.apply_forge_launch_result(result);
+                                    self.request_forge_launch(PendingForgeLaunch::Plain, ctx);
                                 }
                                 Some(deck) => match find_local_deck_path(&deck, &self.forge_local_decks) {
                                     Some(local_stem) => {
-                                        self.launch_local_deck_with_curated_opponent_async(local_stem, ctx);
+                                        self.request_forge_launch(PendingForgeLaunch::LocalDeckWithCuratedOpponent { local_stem }, ctx);
                                     }
-                                    None => self.launch_account_deck_async(deck, ctx),
+                                    None => self.request_forge_launch(PendingForgeLaunch::AccountDeck(deck), ctx),
                                 },
                             }
                         }
@@ -5136,10 +5369,12 @@ impl LauncherApp {
                     ui.horizontal(|ui| {
                         ui.label(&scenario.name);
                         if ui.add_enabled(!is_launching, egui::Button::new("▶ Play in Forge")).clicked() {
-                            self.launch_scenario_async(
-                                deck.deck_id.clone(),
-                                scenario.id.clone(),
-                                scenario.name.clone(),
+                            self.request_forge_launch(
+                                PendingForgeLaunch::Scenario {
+                                    deck_id: deck.deck_id.clone(),
+                                    scenario_id: scenario.id.clone(),
+                                    scenario_name: scenario.name.clone(),
+                                },
                                 ctx,
                             );
                         }
@@ -6016,4 +6251,58 @@ mod deck_picker_tests {
         assert!(slot.try_begin(false), "slot should be claimable again after finish()");
         assert!(!slot.finish());
     }
+
+    #[test]
+    fn pending_forge_launch_variants_constructible() {
+        let plain = PendingForgeLaunch::Plain;
+        assert!(matches!(plain, PendingForgeLaunch::Plain));
+
+        let local = PendingForgeLaunch::LocalDeckWithCuratedOpponent {
+            local_stem: "deck_abc".to_string(),
+        };
+        if let PendingForgeLaunch::LocalDeckWithCuratedOpponent { local_stem } = local {
+            assert_eq!(local_stem, "deck_abc");
+        } else {
+            panic!("expected LocalDeckWithCuratedOpponent");
+        }
+
+        let scenario = PendingForgeLaunch::Scenario {
+            deck_id: "d123".to_string(),
+            scenario_id: "s456".to_string(),
+            scenario_name: "T1 Fast".to_string(),
+        };
+        if let PendingForgeLaunch::Scenario { deck_id, scenario_id, scenario_name } = scenario {
+            assert_eq!(deck_id, "d123");
+            assert_eq!(scenario_id, "s456");
+            assert_eq!(scenario_name, "T1 Fast");
+        } else {
+            panic!("expected Scenario");
+        }
+    }
+
+    #[test]
+    fn prelaunch_update_state_modal_flow() {
+        let asset = crate::download::ForgeAsset {
+            name: "forge-gui-desktop-2.0.0.jar".to_string(),
+            download_url: "https://example.com/forge.jar".to_string(),
+            updated_at: "2026-08-19T12:00:00Z".to_string(),
+        };
+
+        let prompt_staged = PreLaunchUpdateState::Prompt {
+            asset: asset.clone(),
+            is_staged: true,
+        };
+        if let PreLaunchUpdateState::Prompt { is_staged, .. } = prompt_staged {
+            assert!(is_staged, "should be marked as staged");
+        }
+
+        let prompt_remote = PreLaunchUpdateState::Prompt {
+            asset,
+            is_staged: false,
+        };
+        if let PreLaunchUpdateState::Prompt { is_staged, .. } = prompt_remote {
+            assert!(!is_staged, "should not be marked as staged");
+        }
+    }
 }
+
