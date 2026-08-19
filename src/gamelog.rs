@@ -1369,6 +1369,130 @@ pub async fn fetch_deck_scenarios(config: &GameLogConfig, deck_id: &str) -> Resu
     Ok(scenarios)
 }
 
+/// Result of synchronizing a Forge scenario file back to the MaMo backend.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScenarioSyncResult {
+    pub filename: String,
+    pub scenario_id: String,
+    pub scenario_name: String,
+    pub success: bool,
+    pub message: String,
+    pub event_count: usize,
+}
+
+#[derive(Debug, Deserialize)]
+struct BackendScenarioSyncResponse {
+    success: bool,
+    message: String,
+    #[serde(default)]
+    scenario: Option<serde_json::Value>,
+}
+
+/// Synchronize a single Forge scenario JSON file back to the MaMo backend.
+pub async fn sync_forge_scenario_file(path: &Path, config: &GameLogConfig) -> Result<ScenarioSyncResult> {
+    let auth_token = config.auth_token.as_ref()
+        .ok_or_else(|| anyhow::anyhow!("No authentication token configured"))?;
+
+    let filename = path.file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_default();
+
+    let content = fs::read_to_string(path)
+        .with_context(|| format!("Failed to read scenario file: {:?}", path))?;
+
+    let forge_json: serde_json::Value = serde_json::from_str(&content)
+        .with_context(|| format!("Failed to parse scenario JSON in: {:?}", path))?;
+
+    let scenario_id_raw = forge_json.get("scenario")
+        .and_then(|s| s.get("id"))
+        .and_then(|i| i.as_str())
+        .or_else(|| forge_json.get("meta").and_then(|m| m.get("game_id")).and_then(|g| g.as_str()))
+        .unwrap_or_default()
+        .replace("scenario-", "")
+        .replace("mamo-", "");
+
+    if scenario_id_raw.is_empty() {
+        return Err(anyhow::anyhow!("File {:?} does not contain a valid scenario ID", filename));
+    }
+
+    let event_count = forge_json.get("events")
+        .and_then(|e| e.as_array())
+        .map(|a| a.len())
+        .unwrap_or(0);
+
+    let client = reqwest::Client::new();
+    let url = format!("{}/api/scenarios/sync-from-forge", config.api_url);
+
+    log::info!("Synchronizing Forge scenario '{}' ({} events) to backend: {}", filename, event_count, url);
+
+    let response = client
+        .post(&url)
+        .header("Authorization", format!("Bearer {}", auth_token))
+        .json(&forge_json)
+        .send()
+        .await
+        .context("Failed to send scenario sync request")?;
+
+    if !response.status().is_success() {
+        let status = response.status();
+        let error_text = response.text().await.unwrap_or_else(|_| "Unknown error".to_string());
+        return Err(anyhow::anyhow!("Scenario sync failed with status {}: {}", status, error_text));
+    }
+
+    let sync_res: BackendScenarioSyncResponse = response.json().await
+        .context("Failed to parse sync response")?;
+
+    let scenario_name = sync_res.scenario.as_ref()
+        .and_then(|s| s.get("name"))
+        .and_then(|n| n.as_str())
+        .unwrap_or(&filename)
+        .to_string();
+
+    Ok(ScenarioSyncResult {
+        filename,
+        scenario_id: scenario_id_raw,
+        scenario_name,
+        success: sync_res.success,
+        message: sync_res.message,
+        event_count,
+    })
+}
+
+/// Scan Forge scenario directory for all scenario files and synchronize them back to the backend.
+pub async fn sync_all_scenario_files(config: &GameLogConfig) -> Result<Vec<ScenarioSyncResult>> {
+    let scenario_dir = crate::deck::get_scenario_directory()?;
+    if !scenario_dir.exists() {
+        return Ok(Vec::new());
+    }
+
+    let mut results = Vec::new();
+    for entry in fs::read_dir(&scenario_dir).context("Failed to read scenario directory")? {
+        let entry = entry.context("Failed to read scenario entry")?;
+        let path = entry.path();
+        if path.is_file() {
+            if let Some(ext) = path.extension() {
+                if ext.to_string_lossy().to_lowercase() == "json" {
+                    let filename = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+                    // Only sync scenario files that have scenario- prefix or Scenario_ prefix
+                    if filename.starts_with("scenario-") || filename.starts_with("Scenario_") {
+                        match sync_forge_scenario_file(&path, config).await {
+                            Ok(res) => {
+                                log::info!("Successfully synced scenario file '{}': {}", filename, res.message);
+                                results.push(res);
+                            }
+                            Err(e) => {
+                                log::warn!("Skipping or failed to sync scenario file '{}': {}", filename, e);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(results)
+}
+
 /// Calculate similarity score between two deck names (0.0 - 1.0)
 pub fn deck_name_similarity(name1: &str, name2: &str) -> f64 {
     let n1 = name1.to_lowercase();

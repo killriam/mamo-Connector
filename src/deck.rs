@@ -1317,7 +1317,7 @@ pub async fn create_deck_from_mamo(deck_id: &str) -> Result<DeckCreationResult> 
 /// Forge's CSubmenuScenario scans this directory for `*.json` scenario files.
 /// Windows: %APPDATA%\Forge\games\scenarios\
 /// macOS/Linux: ~/.forge/games/scenarios/
-fn get_scenario_directory() -> Result<PathBuf> {
+pub fn get_scenario_directory() -> Result<PathBuf> {
     let base = if cfg!(windows) {
         if let Some(appdata) = std::env::var_os("APPDATA") {
             PathBuf::from(appdata)

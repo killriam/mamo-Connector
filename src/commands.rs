@@ -3,7 +3,7 @@ use std::sync::{Arc, Mutex};
 use crate::deeplink::Deeplink;
 use crate::deck::{create_deck_from_id, create_deck_from_moxfield, create_deck_from_mamo, create_deck_from_mamo_with_progress, create_deck_and_scenario_for_forge, DeckCreationResult, UserDecksImportResult, import_user_decks, list_moxfield_user_decks, MoxfieldDeckEntry, ProgressCallback};
 use crate::forge::{launch_forge_from_settings, launch_forge_replay, ForgeLaunchResult};
-use crate::gamelog::{download_replay_content, save_replay_to_forge_dir};
+use crate::gamelog::{download_replay_content, save_replay_to_forge_dir, ScenarioSyncResult, sync_forge_scenario_file, sync_all_scenario_files};
 use crate::settings::Settings;
 use crate::simulation::{run_simulation_for_deck, post_simulation_report, SimulationResult};
 
@@ -30,6 +30,7 @@ pub enum CommandResult {
     UserDecksList(Vec<MoxfieldDeckEntry>),
     AuthTokenSaved(String),  // Success message
     SimulationCompleted(SimulationResult),
+    ScenarioSynced(Vec<ScenarioSyncResult>),
     UnknownAction(String),
     MissingParameters(String),
     Error(String),
@@ -49,6 +50,7 @@ impl CommandResult {
             CommandResult::UserDecksList(decks) => format!("Found {} decks", decks.len()),
             CommandResult::AuthTokenSaved(msg) => msg.clone(),
             CommandResult::SimulationCompleted(result) => result.message.clone(),
+            CommandResult::ScenarioSynced(results) => format!("Synchronized {} scenario(s)", results.len()),
             CommandResult::UnknownAction(action) => format!("Unknown action: {}", action),
             CommandResult::MissingParameters(msg) => format!("Missing parameters: {}", msg),
             CommandResult::Error(msg) => format!("Error: {}", msg),
@@ -67,6 +69,7 @@ impl CommandResult {
             CommandResult::UserDecksList(decks) => !decks.is_empty(),
             CommandResult::AuthTokenSaved(_) => true,
             CommandResult::SimulationCompleted(result) => result.success,
+            CommandResult::ScenarioSynced(_) => true,
             _ => false,
         }
     }
@@ -123,6 +126,7 @@ pub async fn handle_command_with_logger(deeplink: &Deeplink, log_collector: Opti
         "mamo" => handle_mamo_deck_download(deeplink).await, // MaMo backend: mamoConnector://mamo/DECK_UUID
         "download-deck" => handle_download_deck_only(deeplink).await, // Save .dck to Forge dir without launching Forge
         "playtest-scenario" => handle_playtest_with_scenario(deeplink, log_collector).await, // Scenario-ordered deck + JSON + launch Forge
+        "sync-scenarios" | "syncscenarios" | "sync-scenario" | "syncscenario" => handle_sync_scenarios(deeplink, log_collector).await, // Sync Forge scenario(s) back to MaMo
         "launch-forge" | "launchforge" | "playtest" => handle_launch_forge_with_logger(deeplink, log_collector).await, // Launch Forge with deck
         "replay-game" | "replaygame" => handle_replay_game_with_logger(deeplink, log_collector).await, // Replay a game in Forge
         "import-user-decks" | "importuserdecks" => handle_import_user_decks(deeplink).await,
@@ -281,6 +285,64 @@ async fn handle_playtest_with_scenario(deeplink: &Deeplink, log_collector: Optio
         Err(e) => {
             error!("Forge launch failed: {}", e);
             CommandResult::Error(format!("Deck and scenario ready but Forge launch failed: {}", e))
+        }
+    }
+}
+
+/// Handle mamoConnector://sync-scenarios or mamoConnector://sync-scenario?id=UUID
+/// Synchronizes recorded Forge scenario JSON files back to the MaMo backend.
+async fn handle_sync_scenarios(deeplink: &Deeplink, log_collector: Option<SharedLogCollector>) -> CommandResult {
+    let log = |msg: &str| {
+        info!("{}", msg);
+        if let Some(ref collector) = log_collector {
+            if let Ok(mut logs) = collector.lock() {
+                logs.push(msg.to_string());
+            }
+        }
+    };
+
+    log("Synchronizing Forge scenarios to MaMo backend...");
+    let settings = match Settings::load() {
+        Ok(s) => s,
+        Err(e) => return CommandResult::Error(format!("Failed to load settings: {}", e)),
+    };
+
+    let scenario_id = deeplink.deck_id.clone()
+        .or_else(|| get_parameter(&deeplink.params, "scenarioId"))
+        .or_else(|| get_parameter(&deeplink.params, "scenario_id"))
+        .or_else(|| get_parameter(&deeplink.params, "id"));
+
+    if let Some(sc_id) = scenario_id {
+        let clean_id = sc_id.replace("scenario-", "");
+        let scenario_dir = match crate::deck::get_scenario_directory() {
+            Ok(d) => d,
+            Err(e) => return CommandResult::Error(format!("Failed to locate scenario directory: {}", e)),
+        };
+        let file_path = scenario_dir.join(format!("scenario-{}.json", clean_id));
+        if !file_path.exists() {
+            return CommandResult::Error(format!("Scenario file not found: {:?}", file_path));
+        }
+        match sync_forge_scenario_file(&file_path, &settings.gamelog_config).await {
+            Ok(res) => {
+                log(&format!("Scenario '{}' synced successfully: {}", res.scenario_name, res.message));
+                CommandResult::ScenarioSynced(vec![res])
+            }
+            Err(e) => {
+                log(&format!("Scenario sync failed: {}", e));
+                CommandResult::Error(format!("Scenario sync failed: {}", e))
+            }
+        }
+    } else {
+        match sync_all_scenario_files(&settings.gamelog_config).await {
+            Ok(results) => {
+                let msg = format!("Synchronized {} scenario(s) to MaMo", results.len());
+                log(&msg);
+                CommandResult::ScenarioSynced(results)
+            }
+            Err(e) => {
+                log(&format!("Failed to sync scenarios: {}", e));
+                CommandResult::Error(format!("Failed to sync scenarios: {}", e))
+            }
         }
     }
 }

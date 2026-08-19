@@ -1050,6 +1050,9 @@ impl LauncherApp {
                         activity_log.log_error(&sim_result.message);
                     }
                 }
+                CommandResult::ScenarioSynced(results) => {
+                    activity_log.log_success(format!("Synchronized {} scenario(s) to MaMo", results.len()));
+                }
             }
         }
 
@@ -1889,6 +1892,9 @@ impl LauncherApp {
                         } else {
                             log.log_error(&sim_result.message);
                         }
+                    }
+                    commands::CommandResult::ScenarioSynced(results) => {
+                        log.log_success(format!("Synchronized {} scenario(s) to MaMo", results.len()));
                     }
                 }
             }
@@ -4944,6 +4950,11 @@ impl LauncherApp {
             };
             
             let result = process_new_logs_with_filter(&config, &processed_files, &filter_options).await;
+            let scenario_syncs = if config.auth_token.is_some() {
+                crate::gamelog::sync_all_scenario_files(&config).await.ok()
+            } else {
+                None
+            };
             let should_resolve = scan_slot.finish();
 
             {
@@ -4996,6 +5007,18 @@ impl LauncherApp {
                                     log.log_success(format!(
                                         "\u{1F4CB} Auto-scan: {} new files, {} uploaded, {} failed",
                                         summary.new_files, summary.successfully_uploaded, summary.failed_uploads
+                                    ));
+                                }
+                            }
+                        }
+
+                        // Also log synchronized Forge scenarios if any were processed
+                        if let Some(syncs) = scenario_syncs {
+                            if !syncs.is_empty() {
+                                if let Ok(mut log) = activity_log.lock() {
+                                    log.log_success(format!(
+                                        "\u{1F3AE} Scenario Sync: {} scenario(s) synchronized back to MaMo",
+                                        syncs.len()
                                     ));
                                 }
                             }
