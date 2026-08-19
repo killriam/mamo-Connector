@@ -1275,29 +1275,25 @@ pub async fn create_deck_from_mamo_with_progress(
                             let _ = fs::create_dir_all(dir);
                             if let Ok(json_str) = serde_json::to_string_pretty(&sc_json) {
                                 let _ = fs::write(dir.join(format!("{}.json", scenario_id_tag)), &json_str);
-                                let sanitized_name = sanitize_filename(deck_name);
-                                let _ = fs::write(dir.join(format!("Scenario_{}.json", sanitized_name)), &json_str);
                             }
                         }
                     }
                 }
-                // Attach the most recent scenario to the .dck file's Scenario= metadata
-                if let Some(latest_sc) = playable.first() {
-                    let scenario_id_tag = format!("scenario-{}", latest_sc.id);
-                    let mut updated_body = body.clone();
-                    if let Some(pos) = updated_body.find("Scenario=") {
-                        if let Some(end_line) = updated_body[pos..].find('\n') {
-                            updated_body.replace_range(pos..pos + end_line, &format!("Scenario={}", scenario_id_tag));
-                        }
-                    } else if let Some(pos) = updated_body.find("Name=") {
-                        if let Some(end_line) = updated_body[pos..].find('\n') {
-                            updated_body.replace_range(pos..pos + end_line, &format!("Name={}\nScenario={}", deck_name, scenario_id_tag));
-                        }
-                    } else if updated_body.contains("[metadata]") {
-                        updated_body = updated_body.replace("[metadata]\n", &format!("[metadata]\nName={}\nScenario={}\n", deck_name, scenario_id_tag));
+                // Attach all playable scenarios comma-separated to the .dck file's Scenario= metadata
+                let scenario_tags = playable.iter().map(|s| format!("scenario-{}", s.id)).collect::<Vec<_>>().join(", ");
+                let mut updated_body = body.clone();
+                if let Some(pos) = updated_body.find("Scenario=") {
+                    if let Some(end_line) = updated_body[pos..].find('\n') {
+                        updated_body.replace_range(pos..pos + end_line, &format!("Scenario={}", scenario_tags));
                     }
-                    let _ = write_deck_file(deck_name, &updated_body).await;
+                } else if let Some(pos) = updated_body.find("Name=") {
+                    if let Some(end_line) = updated_body[pos..].find('\n') {
+                        updated_body.replace_range(pos..pos + end_line, &format!("Name={}\nScenario={}", deck_name, scenario_tags));
+                    }
+                } else if updated_body.contains("[metadata]") {
+                    updated_body = updated_body.replace("[metadata]\n", &format!("[metadata]\nName={}\nScenario={}\n", deck_name, scenario_tags));
                 }
+                let _ = write_deck_file(deck_name, &updated_body).await;
             }
         }
     }
@@ -1406,11 +1402,6 @@ pub async fn create_deck_and_scenario_for_forge(deck_id: &str, scenario_id: &str
     fs::write(&id_json_path, &scenario_json_str)
         .with_context(|| format!("Failed to write scenario JSON to {:?}", id_json_path))?;
     info!("Scenario JSON (by ID) written: {:?}", id_json_path);
-
-    let deck_json_path = scenario_dir.join(format!("Scenario_{}.json", sanitized_deck_name));
-    fs::write(&deck_json_path, &scenario_json_str)
-        .with_context(|| format!("Failed to write scenario JSON to {:?}", deck_json_path))?;
-    info!("Scenario JSON (by deck name) written: {:?}", deck_json_path);
 
     Ok(DeckCreationResult::success(
         format!("Scenario deck '{}' and scenario file written for Forge", bundle.deck_name),
