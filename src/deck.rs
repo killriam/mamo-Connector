@@ -1367,10 +1367,11 @@ pub async fn create_deck_and_scenario_for_forge(deck_id: &str, scenario_id: &str
     let scenario_id_tag = format!("scenario-{}", scenario_id);
     let sanitized_deck_name = sanitize_filename(&bundle.deck_name);
 
-    // Update scenario JSON to ensure scenario.id matches the Scenario= metadata tag
+    // Update scenario JSON to ensure scenario.id and scenario.deck_id match the .dck metadata
     let mut scenario_json = bundle.scenario_json.clone();
     if let Some(scenario_obj) = scenario_json.get_mut("scenario").and_then(|s| s.as_object_mut()) {
         scenario_obj.insert("id".to_string(), serde_json::Value::String(scenario_id_tag.clone()));
+        scenario_obj.insert("deck_id".to_string(), serde_json::Value::String(sanitized_deck_name.clone()));
     }
 
     // Ensure the metadata has Name= and Scenario=<id> so Forge displays and selects the Scenario dropdown
