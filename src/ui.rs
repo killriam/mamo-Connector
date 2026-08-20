@@ -609,6 +609,8 @@ enum PendingForgeLaunch {
 /// State of the pre-launch Forge update check and prompt
 #[derive(Clone)]
 enum PreLaunchUpdateState {
+    /// Forge is already running: prompt user to confirm whether to start an additional instance
+    AlreadyRunningPrompt,
     /// Actively checking remote for an update
     Checking {
         started_at: Instant,
@@ -2072,11 +2074,16 @@ impl LauncherApp {
 
     // ==================== Pre-Launch Forge Update Check & Prompt ====================
 
-    /// Request a Forge launch, checking for newer versions first if Connector-managed.
+    /// Request a Forge launch, checking if Forge is already open or for newer versions if Connector-managed.
     fn request_forge_launch(&mut self, launch: PendingForgeLaunch, ctx: &egui::Context) {
-        // If Forge is already open, we can't update open Forge files anyway — launch directly.
+        // If Forge is already open, prompt the user before starting a second Forge instance.
         if crate::forge::is_forge_window_open() {
-            self.execute_pending_forge_launch(launch, ctx);
+            self.prelaunch_update_dialog = Some(PreLaunchUpdateDialog {
+                launch,
+                state: PreLaunchUpdateState::AlreadyRunningPrompt,
+            });
+            ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+            ctx.request_repaint();
             return;
         }
 
@@ -2161,6 +2168,7 @@ impl LauncherApp {
         let Some(ref mut dialog) = self.prelaunch_update_dialog else { return; };
         
         let title = match &dialog.state {
+            PreLaunchUpdateState::AlreadyRunningPrompt => "🎮 Forge is Already Open",
             PreLaunchUpdateState::Checking { .. } => "Checking for Updates…",
             PreLaunchUpdateState::Prompt { is_staged: true, .. } => "✨ MaMo Forge Update Ready",
             PreLaunchUpdateState::Prompt { is_staged: false, .. } => "⬆ MaMo Forge Update Available",
@@ -2180,6 +2188,54 @@ impl LauncherApp {
             .show(ctx, |ui| {
                 ui.set_min_width(400.0);
                 match &dialog.state {
+                    PreLaunchUpdateState::AlreadyRunningPrompt => {
+                        ui.horizontal(|ui| {
+                            ui.label(egui::RichText::new("🎮").size(28.0));
+                            ui.vertical(|ui| {
+                                ui.label(egui::RichText::new("Forge is already running").strong());
+                                match &dialog.launch {
+                                    PendingForgeLaunch::AccountDeck(deck) => {
+                                        ui.label(
+                                            egui::RichText::new(format!("Deck: {}", deck.deck_name))
+                                                .color(egui::Color32::from_rgb(0, 90, 158))
+                                                .small(),
+                                        );
+                                    }
+                                    PendingForgeLaunch::Scenario { scenario_name, .. } => {
+                                        ui.label(
+                                            egui::RichText::new(format!("Scenario: {}", scenario_name))
+                                                .color(egui::Color32::from_rgb(0, 90, 158))
+                                                .small(),
+                                        );
+                                    }
+                                    PendingForgeLaunch::LocalDeckWithCuratedOpponent { local_stem } => {
+                                        ui.label(
+                                            egui::RichText::new(format!("Deck: {}", local_stem))
+                                                .color(egui::Color32::from_rgb(0, 90, 158))
+                                                .small(),
+                                        );
+                                    }
+                                    _ => {}
+                                }
+                            });
+                        });
+                        ui.add_space(12.0);
+                        ui.label("A Forge window is already open. Would you like to start a new Forge instance?");
+                        ui.add_space(16.0);
+                        ui.horizontal(|ui| {
+                            if ui.button("Cancel").clicked() {
+                                action_cancel = true;
+                            }
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                if ui.add(
+                                    egui::Button::new(egui::RichText::new("Start New Forge").color(egui::Color32::WHITE).strong())
+                                        .fill(egui::Color32::from_rgb(0, 120, 215)),
+                                ).clicked() {
+                                    action_launch_anyway = true;
+                                }
+                            });
+                        });
+                    }
                     PreLaunchUpdateState::Checking { .. } => {
                         ui.horizontal(|ui| {
                             ui.spinner();
@@ -2309,8 +2365,16 @@ impl LauncherApp {
             });
 
         if action_cancel {
+            if let Some(ref d) = self.prelaunch_update_dialog {
+                if matches!(d.state, PreLaunchUpdateState::AlreadyRunningPrompt) {
+                    if let Ok(mut log) = self.activity_log.lock() {
+                        log.log_info("Forge launch cancelled — Forge is already open.");
+                    }
+                }
+            }
             self.prelaunch_update_dialog = None;
             *self.play_session.lock().unwrap() = PlaySession::Watching;
+            *self.is_launching_selected_deck.lock().unwrap() = false;
         } else if action_launch_anyway {
             let launch = self.prelaunch_update_dialog.take().unwrap().launch;
             self.execute_pending_forge_launch(launch, ctx);
@@ -6326,6 +6390,9 @@ mod deck_picker_tests {
         if let PreLaunchUpdateState::Prompt { is_staged, .. } = prompt_remote {
             assert!(!is_staged, "should not be marked as staged");
         }
+
+        let prompt_already_running = PreLaunchUpdateState::AlreadyRunningPrompt;
+        assert!(matches!(prompt_already_running, PreLaunchUpdateState::AlreadyRunningPrompt));
     }
 }
 

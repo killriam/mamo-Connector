@@ -41,6 +41,7 @@ impl ForgeLaunchResult {
         }
     }
 
+    #[allow(dead_code)]
     pub fn hint_already_running(deck_name: Option<String>) -> Self {
         let message = match deck_name {
             Some(name) => format!(
@@ -650,12 +651,9 @@ pub fn launch_forge(forge_path: &str, deck_name: Option<&str>, deck2_name: Optio
 /// macOS .app, shell script) — Forge's native launchers all forward CLI args straight through
 /// to forge.view.Main, same as the deck-preselect args in launch_forge() above.
 pub fn launch_forge_replay(replay_path: &str) -> Result<ForgeLaunchResult> {
-    // Don't open another Forge window if one is already visible
+    // Log if Forge is already running (window detected)
     if is_forge_window_open() {
-        info!("Forge is already running — replay file was saved to gamelogs directory");
-        return Ok(ForgeLaunchResult::hint_already_running(Some(
-            "Replay file saved. Open Replay Mode in Forge to start.".to_string(),
-        )));
+        info!("Forge is already running (window detected), but will attempt to launch replay in a new instance.");
     }
 
     let settings = Settings::load()?;
