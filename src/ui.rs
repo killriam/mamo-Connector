@@ -2076,8 +2076,13 @@ impl LauncherApp {
 
     /// Request a Forge launch, checking if Forge is already open or for newer versions if Connector-managed.
     fn request_forge_launch(&mut self, launch: PendingForgeLaunch, ctx: &egui::Context) {
-        // If Forge is already open, prompt the user before starting a second Forge instance.
-        if crate::forge::is_forge_window_open() {
+        // If Forge is already open — or is currently starting up (monitoring active but window
+        // not yet visible because the JVM hasn't finished booting) — prompt before spawning
+        // a second instance. is_forge_window_open() alone isn't enough: the Java window can
+        // take several seconds to appear, so during that gap the check returns false even
+        // though Forge is already on its way up.
+        let forge_starting = self.forge_monitoring_since.lock().unwrap().is_some();
+        if forge_starting || crate::forge::is_forge_window_open() {
             self.prelaunch_update_dialog = Some(PreLaunchUpdateDialog {
                 launch,
                 state: PreLaunchUpdateState::AlreadyRunningPrompt,

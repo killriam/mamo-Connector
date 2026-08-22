@@ -488,6 +488,14 @@ pub async fn upload_game_log(
     } else {
         let status = response.status();
         let error_text = response.text().await.unwrap_or_else(|_| "Unknown error".to_string());
+        if status.as_u16() == 401 {
+            // Return a recognisable sentinel so the batch loop can abort early — retrying
+            // every remaining file with the same expired token just spams the log.
+            return Err(anyhow::anyhow!(
+                "AUTH_EXPIRED: Your MaMo session has expired. \
+                 Please re-authenticate: open Settings and paste a fresh token from your MaMo account."
+            ));
+        }
         Err(anyhow::anyhow!("Upload failed with status {}: {}", status, error_text))
     }
 }
@@ -1020,11 +1028,18 @@ pub async fn process_new_logs_with_filter(
                 }
             }
             Err(e) => {
+                let err_str = e.to_string();
                 summary.failed_uploads += 1;
                 summary.results.push(GameLogProcessResult::failed(
                     filename,
-                    format!("Upload failed: {}", e),
+                    format!("Upload failed: {}", err_str),
                 ));
+                // Token expired — no point retrying the remaining files with the same
+                // dead token. Surface the auth error once and stop.
+                if err_str.starts_with("AUTH_EXPIRED:") {
+                    log::warn!("Upload aborted: authentication token expired. Skipping remaining files.");
+                    break;
+                }
             }
         }
     }
