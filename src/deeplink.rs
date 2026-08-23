@@ -117,6 +117,16 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_playtest_scenario_url() {
+        let url = "mamoConnector://playtest-scenario/deck-uuid-123?scenarioId=scen-uuid-456";
+        let result = parse_deeplink_url(url).unwrap();
+        
+        assert_eq!(result.action, "playtest-scenario");
+        assert_eq!(result.deck_id, Some("deck-uuid-123".to_string()));
+        assert!(result.params.iter().any(|(k, v)| k == "scenarioId" && v == "scen-uuid-456"));
+    }
+
+    #[test]
     fn test_parse_deeplink_from_args() {
         let args = vec![
             "--some-flag".to_string(),
