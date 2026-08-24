@@ -407,6 +407,7 @@ fn get_forge_simulation_stats_dir() -> PathBuf {
 
 /// Sanitize a deck name to match the `.dck` file stem Forge uses.
 /// Spaces and special characters become underscores.
+#[allow(dead_code)]
 pub fn sanitize_deck_name(name: &str) -> String {
     name.chars()
         .map(|c| {

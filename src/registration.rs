@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use cfg_if::cfg_if;
 
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct RegistrationOutcome {
     pub status: RegistrationStatus,

@@ -33,6 +33,7 @@ use std::sync::{Arc, Mutex};
 use std::time::UNIX_EPOCH;
 
 /// Status of the game log watcher
+#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WatcherStatus {
     Stopped,
@@ -108,6 +109,7 @@ pub struct ScanSummary {
 }
 
 /// State for the game log watcher
+#[allow(dead_code)]
 #[derive(Debug, Clone, Default)]
 pub struct GameLogWatcherState {
     /// Current status of the watcher
@@ -256,6 +258,7 @@ pub fn scan_directory(config: &GameLogConfig) -> Result<Vec<PathBuf>> {
 }
 
 /// Preview info for a file before upload
+#[allow(dead_code)]
 #[derive(Debug, Clone, Default)]
 pub struct FilePreviewInfo {
     pub filename: String,
@@ -265,6 +268,7 @@ pub struct FilePreviewInfo {
 }
 
 /// Preview scan - shows what files would be uploaded with detected deck names
+#[allow(dead_code)]
 pub fn preview_scan(
     config: &GameLogConfig,
     processed_files: &HashSet<String>,
@@ -908,6 +912,7 @@ impl GameLogFilterOptions {
 }
 
 /// Process new game logs from the configured directory
+#[allow(dead_code)]
 pub async fn process_new_logs(
     config: &GameLogConfig,
     processed_files: &Arc<Mutex<HashSet<String>>>,
@@ -948,8 +953,6 @@ pub async fn process_new_logs_with_filter(
     let files = scan_directory(config)?;
     summary.total_files_found = files.len();
     
-    let mut skipped_by_filter = 0usize;
-    
     for file_path in files {
         let filename = file_path
             .file_name()
@@ -968,7 +971,6 @@ pub async fn process_new_logs_with_filter(
         // Check days filter based on file modification time
         let modified_time = file_path.metadata().ok().and_then(|m| m.modified().ok());
         if !filter.passes_days_filter(modified_time) {
-            skipped_by_filter += 1;
             continue;
         }
         
@@ -990,7 +992,6 @@ pub async fn process_new_logs_with_filter(
         
         // Check deck filter
         if !filter.passes_deck_filter(deck_identifier.as_deref()) {
-            skipped_by_filter += 1;
             continue;
         }
         
@@ -1071,6 +1072,7 @@ pub fn validate_directory(path: &str) -> Result<bool> {
 }
 
 /// Get file count in a directory matching extensions
+#[allow(dead_code)]
 pub fn get_file_count(config: &GameLogConfig) -> Result<usize> {
     let files = scan_directory(config)?;
     Ok(files.len())

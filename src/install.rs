@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 /// use for settings/lock/pending-command — matching the existing precedent in
 /// `forge::get_default_forge_path()`, which already treats `data_local_dir()` as where installed
 /// binaries/caches belong.
+#[allow(dead_code)]
 pub fn stable_app_dir() -> Result<PathBuf> {
     Ok(dirs::data_local_dir()
         .context("Could not find local app-data directory")?
@@ -16,6 +17,7 @@ pub fn stable_app_dir() -> Result<PathBuf> {
 
 /// Pure comparison: is `current` already the stable, canonicalized `target` path? Kept separate
 /// from any filesystem/process work so it's directly testable.
+#[allow(dead_code)]
 fn already_at_target(current: &Path, target: &Path) -> bool {
     current == target
 }

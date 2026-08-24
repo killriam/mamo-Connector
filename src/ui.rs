@@ -708,6 +708,7 @@ struct GameLogState {
 }
 
 /// State for the settings tab (includes Forge configuration)
+#[allow(dead_code)]
 #[derive(Clone, Default)]
 struct SettingsState {
     /// Forge executable path input

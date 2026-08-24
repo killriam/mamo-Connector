@@ -429,6 +429,7 @@ const CONNECTOR_LATEST_RELEASE_URL: &str =
     "https://github.com/killriam/mamo-Connector/releases/latest";
 
 /// A resolved GitHub release asset for MaMo Connector desktop app.
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct ConnectorAsset {
     pub version: String,

@@ -1723,6 +1723,7 @@ fn parse_card_line(line: &str) -> Option<(u32, String)> {
 
 /// Find an existing deck file by its hash
 /// Scans all .dck files in the deck directory and compares hashes
+#[allow(dead_code)]
 fn find_deck_by_hash(target_hash: &str) -> Option<PathBuf> {
     let deck_dir = get_deck_directory().ok()?;
     
@@ -2693,6 +2694,7 @@ Name = Test Deck
 
     // ==================== Deck File Format Tests ====================
 
+    #[allow(dead_code)]
     fn create_test_deck() -> DeckData {
         DeckData {
             name: "Test EDH Deck".to_string(),

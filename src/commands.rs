@@ -1084,11 +1084,6 @@ fn encode_deck_input(input: &serde_json::Value) -> anyhow::Result<(Vec<u8>, Vec<
         }
     }
 
-    // Build mechanic card masks: for each mechanic group, which card indices are required
-    let commander_oracle_ids: Vec<String> = commanders.iter()
-        .filter_map(|c| c["oracle_id"].as_str().map(str::to_string))
-        .collect();
-
     // oracle_id → indices in all_cards
     let mut oracle_to_indices: std::collections::HashMap<String, Vec<u32>> = std::collections::HashMap::new();
     for (idx, card) in all_cards.iter().enumerate() {
