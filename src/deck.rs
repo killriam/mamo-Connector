@@ -403,8 +403,8 @@ pub fn fetch_user_decks_direct_with_token(username: &str, token: Option<&str>) -
 
     loop {
         let url = format!(
-            "{}/users/{}/decks?pageNumber={}&pageSize={}",
-            MOXFIELD_API_URL, username, page, page_size
+            "{}/decks/search?authorUserNames={}&pageNumber={}&pageSize={}&showIllegal=true",
+            MOXFIELD_API_BASE, username, page, page_size
         );
 
         let body = if let Some(tok) = token {
@@ -614,7 +614,7 @@ pub async fn fetch_moxfield_user_decks(username: &str) -> Result<Vec<MoxfieldDec
     
     loop {
         let url = format!(
-            "{}/users/{}/decks?pageNumber={}&pageSize={}",
+            "{}/decks/search?authorUserNames={}&pageNumber={}&pageSize={}&showIllegal=true",
             MOXFIELD_API_BASE, username, page, page_size
         );
         
@@ -3387,6 +3387,27 @@ Name=Example Commander Deck
     }
 
     /// Integration test for fetching real Moxfield user decks
+    /// Integration test for fetching user decks directly via curl (bypasses Cloudflare)
+    #[test]
+    #[ignore] // Ignored by default - run with: cargo test test_integration_fetch_user_decks_direct -- --ignored --nocapture
+    fn test_integration_fetch_user_decks_direct() {
+        let username = "IceMagma";
+        let result = fetch_user_decks_direct(username);
+        match result {
+            Ok(decks) => {
+                println!("Found {} decks for user '{}' via direct curl", decks.len(), username);
+                assert!(!decks.is_empty(), "User should have some public decks");
+                for (i, deck) in decks.iter().take(5).enumerate() {
+                    println!("  {}. {} (ID: {}, Format: {:?})", 
+                             i + 1, deck.name, deck.public_id, deck.format);
+                }
+            }
+            Err(e) => {
+                panic!("Failed to fetch user decks via curl: {}.", e);
+            }
+        }
+    }
+
     /// This test requires network access to Moxfield API
     #[tokio::test]
     #[ignore] // Ignored by default - run with: cargo test -- --ignored
