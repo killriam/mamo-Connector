@@ -230,6 +230,10 @@ enum WizardTestStatus {
 struct DownloadProgress {
     bytes_done: u64,
     total_bytes: Option<u64>,
+    files_done: usize,
+    total_files: usize,
+    stage: Option<crate::download::DownloadStage>,
+    fraction: f32,
     status_text: String,
     finished: bool,
     error: Option<String>,
@@ -277,16 +281,41 @@ impl Default for SetupWizardState {
     }
 }
 
-/// Human-readable download progress string: "42.3 MB / 156.0 MB (27%)" or "42.3 MB"
-fn format_download_status(done: u64, total: Option<u64>) -> String {
-    let done_mb = done as f64 / (1024.0 * 1024.0);
-    match total {
-        Some(t) if t > 0 => {
-            let total_mb = t as f64 / (1024.0 * 1024.0);
-            let pct = (done as f64 / t as f64 * 100.0) as u32;
-            format!("Downloading… {done_mb:.1} MB / {total_mb:.1} MB ({pct}%)")
+/// Human-readable progress string and 0.0..=1.0 completion fraction for a download/extract operation
+fn format_download_update(update: &crate::download::DownloadUpdate) -> (String, f32) {
+    use crate::download::DownloadStage;
+    match update.stage {
+        DownloadStage::Downloading => {
+            let done_mb = update.bytes_done as f64 / (1024.0 * 1024.0);
+            match update.total_bytes {
+                Some(t) if t > 0 => {
+                    let total_mb = t as f64 / (1024.0 * 1024.0);
+                    let pct = (update.bytes_done as f64 / t as f64 * 100.0) as u32;
+                    let fraction = (update.bytes_done as f32 / t as f32).clamp(0.0, 1.0);
+                    (
+                        format!("Downloading… {done_mb:.1} MB / {total_mb:.1} MB ({pct}%)"),
+                        fraction,
+                    )
+                }
+                _ => (format!("Downloading… {done_mb:.1} MB"), 0.0),
+            }
         }
-        _ => format!("Downloading… {done_mb:.1} MB"),
+        DownloadStage::Extracting => {
+            if update.total_files > 0 {
+                let pct = (update.files_done as f64 / update.total_files as f64 * 100.0) as u32;
+                let fraction = (update.files_done as f32 / update.total_files as f32).clamp(0.0, 1.0);
+                (
+                    format!(
+                        "Extracting MaMo Forge… {} / {} files ({pct}%)",
+                        update.files_done, update.total_files
+                    ),
+                    fraction,
+                )
+            } else {
+                ("Extracting MaMo Forge files…".to_string(), 0.0)
+            }
+        }
+        DownloadStage::Finalizing => ("Finalizing MaMo Forge setup…".to_string(), 1.0),
     }
 }
 
@@ -513,9 +542,14 @@ async fn run_forge_update_check_and_download(
             move |update| {
                 if let Ok(mut guard) = progress_bg.lock() {
                     let entry = guard.get_or_insert_with(DownloadProgress::default);
+                    let (text, fraction) = format_download_update(&update);
                     entry.bytes_done = update.bytes_done;
                     entry.total_bytes = update.total_bytes;
-                    entry.status_text = format_download_status(update.bytes_done, update.total_bytes);
+                    entry.files_done = update.files_done;
+                    entry.total_files = update.total_files;
+                    entry.stage = Some(update.stage);
+                    entry.fraction = fraction;
+                    entry.status_text = text;
                 }
                 ctx_progress.request_repaint();
             },
@@ -1636,8 +1670,7 @@ impl eframe::App for LauncherApp {
                                     } else {
                                         ui.label(
                                             egui::RichText::new(format!(
-                                                "⬆ Downloading MaMo Forge update… {}",
-                                                format_download_status(prog.bytes_done, prog.total_bytes)
+                                                "⬆ {}", prog.status_text
                                             ))
                                             .color(egui::Color32::from_rgb(0, 90, 158))
                                             .small(),
@@ -2312,12 +2345,7 @@ impl LauncherApp {
                         let prog_guard = progress.lock().unwrap();
                         let (status_text, pct) = match prog_guard.as_ref() {
                             Some(p) => {
-                                let pct = if let Some(total) = p.total_bytes {
-                                    (p.bytes_done as f32 / total as f32).clamp(0.0, 1.0)
-                                } else {
-                                    0.0
-                                };
-                                (p.status_text.clone(), pct)
+                                (p.status_text.clone(), p.fraction)
                             }
                             None => ("Starting download…".to_string(), 0.0),
                         };
@@ -2432,9 +2460,14 @@ impl LauncherApp {
                         move |update| {
                             if let Ok(mut guard) = progress_bg.lock() {
                                 let entry = guard.get_or_insert_with(DownloadProgress::default);
+                                let (text, fraction) = format_download_update(&update);
                                 entry.bytes_done = update.bytes_done;
                                 entry.total_bytes = update.total_bytes;
-                                entry.status_text = format_download_status(update.bytes_done, update.total_bytes);
+                                entry.files_done = update.files_done;
+                                entry.total_files = update.total_files;
+                                entry.stage = Some(update.stage);
+                                entry.fraction = fraction;
+                                entry.status_text = text;
                             }
                             ctx_callback.request_repaint();
                         },
@@ -2591,9 +2624,14 @@ impl LauncherApp {
                     &forge_dir,
                     move |update| {
                         if let Ok(mut p) = progress_bg.lock() {
+                            let (text, fraction) = format_download_update(&update);
                             p.bytes_done = update.bytes_done;
                             p.total_bytes = update.total_bytes;
-                            p.status_text = format_download_status(update.bytes_done, update.total_bytes);
+                            p.files_done = update.files_done;
+                            p.total_files = update.total_files;
+                            p.stage = Some(update.stage);
+                            p.fraction = fraction;
+                            p.status_text = text;
                         }
                         ctx_progress.request_repaint();
                     },
@@ -2656,9 +2694,14 @@ impl LauncherApp {
                     move |update| {
                         if let Ok(mut guard) = progress_cb.lock() {
                             let entry = guard.get_or_insert_with(DownloadProgress::default);
+                            let (text, fraction) = format_download_update(&update);
                             entry.bytes_done = update.bytes_done;
                             entry.total_bytes = update.total_bytes;
-                            entry.status_text = format_download_status(update.bytes_done, update.total_bytes);
+                            entry.files_done = update.files_done;
+                            entry.total_files = update.total_files;
+                            entry.stage = Some(update.stage);
+                            entry.fraction = fraction;
+                            entry.status_text = text;
                         }
                         ctx_cb.request_repaint();
                     },
@@ -2847,31 +2890,31 @@ impl LauncherApp {
                     ui.add_space(16.0);
 
                     // Read current progress state
-                    let (prog_done, prog_total, prog_text, prog_finished, prog_error) = self
+                    let (prog_fraction, prog_text, prog_finished, prog_error) = self
                         .wizard
                         .download_progress
                         .as_ref()
                         .and_then(|a| a.try_lock().ok())
-                        .map(|p| (p.bytes_done, p.total_bytes, p.status_text.clone(), p.finished, p.error.clone()))
+                        .map(|p| (p.fraction, p.status_text.clone(), p.finished, p.error.clone()))
                         .unwrap_or_default();
 
                     let is_downloading = self.wizard.download_progress.is_some() && !prog_finished;
 
                     if is_downloading {
-                        // ── Downloading ──────────────────────────────────────
-                        ui.label(egui::RichText::new(&prog_text).color(egui::Color32::from_rgb(0, 100, 180)));
+                        // ── Downloading / Extracting ──────────────────────────
+                        ui.horizontal(|ui| {
+                            ui.spinner();
+                            ui.label(egui::RichText::new(&prog_text).color(egui::Color32::from_rgb(0, 100, 180)).strong());
+                        });
                         ui.add_space(6.0);
-                        match prog_total {
-                            Some(total) if total > 0 => {
-                                ui.add(
-                                    egui::ProgressBar::new(prog_done as f32 / total as f32)
-                                        .show_percentage()
-                                        .desired_width(380.0),
-                                );
-                            }
-                            _ => {
-                                ui.add(egui::ProgressBar::new(0.0).animate(true).desired_width(380.0));
-                            }
+                        if prog_fraction > 0.0 {
+                            ui.add(
+                                egui::ProgressBar::new(prog_fraction)
+                                    .show_percentage()
+                                    .desired_width(380.0),
+                            );
+                        } else {
+                            ui.add(egui::ProgressBar::new(0.0).animate(true).desired_width(380.0));
                         }
                     } else {
                         // ── Idle / error / already downloaded ────────────────
@@ -5710,7 +5753,7 @@ impl LauncherApp {
                                             }
                                         }
                                     } else {
-                                        ui.label(egui::RichText::new(format!("Downloading MaMo Forge update… {}", format_download_status(prog.bytes_done, prog.total_bytes))).color(egui::Color32::from_rgb(0, 90, 158)));
+                                        ui.label(egui::RichText::new(&prog.status_text).color(egui::Color32::from_rgb(0, 90, 158)));
                                         if !prog.finished && ui.small_button("Cancel").clicked() {
                                             self.forge_update_cancelled.store(true, Ordering::Relaxed);
                                         }

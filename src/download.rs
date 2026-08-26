@@ -10,10 +10,54 @@ const FORGE_RELEASES_API: &str =
 const FORGE_EXPANDED_ASSETS_URL: &str =
     "https://github.com/killriam/forge/releases/expanded_assets/replay-features-latest";
 
-/// Progress update sent from the download thread to the UI on each chunk.
+/// Current phase of a download operation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DownloadStage {
+    Downloading,
+    Extracting,
+    Finalizing,
+}
+
+/// Progress update sent from the download thread to the UI on each chunk or extracted file.
+#[derive(Clone, Debug)]
 pub struct DownloadUpdate {
+    pub stage: DownloadStage,
     pub bytes_done: u64,
     pub total_bytes: Option<u64>,
+    pub files_done: usize,
+    pub total_files: usize,
+}
+
+impl DownloadUpdate {
+    pub fn downloading(bytes_done: u64, total_bytes: Option<u64>) -> Self {
+        Self {
+            stage: DownloadStage::Downloading,
+            bytes_done,
+            total_bytes,
+            files_done: 0,
+            total_files: 0,
+        }
+    }
+
+    pub fn extracting(files_done: usize, total_files: usize) -> Self {
+        Self {
+            stage: DownloadStage::Extracting,
+            bytes_done: 0,
+            total_bytes: None,
+            files_done,
+            total_files,
+        }
+    }
+
+    pub fn finalizing() -> Self {
+        Self {
+            stage: DownloadStage::Finalizing,
+            bytes_done: 0,
+            total_bytes: None,
+            files_done: 0,
+            total_files: 0,
+        }
+    }
 }
 
 /// A resolved GitHub release asset — enough to download it and, later, tell whether the server
@@ -77,7 +121,7 @@ fn select_matching_forge_asset(
     matching.sort_by(|a, b| {
         b.updated_at
             .cmp(&a.updated_at)
-            .then_with(|| b.name.cmp(&a.name))
+            .then_with(| | b.name.cmp(&a.name))
     });
 
     matching.into_iter().next()
@@ -158,39 +202,59 @@ pub async fn resolve_forge_portable_zip_url() -> Result<ForgeAsset> {
     resolve_forge_asset_url(|n| n.ends_with(".zip")).await
 }
 
-/// Resolves the standalone JAR — enough to update an install that already has `res/` from a
-/// previous portable-bundle extraction (much smaller download than re-fetching the whole zip).
+/// Resolves just the standalone Forge executable JAR (`forge-gui-desktop-*-jar-with-dependencies.jar`).
 pub async fn resolve_forge_jar_url() -> Result<ForgeAsset> {
-    resolve_forge_asset_url(|n| n.ends_with("-jar-with-dependencies.jar")).await
+    resolve_forge_asset_url(|n| {
+        n.starts_with("forge-gui-desktop-") && n.ends_with("-jar-with-dependencies.jar")
+    })
+    .await
 }
 
-/// Path to the sidecar metadata file recording which server-side build a downloaded jar came
-/// from — `<jar>.source.json` next to it. Absence (older download, predating this file, or a
-/// user-provided Forge path) is treated as "unknown" by the update check, not "up to date".
-fn asset_meta_path(jar_path: &Path) -> PathBuf {
-    let mut name = jar_path.file_name().map(|n| n.to_os_string()).unwrap_or_default();
-    name.push(".source.json");
-    jar_path.with_file_name(name)
+/// Path to the sidecar metadata file recording which release asset a given Forge JAR was
+/// downloaded from (`<jar-path>.source.json`).
+pub fn asset_meta_path(jar_path: &Path) -> PathBuf {
+    PathBuf::from(format!("{}.source.json", jar_path.display()))
 }
 
-/// Records which build a just-downloaded jar came from, so a later `check_forge_update_available`
-/// can tell a same-named-but-newer republish apart from a genuinely up-to-date local copy.
-/// Best-effort: a write failure here just means the next update check treats this jar as
-/// "unknown" (see `asset_meta_path`'s doc) rather than failing the download itself.
-fn write_asset_meta(jar_path: &Path, asset: &ForgeAsset) {
-    let meta = serde_json::json!({ "updated_at": asset.updated_at });
-    if let Ok(content) = serde_json::to_string(&meta) {
-        if let Err(e) = std::fs::write(asset_meta_path(jar_path), content) {
-            log::warn!("Failed to write Forge asset metadata sidecar: {e}");
+/// Sidecar metadata persisted next to each downloaded Forge JAR.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct ForgeAssetMeta {
+    pub download_url: String,
+    pub name: String,
+    pub updated_at: String,
+}
+
+/// Persists the sidecar metadata for a downloaded Forge JAR. Silently logs and ignores write
+/// errors so sidecar issues never break an otherwise-successful download.
+pub fn write_asset_meta(jar_path: &Path, asset: &ForgeAsset) {
+    let meta = ForgeAssetMeta {
+        download_url: asset.download_url.clone(),
+        name: asset.name.clone(),
+        updated_at: asset.updated_at.clone(),
+    };
+    let meta_path = asset_meta_path(jar_path);
+    match serde_json::to_string_pretty(&meta) {
+        Ok(json) => {
+            if let Err(e) = std::fs::write(&meta_path, json) {
+                log::warn!("Failed to write Forge asset metadata to {:?}: {e}", meta_path);
+            }
         }
+        Err(e) => log::warn!("Failed to serialize Forge asset metadata: {e}"),
     }
 }
 
-/// Reads back what `write_asset_meta` recorded for `jar_path`, if anything.
+/// Reads the `updated_at` timestamp from a Forge JAR's sidecar metadata file, if present.
+/// Returns `None` if the sidecar is missing, unreadable, or invalid JSON (which causes the
+/// updater to treat the local jar as "unknown, might be stale" rather than assuming it's current).
 pub fn read_asset_meta_updated_at(jar_path: &Path) -> Option<String> {
-    let content = std::fs::read_to_string(asset_meta_path(jar_path)).ok()?;
-    let value: serde_json::Value = serde_json::from_str(&content).ok()?;
-    value["updated_at"].as_str().map(|s| s.to_string())
+    let meta_path = asset_meta_path(jar_path);
+    let bytes = std::fs::read(&meta_path).ok()?;
+    let meta: ForgeAssetMeta = serde_json::from_slice(&bytes).ok()?;
+    if meta.updated_at.is_empty() {
+        None
+    } else {
+        Some(meta.updated_at)
+    }
 }
 
 /// Streams `download_url` into `dest_dir/filename`, reporting progress and honoring
@@ -242,7 +306,7 @@ async fn download_to_file(
         let chunk = chunk_result.context("Error reading download stream")?;
         bytes_done += chunk.len() as u64;
         file.write_all(&chunk).context("Failed to write chunk to file")?;
-        on_progress(DownloadUpdate { bytes_done, total_bytes });
+        on_progress(DownloadUpdate::downloading(bytes_done, total_bytes));
     }
 
     file.flush().context("Failed to flush download file")?;
@@ -273,16 +337,30 @@ fn common_top_level_dir(archive: &mut zip::ZipArchive<std::fs::File>) -> Result<
 /// wrapper folder if the whole archive is nested under one (so the jar and `res/` land directly
 /// in `dest_dir`, matching how the portable bundle is packaged, whether or not GitHub/CI wraps it
 /// in a directory named after the release). Runs on a blocking thread since the `zip` crate is
-/// synchronous and a ~400MB archive can take a few seconds to unpack.
-async fn extract_zip_to_dir(zip_path: PathBuf, dest_dir: PathBuf) -> Result<()> {
+/// synchronous and a ~400MB archive can take time to unpack. Reports progress during extraction.
+async fn extract_zip_to_dir(
+    zip_path: PathBuf,
+    dest_dir: PathBuf,
+    on_progress: Arc<dyn Fn(DownloadUpdate) + Send + Sync>,
+    cancelled: Arc<AtomicBool>,
+) -> Result<()> {
     tokio::task::spawn_blocking(move || -> Result<()> {
         let file = std::fs::File::open(&zip_path)
             .with_context(|| format!("Failed to open downloaded archive {:?}", zip_path))?;
         let mut archive = zip::ZipArchive::new(file).context("Downloaded file is not a valid zip archive")?;
 
         let strip_prefix = common_top_level_dir(&mut archive)?;
+        let total_files = archive.len();
 
-        for i in 0..archive.len() {
+        on_progress(DownloadUpdate::extracting(0, total_files));
+
+        let mut created_dirs: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
+
+        for i in 0..total_files {
+            if cancelled.load(Ordering::Relaxed) {
+                anyhow::bail!("Extraction cancelled");
+            }
+
             let mut entry = archive.by_index(i)?;
             // `enclosed_name()` rejects entries that would escape `dest_dir` (zip-slip
             // protection) — anything unsafe is silently skipped rather than failing the whole
@@ -299,14 +377,25 @@ async fn extract_zip_to_dir(zip_path: PathBuf, dest_dir: PathBuf) -> Result<()> 
             let out_path = dest_dir.join(relative_path);
 
             if entry.is_dir() {
-                std::fs::create_dir_all(&out_path)?;
+                if created_dirs.insert(out_path.clone()) {
+                    std::fs::create_dir_all(&out_path)?;
+                }
             } else {
                 if let Some(parent) = out_path.parent() {
-                    std::fs::create_dir_all(parent)?;
+                    if created_dirs.insert(parent.to_path_buf()) {
+                        std::fs::create_dir_all(parent)?;
+                    }
                 }
-                let mut out_file = std::fs::File::create(&out_path)
+                let out_file = std::fs::File::create(&out_path)
                     .with_context(|| format!("Failed to create {:?}", out_path))?;
-                std::io::copy(&mut entry, &mut out_file)?;
+                let mut writer = std::io::BufWriter::with_capacity(64 * 1024, out_file);
+                std::io::copy(&mut entry, &mut writer)?;
+                writer.flush()?;
+            }
+
+            // Report progress every 50 files or on the final file
+            if i % 50 == 0 || i + 1 == total_files {
+                on_progress(DownloadUpdate::extracting(i + 1, total_files));
             }
         }
         Ok(())
@@ -319,9 +408,9 @@ async fn extract_zip_to_dir(zip_path: PathBuf, dest_dir: PathBuf) -> Result<()> 
 /// Downloads and extracts the MaMo Forge portable bundle (JAR + `res/`) into `dest_dir` — used
 /// for a fresh install, since there's no pre-existing `res/` to rely on yet.
 ///
-/// Calls `on_progress` during the download phase; checks `cancelled` before each chunk (deletes
-/// the partial zip and returns an error if set). The zip itself is deleted after a successful
-/// extraction so it doesn't sit alongside the extracted files duplicating ~400MB.
+/// Calls `on_progress` during download and extraction phases; checks `cancelled` before each
+/// chunk/file. The zip itself is deleted after a successful extraction so it doesn't sit
+/// alongside the extracted files duplicating ~400MB.
 ///
 /// Returns the path to the extracted jar (found via `resolve_latest_forge_jar`).
 pub async fn download_forge_portable(
@@ -333,17 +422,35 @@ pub async fn download_forge_portable(
         .await
         .context("Could not resolve MaMo Forge portable bundle URL")?;
 
-    let zip_path =
-        download_to_file(&asset.download_url, dest_dir, &asset.name, &on_progress, &cancelled).await?;
+    let on_progress_arc: Arc<dyn Fn(DownloadUpdate) + Send + Sync> = Arc::new(on_progress);
 
-    extract_zip_to_dir(zip_path.clone(), dest_dir.to_path_buf())
-        .await
-        .context("Downloaded MaMo Forge but failed to extract it")?;
+    let progress_cb = {
+        let arc = Arc::clone(&on_progress_arc);
+        move |up| arc(up)
+    };
+
+    let zip_path =
+        download_to_file(&asset.download_url, dest_dir, &asset.name, &progress_cb, &cancelled).await?;
+
+    extract_zip_to_dir(
+        zip_path.clone(),
+        dest_dir.to_path_buf(),
+        Arc::clone(&on_progress_arc),
+        Arc::clone(&cancelled),
+    )
+    .await
+    .context("Downloaded MaMo Forge but failed to extract it")?;
     let _ = std::fs::remove_file(&zip_path);
+
+    on_progress_arc(DownloadUpdate::finalizing());
 
     let jar_path = crate::forge::resolve_latest_forge_jar(dest_dir)
         .context("Extracted MaMo Forge bundle but couldn't find a Forge jar inside it")?;
-    let jar_meta_asset = resolve_forge_jar_url().await.unwrap_or_else(|_| asset.clone());
+    let jar_meta_asset = ForgeAsset {
+        download_url: asset.download_url.clone(),
+        name: jar_path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| asset.name.clone()),
+        updated_at: asset.updated_at.clone(),
+    };
     write_asset_meta(&jar_path, &jar_meta_asset);
     cleanup_old_forge_jars(dest_dir, &jar_path);
     Ok(jar_path)
@@ -728,7 +835,14 @@ mod tests {
             ],
         );
 
-        extract_zip_to_dir(zip_path, dest.clone()).await.expect("extraction should succeed");
+        extract_zip_to_dir(
+            zip_path,
+            dest.clone(),
+            Arc::new(|_| {}),
+            Arc::new(AtomicBool::new(false)),
+        )
+        .await
+        .expect("extraction should succeed");
 
         assert!(dest.join("forge.jar").exists(), "jar should be extracted directly into dest_dir, not nested under the wrapper folder");
         assert!(dest.join("res").join("skins").join("default").join("bg_splash.png").exists());
@@ -748,7 +862,14 @@ mod tests {
             &[("forge.jar", b"fake jar".as_slice()), ("res/howto.txt", b"hi".as_slice())],
         );
 
-        extract_zip_to_dir(zip_path, dest.clone()).await.expect("extraction should succeed");
+        extract_zip_to_dir(
+            zip_path,
+            dest.clone(),
+            Arc::new(|_| {}),
+            Arc::new(AtomicBool::new(false)),
+        )
+        .await
+        .expect("extraction should succeed");
 
         assert!(dest.join("forge.jar").exists());
         assert!(dest.join("res").join("howto.txt").exists());
