@@ -68,11 +68,11 @@ pub const JAVA_DOWNLOAD_URL: &str =
 /// Result of probing the system for a usable Java runtime.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum JavaStatus {
-    /// A Java runtime of major version >= 17 is available (via JAVA_HOME or PATH).
-    Ok(u32),
+    /// A Java runtime of major version >= 17 is available (via JAVA_HOME, known directories, or PATH).
+    Ok { major: u32, path: PathBuf },
     /// Java is present but its major version is too old (< 17).
-    TooOld(u32),
-    /// No `java` executable found via JAVA_HOME or PATH.
+    TooOld { major: u32, path: PathBuf },
+    /// No `java` executable found via JAVA_HOME, standard directories, or PATH.
     Missing,
 }
 
@@ -99,8 +99,16 @@ fn parse_java_major(version_output: &str) -> Option<u32> {
 }
 
 /// Run `<java_exe> -version` and parse the major version, if it runs at all.
-fn probe_java_version(java_exe: impl AsRef<std::ffi::OsStr>) -> Option<u32> {
-    let out = Command::new(java_exe).arg("-version").output().ok()?;
+pub fn probe_java_version(java_exe: impl AsRef<std::ffi::OsStr>) -> Option<u32> {
+    let mut cmd = Command::new(java_exe);
+    cmd.arg("-version");
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x08000000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    let out = cmd.output().ok()?;
     // `java -version` writes to stderr; some distributions use stdout.
     let text = if !out.stderr.is_empty() {
         String::from_utf8_lossy(&out.stderr).into_owned()
@@ -111,43 +119,194 @@ fn probe_java_version(java_exe: impl AsRef<std::ffi::OsStr>) -> Option<u32> {
 }
 
 /// True when JAVA_HOME's probed major version is a valid 17+ runtime worth preferring over PATH.
-/// Separated as pure logic so it's testable without a real Java install/JAVA_HOME on the test
-/// machine.
-fn java_home_is_preferred(java_home_major: Option<u32>) -> bool {
+#[allow(dead_code)]
+pub fn java_home_is_preferred(java_home_major: Option<u32>) -> bool {
     matches!(java_home_major, Some(major) if major >= 17)
 }
 
-/// Resolve which `java` command to actually invoke: JAVA_HOME's `java`/`java.exe` if it probes
-/// as a valid 17+ runtime, otherwise bare `"java"` (PATH-resolved).
-///
-/// This is the *single* source of truth for "which Java runs Forge" — used by both the
-/// pre-flight version check (`detect_java`) and the real `java -jar ...` launch command in
-/// `launch_forge`/`launch_forge_replay`, so the two can never disagree. A bare PATH lookup
-/// alone resolves to whatever happens to be *first* on PATH, which on real machines is often an
-/// unrelated, older JRE some other application installed (e.g. a stray Java 8 from a legacy
-/// tool) shadowing a perfectly good Java 17+ install later in PATH or pointed to by JAVA_HOME.
-/// Preferring JAVA_HOME's fully-qualified path sidesteps PATH ordering entirely — no PATH or
-/// registry changes (and no admin rights) required.
-fn resolve_java_command() -> std::ffi::OsString {
+/// Discovers candidate Java executables across the system:
+/// 1. JAVA_HOME environment variable (and Windows registry JAVA_HOME)
+/// 2. Well-known installation directories (Adoptium, Oracle, Microsoft, Corretto, etc.)
+/// 3. Bare "java" command on PATH
+pub fn discover_java_runtimes() -> Vec<(PathBuf, u32)> {
+    let mut candidates = Vec::new();
+    let mut candidate_paths: Vec<PathBuf> = Vec::new();
+
+    // 1. JAVA_HOME in current process
     if let Ok(home) = std::env::var("JAVA_HOME") {
-        let exe = std::path::Path::new(&home)
-            .join("bin")
-            .join(if cfg!(windows) { "java.exe" } else { "java" });
-        if java_home_is_preferred(probe_java_version(&exe)) {
-            return exe.into_os_string();
+        let exe = PathBuf::from(home).join("bin").join(if cfg!(windows) { "java.exe" } else { "java" });
+        candidate_paths.push(exe);
+    }
+
+    // 2. Windows-specific discoveries
+    #[cfg(windows)]
+    {
+        // Query registry for JAVA_HOME (reads changes made after connector started)
+        let reg_queries = [
+            ("HKCU\\Environment", "JAVA_HOME"),
+            ("HKLM\\SYSTEM\\CurrentControlSet\\Control\\Session Manager\\Environment", "JAVA_HOME"),
+        ];
+        for (key, val) in reg_queries {
+            let mut cmd = Command::new("reg");
+            cmd.args(["query", key, "/v", val]);
+            use std::os::windows::process::CommandExt;
+            const CREATE_NO_WINDOW: u32 = 0x08000000;
+            cmd.creation_flags(CREATE_NO_WINDOW);
+            if let Ok(out) = cmd.output() {
+                let text = String::from_utf8_lossy(&out.stdout);
+                for line in text.lines() {
+                    if line.contains(val) && (line.contains("REG_SZ") || line.contains("REG_EXPAND_SZ")) {
+                        if let Some(path_str) = line.split("REG_SZ").nth(1).or_else(|| line.split("REG_EXPAND_SZ").nth(1)) {
+                            let trimmed = path_str.trim();
+                            if !trimmed.is_empty() {
+                                let exe = PathBuf::from(trimmed).join("bin").join("java.exe");
+                                candidate_paths.push(exe);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Standard Windows directories to scan
+        let mut search_roots = Vec::new();
+
+        if let Ok(pf) = std::env::var("ProgramFiles") {
+            let pfb = PathBuf::from(pf);
+            search_roots.push(pfb.join("Eclipse Adoptium"));
+            search_roots.push(pfb.join("Eclipse Foundation"));
+            search_roots.push(pfb.join("Java"));
+            search_roots.push(pfb.join("Microsoft"));
+            search_roots.push(pfb.join("Amazon Corretto"));
+            search_roots.push(pfb.join("BellSoft"));
+            search_roots.push(pfb.join("RedHat"));
+            search_roots.push(pfb.join("Zulu"));
+            search_roots.push(pfb.join("Semeru"));
+        }
+        if let Ok(pfx86) = std::env::var("ProgramFiles(x86)") {
+            let pfb = PathBuf::from(pfx86);
+            search_roots.push(pfb.join("Eclipse Adoptium"));
+            search_roots.push(pfb.join("Java"));
+        }
+        if let Some(local_app_data) = dirs::data_local_dir() {
+            search_roots.push(local_app_data.join("Programs").join("Eclipse Adoptium"));
+            search_roots.push(local_app_data.join("Programs").join("Java"));
+        }
+        if let Some(home) = dirs::home_dir() {
+            search_roots.push(home.join(".jdks"));
+        }
+
+        for root in search_roots {
+            if !root.exists() {
+                continue;
+            }
+            if let Ok(entries) = std::fs::read_dir(&root) {
+                for entry in entries.flatten() {
+                    let p = entry.path();
+                    if p.is_dir() {
+                        let java1 = p.join("bin").join("java.exe");
+                        if java1.exists() {
+                            candidate_paths.push(java1);
+                        }
+                        let java2 = p.join("jre").join("bin").join("java.exe");
+                        if java2.exists() {
+                            candidate_paths.push(java2);
+                        }
+                    }
+                }
+            }
         }
     }
-    std::ffi::OsString::from("java")
+
+    // 3. Unix standard locations
+    #[cfg(target_os = "macos")]
+    {
+        let mac_roots = [
+            PathBuf::from("/Library/Java/JavaVirtualMachines"),
+            dirs::home_dir().map(|h| h.join("Library/Java/JavaVirtualMachines")).unwrap_or_default(),
+        ];
+        for root in mac_roots {
+            if let Ok(entries) = std::fs::read_dir(&root) {
+                for entry in entries.flatten() {
+                    let java = entry.path().join("Contents/Home/bin/java");
+                    if java.exists() {
+                        candidate_paths.push(java);
+                    }
+                }
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        let linux_roots = [
+            PathBuf::from("/usr/lib/jvm"),
+            PathBuf::from("/usr/java"),
+            PathBuf::from("/opt/java"),
+        ];
+        for root in linux_roots {
+            if let Ok(entries) = std::fs::read_dir(&root) {
+                for entry in entries.flatten() {
+                    let java = entry.path().join("bin/java");
+                    if java.exists() {
+                        candidate_paths.push(java);
+                    }
+                }
+            }
+        }
+    }
+
+    // 4. Bare "java" / "java.exe" from PATH
+    let bare_exe = PathBuf::from(if cfg!(windows) { "java.exe" } else { "java" });
+    if let Some(major) = probe_java_version(&bare_exe) {
+        candidates.push((bare_exe, major));
+    }
+
+    // Deduplicate candidate paths and probe them
+    let mut seen_paths = std::collections::HashSet::new();
+    for path in candidate_paths {
+        if path.exists() && seen_paths.insert(path.clone()) {
+            if let Some(major) = probe_java_version(&path) {
+                candidates.push((path, major));
+            }
+        }
+    }
+
+    // Sort: highest major version first, prefer explicit path over bare "java"
+    candidates.sort_by(|a, b| {
+        b.1.cmp(&a.1)
+            .then_with(|| (b.0 != std::path::Path::new("java") && b.0 != std::path::Path::new("java.exe")).cmp(&(a.0 != std::path::Path::new("java") && a.0 != std::path::Path::new("java.exe"))))
+    });
+
+    candidates
 }
 
-/// Detect whether the Java command that will actually be used to launch Forge (see
-/// `resolve_java_command`) is a usable 17+ runtime.
-pub fn detect_java() -> JavaStatus {
-    match probe_java_version(resolve_java_command()) {
-        Some(major) if major >= 17 => JavaStatus::Ok(major),
-        Some(major) => JavaStatus::TooOld(major),
-        None => JavaStatus::Missing,
+/// Resolve which `java` command to actually invoke: the best available 17+ Java executable,
+/// or fallback to bare `"java"` (PATH-resolved).
+fn resolve_java_command() -> std::ffi::OsString {
+    match detect_java() {
+        JavaStatus::Ok { path, .. } => path.into_os_string(),
+        JavaStatus::TooOld { path, .. } => path.into_os_string(),
+        JavaStatus::Missing => std::ffi::OsString::from(if cfg!(windows) { "java.exe" } else { "java" }),
     }
+}
+
+/// Detect whether a usable Java 17+ runtime is available on the system.
+pub fn detect_java() -> JavaStatus {
+    let runtimes = discover_java_runtimes();
+    if let Some((path, major)) = runtimes.iter().find(|(_, m)| *m >= 17) {
+        return JavaStatus::Ok {
+            major: *major,
+            path: path.clone(),
+        };
+    }
+    if let Some((path, major)) = runtimes.first() {
+        return JavaStatus::TooOld {
+            major: *major,
+            path: path.clone(),
+        };
+    }
+    JavaStatus::Missing
 }
 
 /// Get the default Forge installation path based on OS
@@ -505,10 +664,10 @@ pub fn launch_forge(forge_path: &str, deck_name: Option<&str>, deck2_name: Optio
     // Test Launch and deeplink launches report the real, actionable error.
     if extension == "jar" {
         match detect_java() {
-            JavaStatus::Ok(major) => {
-                debug!("[launch_forge] Detected Java {} (OK)", major);
+            JavaStatus::Ok { major, path } => {
+                debug!("[launch_forge] Detected Java {} at {:?} (OK)", major, path);
             }
-            JavaStatus::TooOld(major) => {
+            JavaStatus::TooOld { major, .. } => {
                 return Ok(ForgeLaunchResult::failure(format!(
                     "Forge needs Java 17 or newer, but Java {} was found. \
                      Install Java 17 (Adoptium Temurin) and try again.",

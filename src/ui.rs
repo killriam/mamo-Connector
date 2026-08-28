@@ -3081,17 +3081,18 @@ impl LauncherApp {
                         self.wizard.java_status = Some(crate::forge::detect_java());
                     }
                     match self.wizard.java_status.clone() {
-                        Some(crate::forge::JavaStatus::Ok(major)) => {
+                        Some(crate::forge::JavaStatus::Ok { major, path }) => {
+                            let display_path = path.to_string_lossy();
                             ui.label(
-                                egui::RichText::new(format!("✓ Java {major} detected"))
+                                egui::RichText::new(format!("✓ Java {major} detected ({display_path})"))
                                     .color(egui::Color32::from_rgb(0, 150, 0))
                                     .small(),
                             );
                         }
                         Some(status) => {
                             let msg = match status {
-                                crate::forge::JavaStatus::TooOld(m) => format!(
-                                    "⚠ Java {m} found, but Forge needs Java 17 or newer."
+                                crate::forge::JavaStatus::TooOld { major, .. } => format!(
+                                    "⚠ Java {major} found, but Forge needs Java 17 or newer."
                                 ),
                                 _ => "⚠ Java 17 is required to run Forge, but none was found.".to_string(),
                             };
@@ -3107,7 +3108,7 @@ impl LauncherApp {
                                     );
                                     ui.add_space(6.0);
                                     ui.horizontal(|ui| {
-                                        if ui.button("📥 Download Java 17").clicked() {
+                                        if ui.button("📥 Download Java 17 (Adoptium)").clicked() {
                                             let _ = std::process::Command::new("cmd")
                                                 .args(["/c", "start", crate::forge::JAVA_DOWNLOAD_URL])
                                                 .spawn();
@@ -3119,12 +3120,9 @@ impl LauncherApp {
                                     ui.add_space(4.0);
                                     ui.label(
                                         egui::RichText::new(
-                                            "That page offers two options: the .msi installer is \
-                                             easiest, but needs administrator rights. No admin \
-                                             rights? Pick the .zip instead — extract it anywhere, \
-                                             then set a JAVA_HOME environment variable (your own \
-                                             account, no admin needed) pointing at that folder, \
-                                             and click Re-check."
+                                            "After running the Java installer, click Re-check. \
+                                             MaMo Connector will automatically scan standard \
+                                             directories (like Program Files) and detect Java 17+."
                                         )
                                         .small()
                                         .color(egui::Color32::from_rgb(150, 80, 0)),
