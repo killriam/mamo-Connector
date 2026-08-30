@@ -686,6 +686,33 @@ struct ScenarioPickerState {
     error_message: Option<String>,
 }
 
+/// Interval before the next periodic auto-scan, given how many consecutive scans in a
+/// row uploaded nothing and had failures (e.g. backend/DB unavailable). Doubles from the
+/// normal 5-minute cadence up to a 1-hour ceiling, so a sustained backend outage doesn't
+/// keep retrying the same failing files every 5 minutes indefinitely.
+fn auto_scan_interval_secs(consecutive_failures: u32) -> u64 {
+    const BASE_SECS: u64 = 5 * 60;
+    const MAX_SECS: u64 = 60 * 60;
+    BASE_SECS.saturating_mul(1u64 << consecutive_failures.min(4)).min(MAX_SECS)
+}
+
+#[cfg(test)]
+mod auto_scan_backoff_tests {
+    use super::*;
+
+    #[test]
+    fn backs_off_by_doubling_and_caps_at_one_hour() {
+        assert_eq!(auto_scan_interval_secs(0), 5 * 60);
+        assert_eq!(auto_scan_interval_secs(1), 10 * 60);
+        assert_eq!(auto_scan_interval_secs(2), 20 * 60);
+        assert_eq!(auto_scan_interval_secs(3), 40 * 60);
+        assert_eq!(auto_scan_interval_secs(4), 60 * 60);
+        // Stays capped rather than continuing to double (and never overflows).
+        assert_eq!(auto_scan_interval_secs(10), 60 * 60);
+        assert_eq!(auto_scan_interval_secs(u32::MAX), 60 * 60);
+    }
+}
+
 /// State for the game log tab
 #[derive(Clone, Default)]
 #[allow(dead_code)]
@@ -706,6 +733,11 @@ struct GameLogState {
     scan_results: Vec<GameLogProcessResult>,
     /// Summary from last scan
     last_scan_summary: Option<ScanSummary>,
+    /// Consecutive periodic auto-scans that uploaded nothing and had at least one
+    /// failure (e.g. backend/DB unavailable). Drives exponential backoff on the
+    /// scan interval so a sustained outage doesn't retry every 5 minutes forever;
+    /// reset to 0 as soon as a scan uploads something or has zero failures.
+    consecutive_auto_scan_failures: u32,
     /// Processed files set
     processed_files: HashSet<String>,
     /// User's decks from backend (for deck mapping)
@@ -1451,12 +1483,27 @@ impl eframe::App for LauncherApp {
                         }
                         false
                     }
-                    Some(last) => now.duration_since(last).as_secs() >= 300,
+                    Some(last) => {
+                        let consecutive_failures =
+                            self.gamelog_state.lock().unwrap().consecutive_auto_scan_failures;
+                        now.duration_since(last).as_secs()
+                            >= auto_scan_interval_secs(consecutive_failures)
+                    }
                 };
 
                 if should_scan && has_token {
+                    let consecutive_failures =
+                        self.gamelog_state.lock().unwrap().consecutive_auto_scan_failures;
                     if let Ok(mut log) = self.activity_log.lock() {
-                        log.log_info("\u{1F504} Auto gamelog scan (periodic 5 min)");
+                        if consecutive_failures > 0 {
+                            log.log_info(format!(
+                                "\u{1F504} Auto gamelog scan (retrying after {} failed attempt(s), backed off to {}m)",
+                                consecutive_failures,
+                                auto_scan_interval_secs(consecutive_failures) / 60
+                            ));
+                        } else {
+                            log.log_info("\u{1F504} Auto gamelog scan (periodic 5 min)");
+                        }
                     }
                     self.start_auto_gamelog_scan(ctx, false);
                     self.last_auto_gamelog_scan = Some(now);
@@ -5072,7 +5119,17 @@ impl LauncherApp {
                 match result {
                     Ok(summary) => {
                         state.scan_results = summary.results.clone();
-                        
+
+                        // Back off the periodic interval when a scan uploads nothing and
+                        // has failures (e.g. backend down); reset as soon as anything
+                        // actually gets through, or a scan comes back clean.
+                        if summary.failed_uploads > 0 && summary.successfully_uploaded == 0 {
+                            state.consecutive_auto_scan_failures =
+                                state.consecutive_auto_scan_failures.saturating_add(1);
+                        } else {
+                            state.consecutive_auto_scan_failures = 0;
+                        }
+
                         // Update processed files
                         let new_processed = processed_files.lock().unwrap().clone();
                         state.processed_files = new_processed.clone();
@@ -5151,6 +5208,8 @@ impl LauncherApp {
                         state.last_scan_summary = Some(summary);
                     }
                     Err(e) => {
+                        state.consecutive_auto_scan_failures =
+                            state.consecutive_auto_scan_failures.saturating_add(1);
                         if let Ok(mut log) = activity_log.lock() {
                             log.log_error(format!("Auto-scan error: {}", e));
                         }
