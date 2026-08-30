@@ -210,13 +210,25 @@ pub async fn resolve_forge_jar_url() -> Result<ForgeAsset> {
     .await
 }
 
+/// Name of the loose resource folder Forge reads next to its jar (card scripts, skins, etc. —
+/// not on the classpath, so a jar swap alone never refreshes it). Shared by every place that
+/// needs to name that folder rather than repeating the string literal.
+const RES_DIR_NAME: &str = "res";
+
 /// Path to the sidecar metadata file recording which release asset a given Forge JAR was
 /// downloaded from (`<jar-path>.source.json`).
 pub fn asset_meta_path(jar_path: &Path) -> PathBuf {
     PathBuf::from(format!("{}.source.json", jar_path.display()))
 }
 
-/// Sidecar metadata persisted next to each downloaded Forge JAR.
+/// Path to the sidecar metadata file recording which portable-zip release asset `res/` was last
+/// extracted from (`res.source.json`, living in the install directory next to `res/` and the
+/// jar rather than inside `res/` itself, so it survives if `res/` is ever wholesale replaced).
+pub fn res_meta_path(dest_dir: &Path) -> PathBuf {
+    dest_dir.join("res.source.json")
+}
+
+/// Sidecar metadata persisted next to each downloaded Forge JAR, or for the `res/` folder.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub struct ForgeAssetMeta {
     pub download_url: String,
@@ -224,18 +236,17 @@ pub struct ForgeAssetMeta {
     pub updated_at: String,
 }
 
-/// Persists the sidecar metadata for a downloaded Forge JAR. Silently logs and ignores write
-/// errors so sidecar issues never break an otherwise-successful download.
-pub fn write_asset_meta(jar_path: &Path, asset: &ForgeAsset) {
+/// Writes `asset`'s metadata as JSON to `meta_path`. Silently logs and ignores write errors so
+/// sidecar issues never break an otherwise-successful download.
+fn write_meta_at(meta_path: &Path, asset: &ForgeAsset) {
     let meta = ForgeAssetMeta {
         download_url: asset.download_url.clone(),
         name: asset.name.clone(),
         updated_at: asset.updated_at.clone(),
     };
-    let meta_path = asset_meta_path(jar_path);
     match serde_json::to_string_pretty(&meta) {
         Ok(json) => {
-            if let Err(e) = std::fs::write(&meta_path, json) {
+            if let Err(e) = std::fs::write(meta_path, json) {
                 log::warn!("Failed to write Forge asset metadata to {:?}: {e}", meta_path);
             }
         }
@@ -243,18 +254,43 @@ pub fn write_asset_meta(jar_path: &Path, asset: &ForgeAsset) {
     }
 }
 
-/// Reads the `updated_at` timestamp from a Forge JAR's sidecar metadata file, if present.
-/// Returns `None` if the sidecar is missing, unreadable, or invalid JSON (which causes the
-/// updater to treat the local jar as "unknown, might be stale" rather than assuming it's current).
-pub fn read_asset_meta_updated_at(jar_path: &Path) -> Option<String> {
-    let meta_path = asset_meta_path(jar_path);
-    let bytes = std::fs::read(&meta_path).ok()?;
+/// Reads the `updated_at` timestamp from a sidecar metadata file at `meta_path`, if present.
+/// Returns `None` if the sidecar is missing, unreadable, or invalid JSON (which causes callers
+/// to treat the local copy as "unknown, might be stale" rather than assuming it's current).
+fn read_meta_updated_at_from(meta_path: &Path) -> Option<String> {
+    let bytes = std::fs::read(meta_path).ok()?;
     let meta: ForgeAssetMeta = serde_json::from_slice(&bytes).ok()?;
     if meta.updated_at.is_empty() {
         None
     } else {
         Some(meta.updated_at)
     }
+}
+
+/// Persists the sidecar metadata for a downloaded Forge JAR.
+pub fn write_asset_meta(jar_path: &Path, asset: &ForgeAsset) {
+    write_meta_at(&asset_meta_path(jar_path), asset);
+}
+
+/// Reads the `updated_at` timestamp from a Forge JAR's sidecar metadata file, if present.
+pub fn read_asset_meta_updated_at(jar_path: &Path) -> Option<String> {
+    read_meta_updated_at_from(&asset_meta_path(jar_path))
+}
+
+/// Persists the sidecar metadata recording which portable-zip build `res/` was extracted from.
+pub fn write_res_meta(dest_dir: &Path, asset: &ForgeAsset) {
+    write_meta_at(&res_meta_path(dest_dir), asset);
+}
+
+/// Reads the `updated_at` timestamp of the portable-zip build `res/` was last extracted from.
+pub fn read_res_meta_updated_at(dest_dir: &Path) -> Option<String> {
+    read_meta_updated_at_from(&res_meta_path(dest_dir))
+}
+
+/// True when `remote_updated_at` doesn't match whatever's recorded locally — i.e. a sidecar
+/// that's missing (`None`) is always treated as stale, never as "assume current".
+fn is_stale(local_updated_at: Option<&str>, remote_updated_at: &str) -> bool {
+    local_updated_at != Some(remote_updated_at)
 }
 
 /// Streams `download_url` into `dest_dir/filename`, reporting progress and honoring
@@ -452,48 +488,144 @@ pub async fn download_forge_portable(
         updated_at: asset.updated_at.clone(),
     };
     write_asset_meta(&jar_path, &jar_meta_asset);
+    // res/ was just extracted from this exact zip — record it as the freshness baseline so a
+    // later check doesn't immediately think res/ is behind.
+    write_res_meta(dest_dir, &asset);
     cleanup_old_forge_jars(dest_dir, &jar_path);
     Ok(jar_path)
 }
 
-/// Downloads just the standalone JAR into `dest_dir` **under a staging filename**
-/// (`<name>.update`) rather than replacing the live jar directly — used by the background
-/// auto-updater to update an install that already has `res/` from a previous
-/// `download_forge_portable` call. Downloading in place used to risk writing over a jar Forge
-/// might currently have open; the caller now finalizes the swap itself (rename staged → live)
-/// once it has confirmed Forge isn't running — see `finalize_staged_forge_jar`.
+/// Determines what (if anything) needs refreshing in the MaMo Forge install at `dest_dir`.
+/// Returns `Ok(None)` if nothing is installed yet (not this function's job — see
+/// `download_forge_portable`) or everything already matches the latest release. Otherwise
+/// returns `Ok(Some(asset))` — the specific release asset a caller should download — where the
+/// **kind of asset returned tells you what changed**: a `...-jar-with-dependencies.jar` asset
+/// means only the jar differs, while a `.zip` (portable bundle) asset means `res/` itself needs
+/// re-extracting.
 ///
-/// Calls `on_progress` after each received chunk. Checks `cancelled` before each chunk — if
-/// set, deletes the partial file and returns an error.
+/// `res/` is loose data (card scripts, skins, etc.) that Forge reads from disk next to the jar
+/// rather than from the jar's classpath, so a build whose fix lives only in `res/` ships no
+/// different bytes in the jar. Comparing only the jar's `updated_at` (as this function's
+/// predecessor did) could report "up to date" forever while `res/` silently stayed on whatever
+/// build first installed it — the auto-updater never had a way to notice or refresh it. This
+/// checks `res/`'s own freshness (via the `res.source.json` sidecar written whenever `res/` is
+/// (re)extracted, against the portable zip's `updated_at`) *before* the jar comparison, and asks
+/// for a full bundle refresh whenever `res/` might be behind — the jar comparison only runs, and
+/// only a jar-only refresh is requested, once `res/` is confirmed current.
+pub async fn resolve_forge_update_needed(dest_dir: &Path) -> Result<Option<ForgeAsset>> {
+    let Some(local_jar) = crate::forge::resolve_latest_forge_jar(dest_dir) else {
+        return Ok(None);
+    };
+
+    let res_dir = dest_dir.join(RES_DIR_NAME);
+    let local_res_updated_at = if res_dir.is_dir() { read_res_meta_updated_at(dest_dir) } else { None };
+    let remote_zip = resolve_forge_portable_zip_url()
+        .await
+        .context("Could not resolve MaMo Forge portable bundle URL")?;
+    if !res_dir.is_dir() || is_stale(local_res_updated_at.as_deref(), &remote_zip.updated_at) {
+        return Ok(Some(remote_zip));
+    }
+
+    let local_jar_updated_at = read_asset_meta_updated_at(&local_jar);
+    let remote_jar = resolve_forge_jar_url()
+        .await
+        .context("Could not resolve Forge JAR download URL")?;
+    if is_stale(local_jar_updated_at.as_deref(), &remote_jar.updated_at) {
+        Ok(Some(remote_jar))
+    } else {
+        Ok(None)
+    }
+}
+
+/// Downloads whatever `resolve_forge_update_needed` says is required into `dest_dir` **staged**
+/// rather than replacing the live install directly, so a caller can finalize the swap (via
+/// `finalize_staged_forge_update`) only once Forge is confirmed not running.
 ///
-/// Returns the staged file's path and the resolved asset info (needed to write the sidecar
-/// metadata once finalized) on success.
-pub async fn download_forge_jar_staged(
+/// - A jar-only update stages to `<name>.update`, a single file — mirrors the old
+///   `download_forge_jar_staged` behavior exactly.
+/// - A full-bundle update (asset name ends in `.zip`) downloads the portable zip and extracts it
+///   into a staging directory (`.forge-update-staging`) containing a fresh jar + `res/` together,
+///   so they can never end up mismatched from two different builds.
+///
+/// Returns the staged path (file or directory — `finalize_staged_forge_update` tells them apart)
+/// and the resolved asset info, needed to write sidecar metadata once finalized.
+pub async fn download_forge_update_staged(
     dest_dir: &Path,
     on_progress: impl Fn(DownloadUpdate) + Send + Sync + 'static,
     cancelled: Arc<AtomicBool>,
 ) -> Result<(PathBuf, ForgeAsset)> {
-    let asset = resolve_forge_jar_url()
-        .await
-        .context("Could not resolve Forge JAR download URL")?;
-    let staging_name = format!("{}.update", asset.name);
-    let staged_path =
-        download_to_file(&asset.download_url, dest_dir, &staging_name, &on_progress, &cancelled).await?;
-    Ok((staged_path, asset))
+    let asset = resolve_forge_update_needed(dest_dir)
+        .await?
+        .context("MaMo Forge is already up to date")?;
+
+    if asset.name.ends_with(".zip") {
+        let staging_dir = dest_dir.join(".forge-update-staging");
+        let _ = std::fs::remove_dir_all(&staging_dir);
+
+        let on_progress_arc: Arc<dyn Fn(DownloadUpdate) + Send + Sync> = Arc::new(on_progress);
+        let progress_cb = {
+            let arc = Arc::clone(&on_progress_arc);
+            move |up| arc(up)
+        };
+        let staging_name = format!("{}.update", asset.name);
+        let zip_path =
+            download_to_file(&asset.download_url, dest_dir, &staging_name, &progress_cb, &cancelled).await?;
+        extract_zip_to_dir(zip_path.clone(), staging_dir.clone(), Arc::clone(&on_progress_arc), Arc::clone(&cancelled))
+            .await
+            .context("Downloaded MaMo Forge update but failed to extract it")?;
+        let _ = std::fs::remove_file(&zip_path);
+        Ok((staging_dir, asset))
+    } else {
+        let staging_name = format!("{}.update", asset.name);
+        let staged_path =
+            download_to_file(&asset.download_url, dest_dir, &staging_name, &on_progress, &cancelled).await?;
+        Ok((staged_path, asset))
+    }
 }
 
-/// Swaps a staged download (from `download_forge_jar_staged`) into place as `dest_dir/<asset
-/// name>`, replacing whatever's there, and records the sidecar metadata. Caller is responsible
-/// for confirming Forge isn't currently running before calling this — an atomic rename is safe
-/// against a *closed* Forge's next launch reading a half-written file, but not against a
-/// *currently open* Forge that might still be reading from the path being replaced.
-pub fn finalize_staged_forge_jar(dest_dir: &Path, staged_path: &Path, asset: &ForgeAsset) -> Result<PathBuf> {
-    let final_path = dest_dir.join(&asset.name);
-    std::fs::rename(staged_path, &final_path)
-        .with_context(|| format!("Failed to move staged Forge update into place at {:?}", final_path))?;
-    write_asset_meta(&final_path, asset);
-    cleanup_old_forge_jars(dest_dir, &final_path);
-    Ok(final_path)
+/// Swaps a staged download (from `download_forge_update_staged`) into place, replacing whatever
+/// jar (and, for a full-bundle update, `res/`) is currently there, and records sidecar metadata.
+/// Caller is responsible for confirming Forge isn't currently running before calling this — an
+/// atomic rename is safe against a *closed* Forge's next launch reading a half-written file, but
+/// not against a *currently open* Forge that might still be reading from the path being replaced.
+pub fn finalize_staged_forge_update(dest_dir: &Path, staged_path: &Path, asset: &ForgeAsset) -> Result<PathBuf> {
+    if staged_path.is_dir() {
+        let staged_jar = crate::forge::resolve_latest_forge_jar(staged_path)
+            .context("Staged MaMo Forge bundle has no jar inside it")?;
+        let final_jar = dest_dir.join(
+            staged_jar
+                .file_name()
+                .context("Staged MaMo Forge jar has no filename")?,
+        );
+
+        let staged_res = staged_path.join(RES_DIR_NAME);
+        if staged_res.is_dir() {
+            let final_res = dest_dir.join(RES_DIR_NAME);
+            if final_res.exists() {
+                std::fs::remove_dir_all(&final_res)
+                    .with_context(|| format!("Failed to remove stale res/ at {:?}", final_res))?;
+            }
+            std::fs::rename(&staged_res, &final_res)
+                .with_context(|| format!("Failed to move staged res/ into place at {:?}", final_res))?;
+            write_res_meta(dest_dir, asset);
+        } else {
+            log::warn!("Staged MaMo Forge bundle at {:?} had no res/ folder inside it", staged_path);
+        }
+
+        std::fs::rename(&staged_jar, &final_jar)
+            .with_context(|| format!("Failed to move staged Forge update into place at {:?}", final_jar))?;
+        write_asset_meta(&final_jar, asset);
+        cleanup_old_forge_jars(dest_dir, &final_jar);
+        let _ = std::fs::remove_dir_all(staged_path);
+        Ok(final_jar)
+    } else {
+        let final_path = dest_dir.join(&asset.name);
+        std::fs::rename(staged_path, &final_path)
+            .with_context(|| format!("Failed to move staged Forge update into place at {:?}", final_path))?;
+        write_asset_meta(&final_path, asset);
+        cleanup_old_forge_jars(dest_dir, &final_path);
+        Ok(final_path)
+    }
 }
 
 /// Cleans up any old Forge JAR files (matching `forge-gui-desktop-*-jar-with-dependencies.jar`)
@@ -920,7 +1052,7 @@ mod tests {
     }
 
     #[test]
-    fn finalize_staged_forge_jar_moves_file_into_place_and_writes_meta() {
+    fn finalize_staged_forge_update_moves_jar_only_file_into_place_and_writes_meta() {
         let dest = std::env::temp_dir().join("mamo-connector-finalize-test");
         let _ = std::fs::remove_dir_all(&dest);
         std::fs::create_dir_all(&dest).unwrap();
@@ -937,7 +1069,7 @@ mod tests {
         std::fs::write(&final_path_expected, b"old jar contents").unwrap();
 
         let final_path =
-            finalize_staged_forge_jar(&dest, &staged_path, &asset).expect("finalize should succeed");
+            finalize_staged_forge_update(&dest, &staged_path, &asset).expect("finalize should succeed");
 
         assert_eq!(final_path, final_path_expected);
         assert!(!staged_path.exists(), "staged file should have been moved, not copied");
@@ -946,6 +1078,106 @@ mod tests {
             read_asset_meta_updated_at(&final_path),
             Some("2026-08-14T08:55:25Z".to_string())
         );
+
+        let _ = std::fs::remove_dir_all(&dest);
+    }
+
+    #[test]
+    fn res_meta_round_trips_through_sidecar_file() {
+        let dest = std::env::temp_dir().join("mamo-connector-res-meta-test-roundtrip");
+        let _ = std::fs::remove_dir_all(&dest);
+        std::fs::create_dir_all(&dest).unwrap();
+
+        let asset = ForgeAsset {
+            download_url: "https://example.com/MaMoForge-portable.zip".to_string(),
+            name: "MaMoForge-portable.zip".to_string(),
+            updated_at: "2026-08-18T04:37:33Z".to_string(),
+        };
+        write_res_meta(&dest, &asset);
+
+        assert_eq!(
+            read_res_meta_updated_at(&dest),
+            Some("2026-08-18T04:37:33Z".to_string())
+        );
+
+        let _ = std::fs::remove_dir_all(&dest);
+    }
+
+    #[test]
+    fn res_meta_is_none_when_sidecar_missing() {
+        // A res/ folder extracted before this fix shipped has no sidecar — the staleness check
+        // must treat that as "unknown, refresh it" rather than silently assuming it's current.
+        let dest = std::env::temp_dir().join("mamo-connector-res-meta-test-missing");
+        let _ = std::fs::remove_dir_all(&dest);
+        std::fs::create_dir_all(&dest).unwrap();
+
+        assert_eq!(read_res_meta_updated_at(&dest), None);
+
+        let _ = std::fs::remove_dir_all(&dest);
+    }
+
+    #[test]
+    fn is_stale_treats_missing_local_as_stale() {
+        assert!(is_stale(None, "2026-08-18T04:37:33Z"));
+    }
+
+    #[test]
+    fn is_stale_treats_matching_timestamp_as_fresh() {
+        assert!(!is_stale(Some("2026-08-18T04:37:33Z"), "2026-08-18T04:37:33Z"));
+    }
+
+    #[test]
+    fn is_stale_treats_older_timestamp_as_stale() {
+        assert!(is_stale(Some("2026-08-13T20:20:00Z"), "2026-08-18T04:37:33Z"));
+    }
+
+    #[test]
+    fn finalize_staged_forge_update_swaps_full_bundle_jar_and_res_together() {
+        let dest = std::env::temp_dir().join("mamo-connector-finalize-bundle-test");
+        let _ = std::fs::remove_dir_all(&dest);
+        std::fs::create_dir_all(&dest).unwrap();
+
+        // An old install already in place: a stale jar and a stale res/ file.
+        let old_jar = dest.join("forge-gui-desktop-2.0.14-SNAPSHOT-08.13-2020-jar-with-dependencies.jar");
+        std::fs::write(&old_jar, b"old jar contents").unwrap();
+        std::fs::create_dir_all(dest.join("res").join("cardsfolder")).unwrap();
+        std::fs::write(dest.join("res").join("cardsfolder").join("some_card.txt"), b"old card text").unwrap();
+
+        // A staged full-bundle extraction (what download_forge_update_staged would produce).
+        let staged_dir = dest.join(".forge-update-staging");
+        let staged_jar = staged_dir.join("forge-gui-desktop-2.0.15-SNAPSHOT-08.26-0432-jar-with-dependencies.jar");
+        std::fs::create_dir_all(&staged_dir).unwrap();
+        std::fs::write(&staged_jar, b"new jar contents").unwrap();
+        std::fs::create_dir_all(staged_dir.join("res").join("cardsfolder")).unwrap();
+        std::fs::write(staged_dir.join("res").join("cardsfolder").join("some_card.txt"), b"new card text").unwrap();
+
+        let asset = ForgeAsset {
+            download_url: "https://example.com/MaMoForge-portable.zip".to_string(),
+            name: "MaMoForge-portable.zip".to_string(),
+            updated_at: "2026-08-26T04:32:00Z".to_string(),
+        };
+
+        let final_jar = finalize_staged_forge_update(&dest, &staged_dir, &asset)
+            .expect("finalize should succeed");
+
+        assert_eq!(final_jar, dest.join("forge-gui-desktop-2.0.15-SNAPSHOT-08.26-0432-jar-with-dependencies.jar"));
+        assert!(!old_jar.exists(), "old jar should have been cleaned up");
+        assert_eq!(std::fs::read(&final_jar).unwrap(), b"new jar contents");
+        assert_eq!(
+            std::fs::read(dest.join("res").join("cardsfolder").join("some_card.txt")).unwrap(),
+            b"new card text",
+            "res/ should have been replaced wholesale with the staged bundle's res/"
+        );
+        assert_eq!(
+            read_asset_meta_updated_at(&final_jar),
+            Some("2026-08-26T04:32:00Z".to_string())
+        );
+        assert_eq!(
+            read_res_meta_updated_at(&dest),
+            Some("2026-08-26T04:32:00Z".to_string()),
+            "res/ freshness sidecar should now match the build it was refreshed from"
+        );
+        assert!(!staged_dir.exists(), "staging directory should be cleaned up after finalize");
 
         let _ = std::fs::remove_dir_all(&dest);
     }

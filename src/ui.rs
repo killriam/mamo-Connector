@@ -444,34 +444,31 @@ fn is_connector_managed_forge(forge_path: &str, forge_download_dir: &std::path::
     !forge_path.is_empty() && std::path::Path::new(forge_path) == forge_download_dir
 }
 
-/// Compare the locally-downloaded MaMo Forge jar against whatever's currently published under
-/// the `replay-features-latest` tag. Returns `Ok(Some(asset))` when a different build is available
-/// (with everything needed to immediately start downloading it), `Ok(None)` when they already match,
-/// or `Err(msg)` if the check failed.
-///
-/// Compares GitHub's per-asset `updated_at` timestamp, not the filename: `replay-features-latest`
-/// is a rolling tag that gets re-published from a new commit under the exact same (fixed
-/// `-SNAPSHOT-`) asset name, so a filename comparison can never detect a same-named republish —
-/// confirmed as the reason a build containing a real fix (FORGE_REPLAY_BUG.md) sat published for
-/// a full day while a stale local jar was never flagged as out of date. An older download with no
-/// recorded `updated_at` (predates this fix, or a user-provided Forge path outside our management)
-/// is treated as "unknown, assume an update may be available" rather than silently assumed current.
+/// Compare the locally-downloaded MaMo Forge install against whatever's currently published
+/// under the `replay-features-latest` tag. Returns `Ok(Some(asset))` when a refresh is needed
+/// (with everything needed to immediately start downloading it), `Ok(None)` when everything
+/// already matches, or `Err(msg)` if the check failed. The returned asset's name tells you what
+/// changed: a `...-jar-with-dependencies.jar` asset means only the jar differs, a `.zip` asset
+/// means `res/` (card scripts, skins — loose data Forge reads next to the jar, not from its
+/// classpath) itself needs re-extracting — see `resolve_forge_update_needed`'s doc comment for
+/// why that distinction exists and why a jar-only comparison alone used to leave `res/`
+/// permanently stale after the first install. Delegates to `crate::download` so every call site
+/// (background auto-update, pre-launch prompt) shares the same staleness logic.
 async fn check_forge_update_available() -> Result<Option<crate::download::ForgeAsset>, String> {
-    let local_jar = match crate::forge::resolve_latest_forge_jar(&forge_download_dir()) {
-        Some(j) => j,
-        None => return Ok(None),
-    };
-    let local_updated_at = crate::download::read_asset_meta_updated_at(&local_jar);
-
-    // The update path only ever re-fetches the standalone JAR (see start_forge_auto_update /
-    // download_forge_jar_staged) — compare against that asset, not the portable zip.
-    let remote = crate::download::resolve_forge_jar_url()
+    crate::download::resolve_forge_update_needed(&forge_download_dir())
         .await
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| e.to_string())
+}
 
-    match local_updated_at {
-        Some(updated_at) if updated_at == remote.updated_at => Ok(None),
-        _ => Ok(Some(remote)),
+/// Activity-log message for a completed Forge update, distinguishing a full bundle refresh
+/// (jar + `res/`) from a jar-only one — surfaces which kind of update happened so a user or
+/// support person can tell at a glance whether card data was refreshed, rather than every
+/// update looking identical in the log regardless of what it actually touched.
+fn forge_update_success_message(asset: &crate::download::ForgeAsset) -> String {
+    if asset.name.ends_with(".zip") {
+        "MaMo Forge updated to the latest build (including refreshed card data).".to_string()
+    } else {
+        "MaMo Forge updated to the latest build.".to_string()
     }
 }
 
@@ -537,7 +534,7 @@ async fn run_forge_update_check_and_download(
         let progress_bg = Arc::clone(&forge_update_progress);
         let ctx_progress = ctx.clone();
         let cancelled_clone = Arc::clone(&cancelled);
-        let outcome = crate::download::download_forge_jar_staged(
+        let outcome = crate::download::download_forge_update_staged(
             &dest_dir,
             move |update| {
                 if let Ok(mut guard) = progress_bg.lock() {
@@ -1319,10 +1316,10 @@ impl eframe::App for LauncherApp {
                         match res {
                             Ok(staged_path) => {
                                 let forge_dir = forge_download_dir();
-                                match crate::download::finalize_staged_forge_jar(&forge_dir, &staged_path, asset) {
+                                match crate::download::finalize_staged_forge_update(&forge_dir, &staged_path, asset) {
                                     Ok(_) => {
                                         if let Ok(mut log) = self.activity_log.lock() {
-                                            log.log_success("MaMo Forge updated to latest version.");
+                                            log.log_success(forge_update_success_message(asset));
                                         }
                                     }
                                     Err(e) => {
@@ -2418,10 +2415,10 @@ impl LauncherApp {
                 let staged_path = self.forge_update_check.lock().unwrap().staged.as_ref().map(|s| s.staged_path.clone());
                 if let Some(staged_path) = staged_path {
                     let forge_dir = forge_download_dir();
-                    match crate::download::finalize_staged_forge_jar(&forge_dir, &staged_path, &asset) {
+                    match crate::download::finalize_staged_forge_update(&forge_dir, &staged_path, &asset) {
                         Ok(_) => {
                             if let Ok(mut log) = self.activity_log.lock() {
-                                log.log_success("MaMo Forge updated to latest version.");
+                                log.log_success(forge_update_success_message(&asset));
                             }
                         }
                         Err(e) => {
@@ -2455,7 +2452,7 @@ impl LauncherApp {
                 let dest_dir = forge_download_dir();
                 let ctx_callback = ctx_bg.clone();
                 let outcome = runtime.block_on(async {
-                    crate::download::download_forge_jar_staged(
+                    crate::download::download_forge_update_staged(
                         &dest_dir,
                         move |update| {
                             if let Ok(mut guard) = progress_bg.lock() {
@@ -2825,10 +2822,10 @@ impl LauncherApp {
         }
 
         let forge_dir = forge_download_dir();
-        match crate::download::finalize_staged_forge_jar(&forge_dir, &staged.staged_path, &staged.asset) {
+        match crate::download::finalize_staged_forge_update(&forge_dir, &staged.staged_path, &staged.asset) {
             Ok(_final_path) => {
                 if let Ok(mut log) = self.activity_log.lock() {
-                    log.log_success("MaMo Forge updated to the latest build.");
+                    log.log_success(forge_update_success_message(&staged.asset));
                 }
             }
             Err(e) => {
