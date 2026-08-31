@@ -198,8 +198,14 @@ async fn resolve_forge_asset_url(matches: impl Fn(&str) -> bool) -> Result<Forge
 
 /// Resolves the portable bundle (JAR + `res/` resources) — what a fresh install needs, since
 /// Forge looks for `res/` as loose files next to the jar, not on the classpath.
+///
+/// Must not match on a bare `.zip` suffix: the release also publishes `MaMoForge-patch.zip` (an
+/// incremental JAR + partial-`res/` update), and matching either name would let tie-breaking in
+/// `select_matching_forge_asset` (by `updated_at`, then name) pick the wrong one by accident of
+/// upload order instead of by contract — silently shipping the patch zip's incomplete `res/` to a
+/// fresh install, which crashes Forge with "Cannot find default skin".
 pub async fn resolve_forge_portable_zip_url() -> Result<ForgeAsset> {
-    resolve_forge_asset_url(|n| n.ends_with(".zip")).await
+    resolve_forge_asset_url(|n| n.ends_with("-portable.zip")).await
 }
 
 /// Resolves just the standalone Forge executable JAR (`forge-gui-desktop-*-jar-with-dependencies.jar`).
@@ -1212,6 +1218,37 @@ mod tests {
         let matched_zip = select_matching_forge_asset(assets, &|n| n.ends_with(".zip"));
         assert!(matched_zip.is_some());
         assert_eq!(matched_zip.unwrap().name, "MaMoForge-portable.zip");
+    }
+
+    /// Regression test for the release publishing a second `.zip` asset (`MaMoForge-patch.zip`,
+    /// the incremental JAR + partial-`res/` update introduced alongside `MaMoForge-portable.zip`).
+    /// A bare `n.ends_with(".zip")` predicate matches both, and `select_matching_forge_asset`'s
+    /// tie-break (newest `updated_at`, then name) would silently pick whichever asset happens to
+    /// finish uploading last in a given CI run — not necessarily the portable bundle. This
+    /// exercises the adversarial ordering (patch uploaded *after* portable, so a naive predicate
+    /// would pick patch) to prove the real `-portable.zip` predicate is immune to upload order.
+    #[test]
+    fn portable_zip_predicate_ignores_patch_zip_even_when_patch_is_newer() {
+        let assets = vec![
+            ForgeAsset {
+                download_url: "https://example.com/MaMoForge-portable.zip".to_string(),
+                name: "MaMoForge-portable.zip".to_string(),
+                updated_at: "2026-08-31T04:19:42Z".to_string(),
+            },
+            ForgeAsset {
+                download_url: "https://example.com/MaMoForge-patch.zip".to_string(),
+                name: "MaMoForge-patch.zip".to_string(),
+                updated_at: "2026-08-31T04:19:48Z".to_string(),
+            },
+        ];
+
+        // The bare-suffix predicate the old code used: ambiguous, picks patch here since it's newer.
+        let naive_match = select_matching_forge_asset(assets.clone(), &|n| n.ends_with(".zip"));
+        assert_eq!(naive_match.unwrap().name, "MaMoForge-patch.zip");
+
+        // The fixed predicate: unambiguous regardless of which asset is newer.
+        let fixed_match = select_matching_forge_asset(assets, &|n| n.ends_with("-portable.zip"));
+        assert_eq!(fixed_match.unwrap().name, "MaMoForge-portable.zip");
     }
 
     /// Real network test against the live killriam/forge release — not run by default (slow,
