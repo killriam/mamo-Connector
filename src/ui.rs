@@ -594,8 +594,19 @@ async fn run_forge_update_check_and_download(
                 }
                 ctx.request_repaint();
 
-                // Check if an even newer version was published while downloading (rare case)
-                if let Ok(latest_remote) = crate::download::resolve_forge_jar_url().await {
+                // Check if an even newer version was published while downloading (rare case).
+                // Must re-resolve the *same asset type* that was just downloaded: the JAR and the
+                // portable zip are different assets in the same release with different
+                // `updated_at` timestamps (seconds apart, from finishing their uploads at
+                // different times), so comparing a zip download's timestamp against the bare
+                // JAR's would always look stale and re-trigger a full 410MB re-download on every
+                // single attempt, forever, regardless of whether anything actually changed.
+                let recheck = if downloaded_asset.name.ends_with(".zip") {
+                    crate::download::resolve_forge_portable_zip_url().await
+                } else {
+                    crate::download::resolve_forge_jar_url().await
+                };
+                if let Ok(latest_remote) = recheck {
                     if latest_remote.updated_at != downloaded_asset.updated_at {
                         if cancelled.load(Ordering::Relaxed) {
                             if let Ok(mut s) = forge_update_check.lock() {
@@ -610,7 +621,11 @@ async fn run_forge_update_check_and_download(
                             latest_remote.name,
                             downloaded_asset.name
                         );
-                        let _ = std::fs::remove_file(&staged_path);
+                        if staged_path.is_dir() {
+                            let _ = std::fs::remove_dir_all(&staged_path);
+                        } else {
+                            let _ = std::fs::remove_file(&staged_path);
+                        }
                         continue;
                     }
                 }
