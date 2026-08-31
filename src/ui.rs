@@ -497,6 +497,15 @@ async fn run_forge_update_check_and_download(
     while attempts < MAX_DOWNLOAD_ATTEMPTS {
         attempts += 1;
 
+        if cancelled.load(Ordering::Relaxed) {
+            if let Ok(mut s) = forge_update_check.lock() {
+                s.busy = false;
+            }
+            *forge_update_progress.lock().unwrap() = None;
+            ctx.request_repaint();
+            return;
+        }
+
         let check_res = check_forge_update_available().await;
         let asset = match check_res {
             Ok(Some(asset)) => asset,
@@ -558,9 +567,44 @@ async fn run_forge_update_check_and_download(
             Ok((staged_path, downloaded_asset)) => {
                 log::info!("MaMo Forge update downloaded: {}", downloaded_asset.name);
 
+                // Extraction's own per-file cancellation check is done once the last file lands,
+                // so a Cancel click landing after that (e.g. during the newer-build check below)
+                // would otherwise go unnoticed until this whole staged update got installed.
+                if cancelled.load(Ordering::Relaxed) {
+                    if let Ok(mut s) = forge_update_check.lock() {
+                        s.busy = false;
+                    }
+                    *forge_update_progress.lock().unwrap() = None;
+                    ctx.request_repaint();
+                    return;
+                }
+
+                // Keep the banner from looking frozen at "Extracting... 100%" while this network
+                // round-trip (and any resulting re-download) is in flight.
+                if let Ok(mut p) = forge_update_progress.lock() {
+                    *p = Some(DownloadProgress {
+                        finished: false,
+                        ..Default::default()
+                    });
+                    if let Some(ref mut prog) = *p {
+                        let (text, fraction) = format_download_update(&crate::download::DownloadUpdate::finalizing());
+                        prog.status_text = text;
+                        prog.fraction = fraction;
+                    }
+                }
+                ctx.request_repaint();
+
                 // Check if an even newer version was published while downloading (rare case)
                 if let Ok(latest_remote) = crate::download::resolve_forge_jar_url().await {
                     if latest_remote.updated_at != downloaded_asset.updated_at {
+                        if cancelled.load(Ordering::Relaxed) {
+                            if let Ok(mut s) = forge_update_check.lock() {
+                                s.busy = false;
+                            }
+                            *forge_update_progress.lock().unwrap() = None;
+                            ctx.request_repaint();
+                            return;
+                        }
                         log::warn!(
                             "A newer MaMo Forge build ({}) was published during download of {}; re-downloading latest build...",
                             latest_remote.name,
