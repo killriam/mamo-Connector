@@ -103,7 +103,7 @@ jobs:
           ### Installation (Windows)
           1. Download ``$asset``
           2. Run it — Windows may show a SmartScreen warning; click **More info → Run anyway**
-          3. On first launch, configure your Forge installation path in the **Settings** tab
+          3. On first launch, configure your Forge installation path in the **Setup** tab
           4. The app registers the ``mamoConnector://`` URL scheme automatically
 
           > macOS and Linux builds are not yet available.
