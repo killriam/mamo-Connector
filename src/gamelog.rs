@@ -411,7 +411,7 @@ pub async fn upload_game_log(
     
     // Check if we have an auth token
     let auth_token = config.auth_token.as_ref()
-        .ok_or_else(|| anyhow::anyhow!("No authentication token configured. Please add your MaMo token in Settings."))?;
+        .ok_or_else(|| anyhow::anyhow!("No authentication token configured. Please connect your MaMo account in Setup."))?;
     
     // Extract deck identifier and deck link from filename or content
     let deck_identifier = extract_deck_identifier(&log_content.filename, &log_content.content);
@@ -497,7 +497,7 @@ pub async fn upload_game_log(
             // every remaining file with the same expired token just spams the log.
             return Err(anyhow::anyhow!(
                 "AUTH_EXPIRED: Your MaMo session has expired. \
-                 Please re-authenticate: open Settings and paste a fresh token from your MaMo account."
+                 Please re-authenticate: open Setup and reconnect your MaMo account."
             ));
         }
         Err(anyhow::anyhow!("Upload failed with status {}: {}", status, error_text))

@@ -130,8 +130,34 @@ enum PlaySession {
     /// Upload succeeded — `deck_id` (if the log matched a known deck) lets the UI link
     /// straight to that deck's analysis instead of just reporting a filename.
     Uploaded { deck_id: Option<String>, filename: String },
-    /// Upload attempted but failed, or the scan itself errored.
-    UploadIssue { message: String },
+    /// Upload attempted but failed, or the scan itself errored. `auth_expired` is set when
+    /// the failure was specifically a 401 (see `gamelog::upload_game_log`'s AUTH_EXPIRED
+    /// sentinel) so the UI can offer a one-click Reconnect instead of just printing the error.
+    UploadIssue { message: String, auth_expired: bool },
+}
+
+/// Turns a raw upload-failure message into UI-friendly text, and reports whether it was
+/// specifically an expired/invalid MaMo connection (the AUTH_EXPIRED sentinel
+/// `gamelog::upload_game_log` returns for a 401) rather than some other failure — callers use
+/// this to swap the raw error for a clean sentence plus a Reconnect action.
+fn friendly_upload_error(message: &str) -> (String, bool) {
+    if message.contains("AUTH_EXPIRED") {
+        (
+            "Your MaMo connection has expired or was revoked.".to_string(),
+            true,
+        )
+    } else {
+        (message.to_string(), false)
+    }
+}
+
+impl PlaySession {
+    /// Builds an `UploadIssue` from a raw failure message, routing it through
+    /// `friendly_upload_error` so every construction site gets the same auth-aware handling.
+    fn upload_issue(message: String) -> Self {
+        let (message, auth_expired) = friendly_upload_error(&message);
+        PlaySession::UploadIssue { message, auth_expired }
+    }
 }
 
 /// One line describing what's happening right now, for the persistent status strip shown on
@@ -154,7 +180,14 @@ fn play_session_strip(ps: &PlaySession) -> (String, bool) {
             format!("Uploaded {filename} — back to watching for your next game"),
             false,
         ),
-        PlaySession::UploadIssue { message } => (format!("Upload issue — {message}"), false),
+        PlaySession::UploadIssue { message, auth_expired } => (
+            if *auth_expired {
+                "Upload issue — your MaMo connection expired, reconnect in Setup".to_string()
+            } else {
+                format!("Upload issue — {message}")
+            },
+            false,
+        ),
     }
 }
 
@@ -474,7 +507,7 @@ fn forge_update_success_message(asset: &crate::download::ForgeAsset) -> String {
 
 /// Checks for a MaMo Forge update and, if one's available, immediately downloads it to a
 /// staging file — no click required. Shared between the 5s-after-startup background check
-/// (`LauncherApp::new`) and the Settings tab's "Check now" button. Reports progress through
+/// (`LauncherApp::new`) and the Setup tab's "Check now" button. Reports progress through
 /// `forge_update_progress` (the same field the download itself reports through) and leaves a
 /// finished download in `forge_update_check.staged` for the periodic tick in `update()` to
 /// swap into place once Forge is confirmed not running (`finalize_staged_forge_update_if_ready`).
@@ -1537,7 +1570,7 @@ impl eframe::App for LauncherApp {
                             if has_token {
                                 log.log_info("\u{1F3AE} Forge running - auto gamelog scanning active (every 5 min)");
                             } else {
-                                log.log_info("\u{1F3AE} Forge running - connect your MaMo account in Settings to auto-upload game logs");
+                                log.log_info("\u{1F3AE} Forge running - connect your MaMo account in Setup to auto-upload game logs");
                             }
                         }
                         false
@@ -3250,7 +3283,7 @@ impl LauncherApp {
                                 settings.forge_path = Some(path.clone());
                                 let _ = settings.save();
                             }
-                            // Sync into settings_state so the Settings tab shows it too
+                            // Sync into settings_state so the Setup tab shows it too
                             {
                                 let mut ss = self.settings_state.lock().unwrap();
                                 ss.forge_path_input = path;
@@ -3789,8 +3822,17 @@ impl LauncherApp {
                         .show(ui, |ui| {
                             ui.label(egui::RichText::new(title).strong().color(text_color));
                             if is_issue && i == 4 {
-                                if let PlaySession::UploadIssue { ref message } = ps {
+                                if let PlaySession::UploadIssue { ref message, auth_expired } = ps {
                                     ui.label(egui::RichText::new(message).small().color(text_color));
+                                    if auth_expired {
+                                        ui.add_space(4.0);
+                                        if ui.button("🔗 Reconnect MaMo account").clicked() {
+                                            let _ = std::process::Command::new("cmd")
+                                                .args(["/c", "start", MAMO_WEBSITE_URL])
+                                                .spawn();
+                                            self.current_tab = Tab::Setup;
+                                        }
+                                    }
                                 }
                             } else if i == 5 {
                                 if let PlaySession::Uploaded { ref deck_id, ref filename } = ps {
@@ -3849,7 +3891,8 @@ impl LauncherApp {
                                     ui.label(egui::RichText::new(icon).color(color));
                                     ui.label(egui::RichText::new(&result.filename).small());
                                     if !result.success {
-                                        ui.label(egui::RichText::new(&result.message).small().color(egui::Color32::from_rgb(176, 0, 32)));
+                                        let (friendly, _) = friendly_upload_error(&result.message);
+                                        ui.label(egui::RichText::new(&friendly).small().color(egui::Color32::from_rgb(176, 0, 32)));
                                     } else if let Some(ref deck) = result.deck_identifier {
                                         ui.label(egui::RichText::new(format!("→ {}", deck)).small().color(egui::Color32::from_rgb(100, 149, 237)));
                                     }
@@ -5048,7 +5091,7 @@ impl LauncherApp {
                                     filename: uploaded.filename.clone(),
                                 }
                             } else if let Some(failed) = summary.results.iter().find(|r| !r.success) {
-                                PlaySession::UploadIssue { message: failed.message.clone() }
+                                PlaySession::upload_issue(failed.message.clone())
                             } else {
                                 PlaySession::Watching
                             };
@@ -5059,7 +5102,7 @@ impl LauncherApp {
                     Err(e) => {
                         state.status_message = Some(format!("Error: {}", e));
                         if should_resolve {
-                            *play_session.lock().unwrap() = PlaySession::UploadIssue { message: e.to_string() };
+                            *play_session.lock().unwrap() = PlaySession::upload_issue(e.to_string());
                         }
                     }
                 }
@@ -5200,7 +5243,7 @@ impl LauncherApp {
                             if summary.new_files > 0 {
                                 if let Ok(mut log) = activity_log.lock() {
                                     log.log_info(format!(
-                                        "\u{1F4CB} {} game log(s) waiting — connect your MaMo account in Settings to upload",
+                                        "\u{1F4CB} {} game log(s) waiting — connect your MaMo account in Setup to upload",
                                         summary.new_files
                                     ));
                                 }
@@ -5257,7 +5300,7 @@ impl LauncherApp {
                                     filename: uploaded.filename.clone(),
                                 }
                             } else if let Some(failed) = summary.results.iter().find(|r| !r.success) {
-                                PlaySession::UploadIssue { message: failed.message.clone() }
+                                PlaySession::upload_issue(failed.message.clone())
                             } else {
                                 // Nothing new found this scan — back to idle.
                                 PlaySession::Watching
@@ -5273,7 +5316,7 @@ impl LauncherApp {
                             log.log_error(format!("Auto-scan error: {}", e));
                         }
                         if should_resolve {
-                            *play_session.lock().unwrap() = PlaySession::UploadIssue { message: e.to_string() };
+                            *play_session.lock().unwrap() = PlaySession::upload_issue(e.to_string());
                         }
                     }
                 }
@@ -5661,6 +5704,7 @@ impl LauncherApp {
 
                 if has_token {
                     ui.label("Game logs upload automatically, and your MaMo decks show up in Play.");
+                    ui.label(egui::RichText::new("Seeing an auth error? Your token may have been revoked — reconnect below.").small().weak());
                     ui.add_space(5.0);
                     if ui.button("Disconnect").clicked() {
                         {
@@ -5669,36 +5713,38 @@ impl LauncherApp {
                         }
                         self.save_auth_token();
                     }
+                    ui.add_space(8.0);
                 } else {
                     ui.label("On the MaMo website, click the profile icon (top-right), then \"Connect Connector\".");
-                    if ui.button("🌐 Open MaMo Website")
-                        .on_hover_text("Opens MaMo in your browser to retrieve an API token")
-                        .clicked()
-                    {
-                        ctx.output_mut(|o| o.open_url = Some(egui::OpenUrl::new_tab(MAMO_WEBSITE_URL)));
-                    }
-                    ui.add_space(8.0);
-                    ui.label(egui::RichText::new("Or paste a token directly:").small().weak());
-                    ui.horizontal(|ui| {
-                        let mut token_input = {
-                            let state = self.settings_state.lock().unwrap();
-                            state.auth_token_input.clone()
-                        };
-                        let response = ui.add(
-                            egui::TextEdit::singleline(&mut token_input)
-                                .desired_width(320.0)
-                                .password(true)
-                                .hint_text("Paste token here"),
-                        );
-                        if response.changed() {
-                            let mut state = self.settings_state.lock().unwrap();
-                            state.auth_token_input = token_input;
-                        }
-                        if ui.button("Save").clicked() {
-                            self.save_auth_token();
-                        }
-                    });
                 }
+
+                if ui.button(if has_token { "🌐 Reconnect via MaMo Website" } else { "🌐 Open MaMo Website" })
+                    .on_hover_text("Opens MaMo in your browser to retrieve a fresh API token")
+                    .clicked()
+                {
+                    ctx.output_mut(|o| o.open_url = Some(egui::OpenUrl::new_tab(MAMO_WEBSITE_URL)));
+                }
+                ui.add_space(8.0);
+                ui.label(egui::RichText::new("Or paste a token directly:").small().weak());
+                ui.horizontal(|ui| {
+                    let mut token_input = {
+                        let state = self.settings_state.lock().unwrap();
+                        state.auth_token_input.clone()
+                    };
+                    let response = ui.add(
+                        egui::TextEdit::singleline(&mut token_input)
+                            .desired_width(320.0)
+                            .password(true)
+                            .hint_text("Paste token here"),
+                    );
+                    if response.changed() {
+                        let mut state = self.settings_state.lock().unwrap();
+                        state.auth_token_input = token_input;
+                    }
+                    if ui.button("Save").clicked() {
+                        self.save_auth_token();
+                    }
+                });
             });
 
             ui.add_space(12.0);
@@ -6393,8 +6439,33 @@ mod deck_picker_tests {
     fn play_session_step_index_upload_issue_lands_on_the_uploading_step() {
         // The failure happened while uploading, so earlier steps (Launching/Playing/Scanning)
         // should still read as done, and Uploaded (index 5) should still read as pending.
-        let issue = PlaySession::UploadIssue { message: "network error".to_string() };
+        let issue = PlaySession::UploadIssue { message: "network error".to_string(), auth_expired: false };
         assert_eq!(play_session_step_index(&issue), 4);
+    }
+
+    #[test]
+    fn friendly_upload_error_recognizes_auth_expired_sentinel() {
+        let (message, auth_expired) = friendly_upload_error(
+            "Upload failed: AUTH_EXPIRED: Your MaMo session has expired. \
+             Please re-authenticate: open Setup and reconnect your MaMo account.",
+        );
+        assert!(auth_expired);
+        assert!(!message.contains("AUTH_EXPIRED"), "the raw sentinel should never reach the UI");
+    }
+
+    #[test]
+    fn friendly_upload_error_passes_through_other_failures_unchanged() {
+        let (message, auth_expired) = friendly_upload_error("Upload failed with status 500: server error");
+        assert!(!auth_expired);
+        assert_eq!(message, "Upload failed with status 500: server error");
+    }
+
+    #[test]
+    fn play_session_strip_auth_expired_upload_issue_names_setup_not_the_raw_error() {
+        let issue = PlaySession::upload_issue("Upload failed: AUTH_EXPIRED: session expired".to_string());
+        let (text, _) = play_session_strip(&issue);
+        assert!(text.contains("Setup"));
+        assert!(!text.contains("AUTH_EXPIRED"));
     }
 
     #[test]
@@ -6406,7 +6477,7 @@ mod deck_picker_tests {
             PlaySession::Scanning,
             PlaySession::Uploading,
             PlaySession::Uploaded { deck_id: Some("deck-1".to_string()), filename: "a.json".to_string() },
-            PlaySession::UploadIssue { message: "oops".to_string() },
+            PlaySession::UploadIssue { message: "oops".to_string(), auth_expired: false },
         ];
         for ps in &sessions {
             let (text, _) = play_session_strip(ps);
@@ -6422,7 +6493,7 @@ mod deck_picker_tests {
         assert!(play_session_strip(&PlaySession::Scanning).1);
         assert!(play_session_strip(&PlaySession::Uploading).1);
         assert!(!play_session_strip(&PlaySession::Uploaded { deck_id: None, filename: "a.json".to_string() }).1);
-        assert!(!play_session_strip(&PlaySession::UploadIssue { message: "oops".to_string() }).1);
+        assert!(!play_session_strip(&PlaySession::UploadIssue { message: "oops".to_string(), auth_expired: false }).1);
     }
 
     #[test]

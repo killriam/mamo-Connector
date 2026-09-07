@@ -823,7 +823,7 @@ pub fn launch_forge_replay(replay_path: &str) -> Result<ForgeLaunchResult> {
             Some(path) => path.to_string_lossy().to_string(),
             None => {
                 return Ok(ForgeLaunchResult::failure(
-                    "Forge path not configured. Please set it in the Settings tab.",
+                    "Forge path not configured. Please set it in the Setup tab.",
                 ));
             }
         },
@@ -979,7 +979,7 @@ pub fn launch_forge_from_settings(deck_path: Option<&str>, deck2_path: Option<&s
                 Some(path) => path.to_string_lossy().to_string(),
                 None => {
                     return Ok(ForgeLaunchResult::failure(
-                        "Forge path not configured. Please set it in the Settings tab."
+                        "Forge path not configured. Please set it in the Setup tab."
                     ));
                 }
             }
