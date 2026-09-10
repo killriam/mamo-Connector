@@ -97,6 +97,8 @@ struct ForgeUpdateCheckState {
     /// one (e.g. from "Check now") while one's already running.
     busy: bool,
     dismissed: bool,
+    /// The asset currently being downloaded in the background, if any.
+    downloading_asset: Option<crate::download::ForgeAsset>,
 }
 
 /// Destructive actions that require a confirmation dialog
@@ -497,6 +499,16 @@ async fn check_forge_update_available() -> Result<Option<crate::download::ForgeA
 /// (jar + `res/`) from a jar-only one — surfaces which kind of update happened so a user or
 /// support person can tell at a glance whether card data was refreshed, rather than every
 /// update looking identical in the log regardless of what it actually touched.
+/// Helper to inspect an anyhow error chain for cancellation keywords.
+fn is_cancelled(err: &anyhow::Error) -> bool {
+    err.chain().any(|c| c.to_string().to_lowercase().contains("cancelled"))
+}
+
+/// Helper to check a string error message for cancellation keywords.
+fn is_cancelled_error(err_str: &str) -> bool {
+    err_str.to_lowercase().contains("cancelled")
+}
+
 fn forge_update_success_message(asset: &crate::download::ForgeAsset) -> String {
     if asset.name.ends_with(".zip") {
         "MaMo Forge updated to the latest build (including refreshed card data).".to_string()
@@ -568,6 +580,10 @@ async fn run_forge_update_check_and_download(
         };
 
         log::info!("MaMo Forge update available: {} — downloading in background", asset.name);
+        if let Ok(mut s) = forge_update_check.lock() {
+            s.busy = true;
+            s.downloading_asset = Some(asset.clone());
+        }
         cancelled.store(false, Ordering::Relaxed);
         *forge_update_progress.lock().unwrap() = Some(DownloadProgress::default());
         ctx.request_repaint();
@@ -606,6 +622,7 @@ async fn run_forge_update_check_and_download(
                 if cancelled.load(Ordering::Relaxed) {
                     if let Ok(mut s) = forge_update_check.lock() {
                         s.busy = false;
+                        s.downloading_asset = None;
                     }
                     *forge_update_progress.lock().unwrap() = None;
                     ctx.request_repaint();
@@ -644,6 +661,7 @@ async fn run_forge_update_check_and_download(
                         if cancelled.load(Ordering::Relaxed) {
                             if let Ok(mut s) = forge_update_check.lock() {
                                 s.busy = false;
+                                s.downloading_asset = None;
                             }
                             *forge_update_progress.lock().unwrap() = None;
                             ctx.request_repaint();
@@ -667,27 +685,31 @@ async fn run_forge_update_check_and_download(
                 if let Ok(mut s) = forge_update_check.lock() {
                     s.staged = Some(StagedForgeUpdate { staged_path, asset: downloaded_asset });
                     s.busy = false;
+                    s.downloading_asset = None;
                 }
                 *forge_update_progress.lock().unwrap() = None;
                 break;
             }
-            Err(e) if e.to_string().contains("cancelled") => {
+            Err(e) if is_cancelled(&e) => {
                 if let Ok(mut s) = forge_update_check.lock() {
                     s.busy = false;
+                    s.downloading_asset = None;
                 }
                 *forge_update_progress.lock().unwrap() = None;
                 break;
             }
             Err(e) => {
-                log::error!("MaMo Forge update download failed: {e}");
+                let err_msg = format!("{e:#}");
+                log::error!("MaMo Forge update download failed: {err_msg}");
                 if let Ok(mut p) = forge_update_progress.lock() {
                     if let Some(ref mut prog) = *p {
                         prog.finished = true;
-                        prog.error = Some(e.to_string());
+                        prog.error = Some(err_msg);
                     }
                 }
                 if let Ok(mut s) = forge_update_check.lock() {
                     s.busy = false;
+                    s.downloading_asset = None;
                 }
                 break;
             }
@@ -732,6 +754,11 @@ enum PendingForgeLaunch {
 /// State of the pre-launch Forge update check and prompt
 #[derive(Clone)]
 enum PreLaunchUpdateState {
+    /// Actively downloading/preparing the deck from MaMo before checking Forge updates
+    PreparingDeck {
+        deck_name: String,
+        result_rx: Arc<Mutex<Option<Result<PendingForgeLaunch, String>>>>,
+    },
     /// Forge is already running: prompt user to confirm whether to start an additional instance
     AlreadyRunningPrompt,
     /// Actively checking remote for an update
@@ -1410,6 +1437,25 @@ impl eframe::App for LauncherApp {
         let mut prelaunch_action: Option<PendingForgeLaunch> = None;
         if let Some(ref mut dialog) = self.prelaunch_update_dialog {
             match &mut dialog.state {
+                PreLaunchUpdateState::PreparingDeck { result_rx, .. } => {
+                    let res = result_rx.lock().unwrap().take();
+                    if let Some(res) = res {
+                        match res {
+                            Ok(prepared_launch) => {
+                                self.prelaunch_update_dialog = None;
+                                self.launch_forge_with_precheck(prepared_launch, ctx);
+                            }
+                            Err(e) => {
+                                if let Ok(mut log) = self.activity_log.lock() {
+                                    log.log_error(format!("Deck preparation failed: {e}"));
+                                }
+                                let launch = dialog.launch.clone();
+                                self.prelaunch_update_dialog = None;
+                                self.launch_forge_with_precheck(launch, ctx);
+                            }
+                        }
+                    }
+                }
                 PreLaunchUpdateState::Checking { started_at, result_rx } => {
                     let res = result_rx.lock().unwrap().take();
                     if let Some(res) = res {
@@ -1452,7 +1498,7 @@ impl eframe::App for LauncherApp {
                                 }
                                 prelaunch_action = Some(dialog.launch.clone());
                             }
-                            Err(e) if e.contains("cancelled") => {
+                            Err(e) if is_cancelled_error(&e) => {
                                 // Cancelled
                                 self.prelaunch_update_dialog = None;
                                 *self.play_session.lock().unwrap() = PlaySession::Watching;
@@ -1463,6 +1509,27 @@ impl eframe::App for LauncherApp {
                                     asset: asset.clone(),
                                 };
                             }
+                        }
+                    } else if let Some(staged) = self.forge_update_check.lock().unwrap().staged.clone() {
+                        let forge_dir = forge_download_dir();
+                        match crate::download::finalize_staged_forge_update(&forge_dir, &staged.staged_path, &staged.asset) {
+                            Ok(_) => {
+                                if let Ok(mut log) = self.activity_log.lock() {
+                                    log.log_success(forge_update_success_message(&staged.asset));
+                                }
+                            }
+                            Err(e) => {
+                                log::error!("Failed to finalize updated Forge jar: {e}");
+                            }
+                        }
+                        self.forge_update_check.lock().unwrap().staged = None;
+                        prelaunch_action = Some(dialog.launch.clone());
+                    } else if let Some(ref prog) = *self.forge_update_progress.lock().unwrap() {
+                        if let Some(ref err) = prog.error {
+                            dialog.state = PreLaunchUpdateState::Failed {
+                                error: err.clone(),
+                                asset: asset.clone(),
+                            };
                         }
                     }
                 }
@@ -2244,8 +2311,137 @@ impl LauncherApp {
 
     // ==================== Pre-Launch Forge Update Check & Prompt ====================
 
-    /// Request a Forge launch, checking if Forge is already open or for newer versions if Connector-managed.
+    /// Check whether a requested launch needs a deck download from MaMo before launching Forge.
+    fn launch_deck_download_needed(launch: &PendingForgeLaunch) -> Option<String> {
+        match launch {
+            PendingForgeLaunch::Plain => None,
+            PendingForgeLaunch::LocalDeckWithCuratedOpponent { .. } => None,
+            PendingForgeLaunch::AccountDeck(deck) => Some(deck.deck_name.clone()),
+            PendingForgeLaunch::Scenario { scenario_name, .. } => Some(scenario_name.clone()),
+            PendingForgeLaunch::Deeplink(deeplink) => {
+                let action = deeplink.action.as_str();
+                if matches!(action, "launch-forge" | "launchforge" | "playtest") {
+                    let deck_id = deeplink.deck_id.clone()
+                        .or_else(|| crate::commands::get_parameter(&deeplink.params, "id"))
+                        .or_else(|| crate::commands::get_parameter(&deeplink.params, "deck_id"))
+                        .or_else(|| crate::commands::get_parameter(&deeplink.params, "deckId"));
+                    let skip_download = crate::commands::get_parameter(&deeplink.params, "skip_download")
+                        .map(|s| s == "true" || s == "1")
+                        .unwrap_or(false);
+                    if deck_id.is_some() && !skip_download {
+                        Some("Deck".to_string())
+                    } else {
+                        None
+                    }
+                } else if action == "playtest-scenario" {
+                    Some("Scenario Deck".to_string())
+                } else {
+                    None
+                }
+            }
+        }
+    }
+
+    /// Prepare (download and save to disk) the deck for a launch upfront, so the .dck file is
+    /// safely stored in Forge's deck folder even if an update check is prompted and cancelled.
+    async fn prepare_launch_deck(launch: PendingForgeLaunch) -> Result<PendingForgeLaunch, String> {
+        match launch {
+            PendingForgeLaunch::AccountDeck(deck) => {
+                let res = crate::deck::create_deck_from_mamo(&deck.deck_id).await.map_err(|e| format!("{e:#}"))?;
+                if !res.success {
+                    return Err(res.message);
+                }
+                if let Some(path) = res.deck_path {
+                    if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
+                        return Ok(PendingForgeLaunch::LocalDeckWithCuratedOpponent {
+                            local_stem: stem.to_string(),
+                        });
+                    }
+                }
+                Ok(PendingForgeLaunch::AccountDeck(deck))
+            }
+            PendingForgeLaunch::Scenario { deck_id, scenario_id, scenario_name } => {
+                let res = crate::deck::create_deck_and_scenario_for_forge(&deck_id, &scenario_id).await.map_err(|e| format!("{e:#}"))?;
+                if !res.success {
+                    return Err(res.message);
+                }
+                Ok(PendingForgeLaunch::Scenario { deck_id, scenario_id, scenario_name })
+            }
+            PendingForgeLaunch::Deeplink(mut deeplink) => {
+                let action = deeplink.action.clone();
+                if matches!(action.as_str(), "launch-forge" | "launchforge" | "playtest") {
+                    let deck_id = deeplink.deck_id.clone()
+                        .or_else(|| crate::commands::get_parameter(&deeplink.params, "id"))
+                        .or_else(|| crate::commands::get_parameter(&deeplink.params, "deck_id"))
+                        .or_else(|| crate::commands::get_parameter(&deeplink.params, "deckId"));
+                    if let Some(id) = deck_id {
+                        let res = crate::deck::create_deck_from_mamo(&id).await.map_err(|e| format!("{e:#}"))?;
+                        if !res.success {
+                            return Err(res.message);
+                        }
+                        if let Some(path) = res.deck_path {
+                            let path_str = path.to_string_lossy().to_string();
+                            deeplink.params.retain(|(k, _)| k != "skip_download" && k != "deck_path");
+                            deeplink.params.push(("skip_download".to_string(), "true".to_string()));
+                            deeplink.params.push(("deck_path".to_string(), path_str));
+                        }
+                    }
+                } else if action == "playtest-scenario" {
+                    let deck_id = deeplink.deck_id.clone()
+                        .or_else(|| crate::commands::get_parameter(&deeplink.params, "deckId"))
+                        .or_else(|| crate::commands::get_parameter(&deeplink.params, "deck_id"));
+                    let scenario_id = crate::commands::get_parameter(&deeplink.params, "scenarioId")
+                        .or_else(|| crate::commands::get_parameter(&deeplink.params, "scenario_id"));
+                    if let (Some(d), Some(s)) = (deck_id, scenario_id) {
+                        let res = crate::deck::create_deck_and_scenario_for_forge(&d, &s).await.map_err(|e| format!("{e:#}"))?;
+                        if !res.success {
+                            return Err(res.message);
+                        }
+                    }
+                }
+                Ok(PendingForgeLaunch::Deeplink(deeplink))
+            }
+            other => Ok(other),
+        }
+    }
+
+    /// Request a Forge launch: always ensures the deck is downloaded upfront before any Forge update check.
     fn request_forge_launch(&mut self, launch: PendingForgeLaunch, ctx: &egui::Context) {
+        if let Some(deck_name) = Self::launch_deck_download_needed(&launch) {
+            let result_rx = Arc::new(Mutex::new(None));
+            let result_rx_bg = Arc::clone(&result_rx);
+            let ctx_bg = ctx.clone();
+            let launch_clone = launch.clone();
+
+            if let Ok(mut log) = self.activity_log.lock() {
+                log.log_info(format!("Downloading deck '{deck_name}' before launching Forge…"));
+            }
+
+            std::thread::spawn(move || {
+                let runtime = tokio::runtime::Runtime::new().unwrap();
+                let res = runtime.block_on(async {
+                    Self::prepare_launch_deck(launch_clone).await
+                });
+                *result_rx_bg.lock().unwrap() = Some(res);
+                ctx_bg.request_repaint();
+            });
+
+            self.prelaunch_update_dialog = Some(PreLaunchUpdateDialog {
+                launch,
+                state: PreLaunchUpdateState::PreparingDeck {
+                    deck_name,
+                    result_rx,
+                },
+            });
+            ctx.request_repaint();
+            return;
+        }
+
+        self.launch_forge_with_precheck(launch, ctx);
+    }
+
+    /// Perform pre-launch checks: Forge already running, Connector-managed, staged update, or update download in progress.
+    fn launch_forge_with_precheck(&mut self, launch: PendingForgeLaunch, ctx: &egui::Context) {
         // If Forge is already open — or is currently starting up (monitoring active but window
         // not yet visible because the JVM hasn't finished booting) — prompt before spawning
         // a second instance. is_forge_window_open() alone isn't enough: the Java window can
@@ -2284,6 +2480,27 @@ impl LauncherApp {
             });
             ctx.request_repaint();
             return;
+        }
+
+        // Check if an update download is ALREADY in progress (e.g. background auto-updater)
+        let (is_downloading, downloading_asset) = {
+            let s = self.forge_update_check.lock().unwrap();
+            (s.busy && self.forge_update_progress.lock().unwrap().is_some(), s.downloading_asset.clone())
+        };
+        if is_downloading {
+            if let Some(asset) = downloading_asset {
+                self.prelaunch_update_dialog = Some(PreLaunchUpdateDialog {
+                    launch,
+                    state: PreLaunchUpdateState::Downloading {
+                        asset,
+                        progress: Arc::clone(&self.forge_update_progress),
+                        cancelled: Arc::clone(&self.forge_update_cancelled),
+                        result: Arc::new(Mutex::new(None)),
+                    },
+                });
+                ctx.request_repaint();
+                return;
+            }
         }
 
         // Start background check with result_rx
@@ -2343,6 +2560,7 @@ impl LauncherApp {
         let Some(ref mut dialog) = self.prelaunch_update_dialog else { return; };
         
         let title = match &dialog.state {
+            PreLaunchUpdateState::PreparingDeck { .. } => "📥 Preparing Deck…",
             PreLaunchUpdateState::AlreadyRunningPrompt => "🎮 Forge is Already Open",
             PreLaunchUpdateState::Checking { .. } => "Checking for Updates…",
             PreLaunchUpdateState::Prompt { is_staged: true, .. } => "✨ MaMo Forge Update Ready",
@@ -2363,6 +2581,18 @@ impl LauncherApp {
             .show(ctx, |ui| {
                 ui.set_min_width(400.0);
                 match &dialog.state {
+                    PreLaunchUpdateState::PreparingDeck { deck_name, .. } => {
+                        ui.horizontal(|ui| {
+                            ui.spinner();
+                            ui.label(egui::RichText::new(format!("Downloading '{deck_name}' from MaMo…")).small());
+                        });
+                        ui.add_space(14.0);
+                        ui.horizontal(|ui| {
+                            if ui.button("Cancel").clicked() {
+                                action_cancel = true;
+                            }
+                        });
+                    }
                     PreLaunchUpdateState::AlreadyRunningPrompt => {
                         ui.horizontal(|ui| {
                             ui.label(egui::RichText::new("🎮").size(28.0));
@@ -2502,7 +2732,6 @@ impl LauncherApp {
                             }
                             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                                 if ui.button("Launch Current Version").clicked() {
-                                    cancelled.store(true, Ordering::Relaxed);
                                     action_launch_anyway = true;
                                 }
                             });
@@ -2539,6 +2768,14 @@ impl LauncherApp {
                 if matches!(d.state, PreLaunchUpdateState::AlreadyRunningPrompt) {
                     if let Ok(mut log) = self.activity_log.lock() {
                         log.log_info("Forge launch cancelled — Forge is already open.");
+                    }
+                } else if matches!(d.state, PreLaunchUpdateState::PreparingDeck { .. }) {
+                    if let Ok(mut log) = self.activity_log.lock() {
+                        log.log_info("Forge launch cancelled while preparing deck.");
+                    }
+                } else {
+                    if let Ok(mut log) = self.activity_log.lock() {
+                        log.log_info("Forge launch cancelled by user.");
                     }
                 }
             }
@@ -2577,24 +2814,49 @@ impl LauncherApp {
                 None => return,
             };
 
-            let progress: Arc<Mutex<Option<DownloadProgress>>> = Arc::new(Mutex::new(Some(DownloadProgress::default())));
-            let cancelled = Arc::new(AtomicBool::new(false));
+            let is_busy = self.forge_update_check.lock().unwrap().busy;
+            if is_busy {
+                self.prelaunch_update_dialog = Some(PreLaunchUpdateDialog {
+                    launch,
+                    state: PreLaunchUpdateState::Downloading {
+                        asset,
+                        progress: Arc::clone(&self.forge_update_progress),
+                        cancelled: Arc::clone(&self.forge_update_cancelled),
+                        result: Arc::new(Mutex::new(None)),
+                    },
+                });
+                ctx.request_repaint();
+                return;
+            }
+
+            let progress = Arc::clone(&self.forge_update_progress);
+            let cancelled = Arc::clone(&self.forge_update_cancelled);
             let result: Arc<Mutex<Option<Result<std::path::PathBuf, String>>>> = Arc::new(Mutex::new(None));
+
+            cancelled.store(false, Ordering::Relaxed);
+            *progress.lock().unwrap() = Some(DownloadProgress::default());
+            if let Ok(mut s) = self.forge_update_check.lock() {
+                s.busy = true;
+                s.downloading_asset = Some(asset.clone());
+            }
 
             let progress_bg = Arc::clone(&progress);
             let cancelled_bg = Arc::clone(&cancelled);
             let result_bg = Arc::clone(&result);
             let ctx_bg = ctx.clone();
+            let forge_update_check = Arc::clone(&self.forge_update_check);
+            let downloaded_asset = asset.clone();
 
             std::thread::spawn(move || {
                 let runtime = tokio::runtime::Runtime::new().unwrap();
                 let dest_dir = forge_download_dir();
                 let ctx_callback = ctx_bg.clone();
+                let progress_cb = Arc::clone(&progress_bg);
                 let outcome = runtime.block_on(async {
                     crate::download::download_forge_update_staged(
                         &dest_dir,
                         move |update| {
-                            if let Ok(mut guard) = progress_bg.lock() {
+                            if let Ok(mut guard) = progress_cb.lock() {
                                 let entry = guard.get_or_insert_with(DownloadProgress::default);
                                 let (text, fraction) = format_download_update(&update);
                                 entry.bytes_done = update.bytes_done;
@@ -2612,7 +2874,40 @@ impl LauncherApp {
                     .await
                 });
 
-                *result_bg.lock().unwrap() = Some(outcome.map(|(p, _)| p).map_err(|e| e.to_string()));
+                match outcome {
+                    Ok((staged_path, _)) => {
+                        if let Ok(mut s) = forge_update_check.lock() {
+                            s.staged = Some(StagedForgeUpdate { staged_path: staged_path.clone(), asset: downloaded_asset });
+                            s.busy = false;
+                            s.downloading_asset = None;
+                        }
+                        *progress_bg.lock().unwrap() = None;
+                        *result_bg.lock().unwrap() = Some(Ok(staged_path));
+                    }
+                    Err(e) if is_cancelled(&e) => {
+                        if let Ok(mut s) = forge_update_check.lock() {
+                            s.busy = false;
+                            s.downloading_asset = None;
+                        }
+                        *progress_bg.lock().unwrap() = None;
+                        *result_bg.lock().unwrap() = Some(Err("cancelled".to_string()));
+                    }
+                    Err(e) => {
+                        let err_msg = format!("{e:#}");
+                        log::error!("Pre-launch Forge update download failed: {err_msg}");
+                        if let Ok(mut guard) = progress_bg.lock() {
+                            if let Some(ref mut prog) = *guard {
+                                prog.finished = true;
+                                prog.error = Some(err_msg.clone());
+                            }
+                        }
+                        if let Ok(mut s) = forge_update_check.lock() {
+                            s.busy = false;
+                            s.downloading_asset = None;
+                        }
+                        *result_bg.lock().unwrap() = Some(Err(err_msg));
+                    }
+                }
                 ctx_bg.request_repaint();
             });
 
@@ -2784,8 +3079,8 @@ impl LauncherApp {
                         .unwrap_or_default();
                     DownloadResult::Success { jar_dir: dir }
                 }
-                Err(e) if e.to_string().contains("cancelled") => DownloadResult::Cancelled,
-                Err(e) => DownloadResult::Failed(e.to_string()),
+                Err(e) if is_cancelled(&e) => DownloadResult::Cancelled,
+                Err(e) => DownloadResult::Failed(format!("{e:#}")),
             };
             *result_bg.lock().unwrap() = Some(terminal);
             ctx_end.request_repaint();
@@ -2855,7 +3150,7 @@ impl LauncherApp {
                         }
                         *progress_bg.lock().unwrap() = None;
                     }
-                    Err(e) if e.to_string().contains("cancelled") => {
+                    Err(e) if is_cancelled(&e) => {
                         log::info!("MaMo Connector update download cancelled");
                         if let Ok(mut s) = update_check_bg.lock() {
                             s.is_downloading = false;
@@ -2863,10 +3158,11 @@ impl LauncherApp {
                         *progress_bg.lock().unwrap() = None;
                     }
                     Err(e) => {
-                        log::error!("Failed to download MaMo Connector update: {e}");
+                        let err_msg = format!("{e:#}");
+                        log::error!("Failed to download MaMo Connector update: {err_msg}");
                         if let Ok(mut s) = update_check_bg.lock() {
                             s.is_downloading = false;
-                            s.error = Some(e.to_string());
+                            s.error = Some(err_msg);
                         }
                         *progress_bg.lock().unwrap() = None;
                     }
@@ -6626,6 +6922,89 @@ mod deck_picker_tests {
 
         let prompt_already_running = PreLaunchUpdateState::AlreadyRunningPrompt;
         assert!(matches!(prompt_already_running, PreLaunchUpdateState::AlreadyRunningPrompt));
+    }
+
+    #[test]
+    fn launch_deck_download_needed_detects_all_deck_bearing_launches() {
+        // Plain and already-local decks need no pre-download
+        assert_eq!(LauncherApp::launch_deck_download_needed(&PendingForgeLaunch::Plain), None);
+        assert_eq!(
+            LauncherApp::launch_deck_download_needed(&PendingForgeLaunch::LocalDeckWithCuratedOpponent {
+                local_stem: "mono_red".to_string(),
+            }),
+            None
+        );
+
+        // Account deck needs pre-download
+        let account_deck = crate::gamelog::UserDeck {
+            deck_id: "deck-123".to_string(),
+            deck_name: "Goblins".to_string(),
+            user_id: "user-1".to_string(),
+            color_identity: None,
+            commander_id: None,
+            commander_partner_id: None,
+            created_at: None,
+            updated_at: None,
+        };
+        assert_eq!(
+            LauncherApp::launch_deck_download_needed(&PendingForgeLaunch::AccountDeck(account_deck)),
+            Some("Goblins".to_string())
+        );
+
+        // Scenario needs pre-download
+        assert_eq!(
+            LauncherApp::launch_deck_download_needed(&PendingForgeLaunch::Scenario {
+                deck_id: "deck-1".to_string(),
+                scenario_id: "sc-1".to_string(),
+                scenario_name: "Burn Test".to_string(),
+            }),
+            Some("Burn Test".to_string())
+        );
+
+        // Deeplink launch-forge with deck id and without skip_download
+        let deeplink_forge = crate::deeplink::parse_deeplink_url("mamoConnector://launch-forge/uuid-abc").unwrap();
+        assert_eq!(
+            LauncherApp::launch_deck_download_needed(&PendingForgeLaunch::Deeplink(deeplink_forge)),
+            Some("Deck".to_string())
+        );
+
+        // Deeplink launch-forge with skip_download=true
+        let deeplink_skipped = crate::deeplink::parse_deeplink_url("mamoConnector://launch-forge/uuid-abc?skip_download=true").unwrap();
+        assert_eq!(
+            LauncherApp::launch_deck_download_needed(&PendingForgeLaunch::Deeplink(deeplink_skipped)),
+            None
+        );
+
+        // Deeplink playtest-scenario
+        let deeplink_scenario = crate::deeplink::parse_deeplink_url("mamoConnector://playtest-scenario/uuid-abc?scenarioId=sc-1").unwrap();
+        assert_eq!(
+            LauncherApp::launch_deck_download_needed(&PendingForgeLaunch::Deeplink(deeplink_scenario)),
+            Some("Scenario Deck".to_string())
+        );
+
+        // Deeplink unrelated action
+        let deeplink_auth = crate::deeplink::parse_deeplink_url("mamoConnector://auth?token=token123").unwrap();
+        assert_eq!(
+            LauncherApp::launch_deck_download_needed(&PendingForgeLaunch::Deeplink(deeplink_auth)),
+            None
+        );
+    }
+
+    #[test]
+    fn is_cancelled_inspects_nested_anyhow_error_chain() {
+        let root_cancel = anyhow::anyhow!("Extraction cancelled");
+        assert!(is_cancelled(&root_cancel));
+
+        // Masked by outer anyhow context — this was the bug where outer context masked cancellation!
+        let masked_cancel = root_cancel.context("Downloaded MaMo Forge update but failed to extract it");
+        assert!(is_cancelled(&masked_cancel), "must find 'cancelled' anywhere in the anyhow causal chain");
+
+        let normal_err = anyhow::anyhow!("Connection reset by peer");
+        let masked_normal = normal_err.context("Downloaded MaMo Forge update but failed to extract it");
+        assert!(!is_cancelled(&masked_normal));
+
+        assert!(is_cancelled_error("download cancelled by user"));
+        assert!(!is_cancelled_error("connection reset"));
     }
 }
 
