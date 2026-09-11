@@ -2149,6 +2149,181 @@ fn archive_deck_with_prefix(deck_path: &std::path::Path) -> Result<PathBuf> {
     Ok(archived_path)
 }
 
+// ==================== MaMo Reference Deck Sync ====================
+
+/// Card payload for MaMo reference deck synchronization
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SyncReferenceCard {
+    pub name: String,
+    pub amount: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub oracle_id: Option<String>,
+}
+
+/// Request payload for `POST /api/decks/sync-external-reference`
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SyncReferenceDeckPayload {
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_type: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_date: Option<String>,
+    pub commanders: Vec<SyncReferenceCard>,
+    pub maincards: Vec<SyncReferenceCard>,
+}
+
+/// Response payload from `POST /api/decks/sync-external-reference`
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SyncReferenceDeckResponse {
+    pub success: bool,
+    pub deck_id: Option<String>,
+    pub action: Option<String>,
+    pub revision: Option<u32>,
+    pub message: Option<String>,
+}
+
+/// Extract cards from Moxfield board (commanders or mainboard)
+pub fn extract_moxfield_cards(value: &serde_json::Value) -> Vec<SyncReferenceCard> {
+    let mut cards = Vec::new();
+    if let Some(obj) = value.as_object() {
+        for (_, entry) in obj {
+            let quantity = entry.get("quantity").and_then(|q| q.as_u64()).unwrap_or(1) as u32;
+            if let Some(card) = entry.get("card") {
+                if let Some(name) = card.get("name").and_then(|n| n.as_str()) {
+                    let oracle_id = card.get("scryfall_oracle_id")
+                        .or_else(|| card.get("oracle_id"))
+                        .and_then(|o| o.as_str())
+                        .map(|s| s.to_string());
+                    cards.push(SyncReferenceCard {
+                        name: name.to_string(),
+                        amount: quantity,
+                        oracle_id,
+                    });
+                }
+            }
+        }
+    }
+    cards
+}
+
+/// Extract cards from Archidekt deck
+fn extract_archidekt_cards(deck: &ArchidektDeck) -> (Vec<SyncReferenceCard>, Vec<SyncReferenceCard>) {
+    let mut commanders = Vec::new();
+    let mut mainboard = Vec::new();
+    for card in &deck.cards {
+        let is_commander = card.categories.iter()
+            .any(|c| c.to_lowercase().contains("commander"));
+        let is_sideboard = card.categories.iter()
+            .any(|c| c.to_lowercase().contains("sideboard") || c.to_lowercase().contains("maybeboard"));
+        if is_sideboard {
+            continue;
+        }
+        let ref_card = SyncReferenceCard {
+            name: card.card.oracle_card.name.clone(),
+            amount: card.quantity,
+            oracle_id: None,
+        };
+        if is_commander {
+            commanders.push(ref_card);
+        } else {
+            mainboard.push(ref_card);
+        }
+    }
+    (commanders, mainboard)
+}
+
+/// Extract cards from Deckstats raw text content
+fn extract_deckstats_cards(content: &str) -> (Vec<SyncReferenceCard>, Vec<SyncReferenceCard>) {
+    let mut commanders = Vec::new();
+    let mut mainboard = Vec::new();
+    let mut in_sideboard = false;
+    for line in content.lines() {
+        let line = line.trim();
+        let lower = line.to_lowercase();
+        if lower.contains("sideboard") || lower.contains("maybeboard") {
+            in_sideboard = true;
+            continue;
+        }
+        if lower.contains("commander") {
+            continue;
+        }
+        if lower.contains("main") {
+            in_sideboard = false;
+            continue;
+        }
+        if line.is_empty() || line.starts_with("//") {
+            continue;
+        }
+        if in_sideboard {
+            continue;
+        }
+        let parts: Vec<&str> = line.splitn(2, ' ').collect();
+        if parts.len() != 2 {
+            continue;
+        }
+        if let Ok(qty) = parts[0].parse::<u32>() {
+            let card_name = front_face_name(parts[1]).to_string();
+            let clean_name = card_name.split('[').next().unwrap_or(&card_name).trim().to_string();
+            let card = SyncReferenceCard {
+                name: clean_name,
+                amount: qty,
+                oracle_id: None,
+            };
+            if commanders.is_empty() && qty == 1 {
+                commanders.push(card);
+            } else {
+                mainboard.push(card);
+            }
+        }
+    }
+    (commanders, mainboard)
+}
+
+/// Synchronize a deck to MaMo backend as a Reference Deck
+pub async fn sync_deck_to_mamo_as_reference(
+    payload: &SyncReferenceDeckPayload,
+    auth_token: &str,
+    api_url: &str,
+) -> Result<SyncReferenceDeckResponse> {
+    let url = format!("{}/api/decks/sync-external-reference", api_url.trim_end_matches('/'));
+    info!("Syncing deck '{}' to MaMo as reference deck: {}", payload.name, url);
+
+    let client = reqwest::Client::new();
+    let response = client
+        .post(&url)
+        .header("Authorization", format!("Bearer {}", auth_token))
+        .json(payload)
+        .send()
+        .await
+        .context("Failed to send request to /api/decks/sync-external-reference")?;
+
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        return Err(anyhow::anyhow!(
+            "Backend returned status {} syncing reference deck: {}",
+            status,
+            body
+        ));
+    }
+
+    let result: SyncReferenceDeckResponse = response
+        .json()
+        .await
+        .context("Failed to parse sync reference deck response")?;
+
+    Ok(result)
+}
+
+fn with_mamo_note(mut result: DeckSyncResult, note: Option<String>) -> DeckSyncResult {
+    if let Some(n) = note {
+        result.message = format!("{} [{}]", result.message, n);
+    }
+    result
+}
+
 /// Sync a single Moxfield deck - check if newer and update if needed
 pub async fn sync_moxfield_deck(deck_id: &str) -> Result<DeckSyncResult> {
     info!("Syncing Moxfield deck: {}", deck_id);
@@ -2160,6 +2335,58 @@ pub async fn sync_moxfield_deck(deck_id: &str) -> Result<DeckSyncResult> {
     let deck: MoxfieldFullDeck = serde_json::from_str(&body)
         .with_context(|| "Failed to parse Moxfield deck response")?;
     
+    // Optional reference deck sync to MaMo
+    let mut mamo_sync_note: Option<String> = None;
+    if let Ok(settings) = Settings::load() {
+        if settings.sync_as_reference_decks {
+            let token = settings.auth_token.as_ref().or(settings.gamelog_config.auth_token.as_ref());
+            if let Some(token) = token {
+                let api_url = if settings.gamelog_config.api_url.is_empty() {
+                    MAMO_API_URL
+                } else {
+                    &settings.gamelog_config.api_url
+                };
+
+                let commanders = extract_moxfield_cards(&deck.commanders);
+                let maincards = extract_moxfield_cards(&deck.mainboard);
+                let source_url = format!("https://www.moxfield.com/decks/{}", deck_id);
+
+                let payload = SyncReferenceDeckPayload {
+                    name: deck.name.clone(),
+                    source_url: Some(source_url),
+                    source_type: Some("moxfield".to_string()),
+                    source_date: deck.last_updated_at_utc.clone(),
+                    commanders,
+                    maincards,
+                };
+
+                match sync_deck_to_mamo_as_reference(&payload, token, api_url).await {
+                    Ok(resp) => {
+                        info!(
+                            "MaMo reference deck sync for '{}': action={:?}, revision={:?}",
+                            deck.name, resp.action, resp.revision
+                        );
+                        if let Some(action) = resp.action {
+                            match action.as_str() {
+                                "created" => {
+                                    mamo_sync_note = Some("Imported to MaMo as reference deck".to_string());
+                                }
+                                "updated" => {
+                                    let rev = resp.revision.map(|r| format!("Rev {}", r)).unwrap_or_else(|| "new rev".to_string());
+                                    mamo_sync_note = Some(format!("MaMo reference updated ({})", rev));
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        warn!("Failed to sync reference deck to MaMo for '{}': {}", deck.name, e);
+                    }
+                }
+            }
+        }
+    }
+
     // Build the expected filename
     let author = deck.created_by_user.as_ref()
         .map(|u| u.user_name.as_str())
@@ -2180,7 +2407,7 @@ pub async fn sync_moxfield_deck(deck_id: &str) -> Result<DeckSyncResult> {
             if local_date >= &moxfield_date.to_string() {
                 info!("Deck '{}' is already up to date (local: {}, moxfield: {})", 
                       deck.name, local_date, moxfield_date);
-                return Ok(DeckSyncResult::already_up_to_date(deck.name));
+                return Ok(with_mamo_note(DeckSyncResult::already_up_to_date(deck.name), mamo_sync_note));
             }
         }
         
@@ -2196,7 +2423,7 @@ pub async fn sync_moxfield_deck(deck_id: &str) -> Result<DeckSyncResult> {
         let forge_content = convert_moxfield_to_forge(&full_name, &body)?;
         let (new_path, _) = write_deck_file(&full_name, &forge_content).await?;
         
-        Ok(DeckSyncResult::updated(deck.name, archived_path, new_path))
+        Ok(with_mamo_note(DeckSyncResult::updated(deck.name, archived_path, new_path), mamo_sync_note))
     } else {
         // No existing file - download as new
         info!("Deck '{}' is new, downloading...", deck.name);
@@ -2205,7 +2432,7 @@ pub async fn sync_moxfield_deck(deck_id: &str) -> Result<DeckSyncResult> {
         let forge_content = convert_moxfield_to_forge(&full_name, &body)?;
         let (new_path, _) = write_deck_file(&full_name, &forge_content).await?;
         
-        Ok(DeckSyncResult::new_downloaded(deck.name, new_path))
+        Ok(with_mamo_note(DeckSyncResult::new_downloaded(deck.name, new_path), mamo_sync_note))
     }
 }
 
@@ -2239,6 +2466,57 @@ pub async fn sync_archidekt_deck(deck_id: &str) -> Result<DeckSyncResult> {
     let deck: ArchidektDeck = serde_json::from_str(&body)
         .with_context(|| "Failed to parse Archidekt deck response")?;
     
+    // Optional reference deck sync to MaMo
+    let mut mamo_sync_note: Option<String> = None;
+    if let Ok(settings) = Settings::load() {
+        if settings.sync_as_reference_decks {
+            let token = settings.auth_token.as_ref().or(settings.gamelog_config.auth_token.as_ref());
+            if let Some(token) = token {
+                let api_url = if settings.gamelog_config.api_url.is_empty() {
+                    MAMO_API_URL
+                } else {
+                    &settings.gamelog_config.api_url
+                };
+
+                let (commanders, maincards) = extract_archidekt_cards(&deck);
+                let source_url = format!("https://archidekt.com/decks/{}", deck_id);
+
+                let payload = SyncReferenceDeckPayload {
+                    name: deck.name.clone(),
+                    source_url: Some(source_url),
+                    source_type: Some("archidekt".to_string()),
+                    source_date: deck.updated_at.clone(),
+                    commanders,
+                    maincards,
+                };
+
+                match sync_deck_to_mamo_as_reference(&payload, token, api_url).await {
+                    Ok(resp) => {
+                        info!(
+                            "MaMo reference deck sync for Archidekt '{}': action={:?}, revision={:?}",
+                            deck.name, resp.action, resp.revision
+                        );
+                        if let Some(action) = resp.action {
+                            match action.as_str() {
+                                "created" => {
+                                    mamo_sync_note = Some("Imported to MaMo as reference deck".to_string());
+                                }
+                                "updated" => {
+                                    let rev = resp.revision.map(|r| format!("Rev {}", r)).unwrap_or_else(|| "new rev".to_string());
+                                    mamo_sync_note = Some(format!("MaMo reference updated ({})", rev));
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        warn!("Failed to sync Archidekt deck to MaMo for '{}': {}", deck.name, e);
+                    }
+                }
+            }
+        }
+    }
+
     let author = deck.owner.as_ref()
         .map(|o| o.username.as_str())
         .unwrap_or("Unknown");
@@ -2253,7 +2531,7 @@ pub async fn sync_archidekt_deck(deck_id: &str) -> Result<DeckSyncResult> {
     if let Some(existing_path) = existing_file {
         if let Some(local_date) = existing_date {
             if local_date >= archidekt_date.to_string() {
-                return Ok(DeckSyncResult::already_up_to_date(deck.name));
+                return Ok(with_mamo_note(DeckSyncResult::already_up_to_date(deck.name), mamo_sync_note));
             }
         }
         
@@ -2264,13 +2542,13 @@ pub async fn sync_archidekt_deck(deck_id: &str) -> Result<DeckSyncResult> {
         let forge_content = convert_archidekt_to_forge(&full_name, &deck)?;
         let (new_path, _) = write_deck_file(&full_name, &forge_content).await?;
         
-        Ok(DeckSyncResult::updated(deck.name, archived_path, new_path))
+        Ok(with_mamo_note(DeckSyncResult::updated(deck.name, archived_path, new_path), mamo_sync_note))
     } else {
         let full_name = format!("{} - {} ({})", author, deck.name, archidekt_date);
         let forge_content = convert_archidekt_to_forge(&full_name, &deck)?;
         let (new_path, _) = write_deck_file(&full_name, &forge_content).await?;
         
-        Ok(DeckSyncResult::new_downloaded(deck.name, new_path))
+        Ok(with_mamo_note(DeckSyncResult::new_downloaded(deck.name, new_path), mamo_sync_note))
     }
 }
 
@@ -2295,6 +2573,57 @@ pub async fn sync_deckstats_deck(owner_id: &str, deck_id: &str) -> Result<DeckSy
     
     let date = chrono::Local::now().format("%Y-%m-%d").to_string();
     let full_name = format!("Deckstats - {} ({})", deck_name, date);
+
+    // Optional reference deck sync to MaMo
+    let mut mamo_sync_note: Option<String> = None;
+    if let Ok(settings) = Settings::load() {
+        if settings.sync_as_reference_decks {
+            let token = settings.auth_token.as_ref().or(settings.gamelog_config.auth_token.as_ref());
+            if let Some(token) = token {
+                let api_url = if settings.gamelog_config.api_url.is_empty() {
+                    MAMO_API_URL
+                } else {
+                    &settings.gamelog_config.api_url
+                };
+
+                let (commanders, maincards) = extract_deckstats_cards(&body);
+                let source_url = format!("https://deckstats.net/decks/{}/{}", owner_id, deck_id);
+
+                let payload = SyncReferenceDeckPayload {
+                    name: deck_name.to_string(),
+                    source_url: Some(source_url),
+                    source_type: Some("deckstats".to_string()),
+                    source_date: Some(date.clone()),
+                    commanders,
+                    maincards,
+                };
+
+                match sync_deck_to_mamo_as_reference(&payload, token, api_url).await {
+                    Ok(resp) => {
+                        info!(
+                            "MaMo reference deck sync for Deckstats '{}': action={:?}, revision={:?}",
+                            deck_name, resp.action, resp.revision
+                        );
+                        if let Some(action) = resp.action {
+                            match action.as_str() {
+                                "created" => {
+                                    mamo_sync_note = Some("Imported to MaMo as reference deck".to_string());
+                                }
+                                "updated" => {
+                                    let rev = resp.revision.map(|r| format!("Rev {}", r)).unwrap_or_else(|| "new rev".to_string());
+                                    mamo_sync_note = Some(format!("MaMo reference updated ({})", rev));
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        warn!("Failed to sync Deckstats deck to MaMo for '{}': {}", deck_name, e);
+                    }
+                }
+            }
+        }
+    }
     
     let deck_dir = get_deck_directory()?;
     let (existing_file, _) = find_existing_deck_file("Deckstats", deck_name, &deck_dir)?;
@@ -2306,12 +2635,12 @@ pub async fn sync_deckstats_deck(owner_id: &str, deck_id: &str) -> Result<DeckSy
         let forge_content = convert_deckstats_to_forge(&full_name, &body)?;
         let (new_path, _) = write_deck_file(&full_name, &forge_content).await?;
         
-        Ok(DeckSyncResult::updated(deck_name.to_string(), archived_path, new_path))
+        Ok(with_mamo_note(DeckSyncResult::updated(deck_name.to_string(), archived_path, new_path), mamo_sync_note))
     } else {
         let forge_content = convert_deckstats_to_forge(&full_name, &body)?;
         let (new_path, _) = write_deck_file(&full_name, &forge_content).await?;
         
-        Ok(DeckSyncResult::new_downloaded(deck_name.to_string(), new_path))
+        Ok(with_mamo_note(DeckSyncResult::new_downloaded(deck_name.to_string(), new_path), mamo_sync_note))
     }
 }
 
@@ -3489,5 +3818,48 @@ Name=Example Commander Deck
     fn curated_opponent_deck_list_deserializes_when_empty() {
         let decks: Vec<CuratedOpponentDeck> = serde_json::from_str("[]").expect("empty array is valid");
         assert!(decks.is_empty());
+    }
+
+    #[test]
+    fn test_extract_moxfield_cards() {
+        let raw = serde_json::json!({
+            "card_1": {
+                "quantity": 1,
+                "card": {
+                    "name": "Atraxa, Praetors' Voice",
+                    "scryfall_oracle_id": "00000000-0000-0000-0000-000000000001",
+                    "set": "2xm",
+                    "cn": "190"
+                }
+            },
+            "card_2": {
+                "quantity": 2,
+                "card": {
+                    "name": "Sol Ring",
+                    "oracle_id": "00000000-0000-0000-0000-000000000002"
+                }
+            }
+        });
+
+        let cards = extract_moxfield_cards(&raw);
+        assert_eq!(cards.len(), 2);
+        let atraxa = cards.iter().find(|c| c.name == "Atraxa, Praetors' Voice").expect("Atraxa must be found");
+        assert_eq!(atraxa.amount, 1);
+        assert_eq!(atraxa.oracle_id.as_deref(), Some("00000000-0000-0000-0000-000000000001"));
+        let sol_ring = cards.iter().find(|c| c.name == "Sol Ring").expect("Sol Ring must be found");
+        assert_eq!(sol_ring.amount, 2);
+        assert_eq!(sol_ring.oracle_id.as_deref(), Some("00000000-0000-0000-0000-000000000002"));
+    }
+
+    #[test]
+    fn test_extract_deckstats_cards() {
+        let content = "//NAME: Test Deck\n1 The Ur-Dragon\n1 Sol Ring\n//Sideboard\n1 Mountain";
+        let (commanders, main) = extract_deckstats_cards(content);
+        assert_eq!(commanders.len(), 1);
+        assert_eq!(commanders[0].name, "The Ur-Dragon");
+        assert_eq!(commanders[0].amount, 1);
+        assert_eq!(main.len(), 1);
+        assert_eq!(main[0].name, "Sol Ring");
+        assert_eq!(main[0].amount, 1);
     }
 }

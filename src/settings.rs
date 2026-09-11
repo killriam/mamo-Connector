@@ -100,7 +100,7 @@ impl SavedLink {
 }
 
 /// Application settings
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Settings {
     /// List of saved links for synchronization
     #[serde(default)]
@@ -133,6 +133,27 @@ pub struct Settings {
     /// Defaults to the bundled dummy defender deck.
     #[serde(default = "default_simulation_opponent_deck")]
     pub simulation_opponent_deck: Option<String>,
+    /// Whether to backward-import and synchronize decks as Reference Decks in MaMo
+    #[serde(default = "default_true")]
+    pub sync_as_reference_decks: bool,
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Self {
+            saved_links: Vec::new(),
+            forge_path: None,
+            forge_auto_launch: true,
+            auto_sync_on_startup: false,
+            gamelog_config: GameLogConfig::default(),
+            auth_token: None,
+            moxfield_auth_token: None,
+            forge_scripts_path: None,
+            simulation_games: default_simulation_games(),
+            simulation_opponent_deck: default_simulation_opponent_deck(),
+            sync_as_reference_decks: true,
+        }
+    }
 }
 
 impl Settings {

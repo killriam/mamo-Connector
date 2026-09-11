@@ -4869,6 +4869,20 @@ impl LauncherApp {
                 ui.label("Syncing...");
             }
         });
+
+        ui.add_space(4.0);
+        let mut sync_as_ref = {
+            let settings = self.settings.lock().unwrap();
+            settings.sync_as_reference_decks
+        };
+        if ui.checkbox(&mut sync_as_ref, "Import & update synced decks as Reference Decks in MaMo")
+            .on_hover_text("Automatically registers synced decks in MaMo under Reference Decks and tracks new revisions when cards change")
+            .changed()
+        {
+            let mut settings = self.settings.lock().unwrap();
+            settings.sync_as_reference_decks = sync_as_ref;
+            let _ = settings.save();
+        }
         
         // Add dialog
         if show_add_dialog {
