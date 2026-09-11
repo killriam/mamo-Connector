@@ -2577,6 +2577,7 @@ impl LauncherApp {
         egui::Window::new(title)
             .collapsible(false)
             .resizable(false)
+            .vscroll(true)
             .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
             .show(ctx, |ui| {
                 ui.set_min_width(400.0);
@@ -2949,6 +2950,7 @@ impl LauncherApp {
         egui::Window::new(title)
             .collapsible(false)
             .resizable(false)
+            .vscroll(true)
             .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
             .show(ctx, |ui| {
                 ui.set_min_width(340.0);
@@ -3275,8 +3277,9 @@ impl LauncherApp {
     }
 
     fn render_setup_wizard(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
-        ui.vertical_centered(|ui| {
-            ui.add_space(20.0);
+        egui::ScrollArea::vertical().show(ui, |ui| {
+            ui.vertical_centered(|ui| {
+                ui.add_space(20.0);
 
             match self.wizard.step.clone() {
                 // ── Step 1: Welcome ───────────────────────────────────────────
@@ -3611,6 +3614,7 @@ impl LauncherApp {
                     }
                 }
             }
+        });
         });
     }
 
@@ -4216,18 +4220,20 @@ impl LauncherApp {
     // ==================== Decks Tab (merged Import + Sync) ====================
 
     fn render_decks_tab(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
-        ui.label(egui::RichText::new(format!("Deck folder: {}", get_deck_directory_display())).weak().small());
-        ui.add_space(5.0);
+        egui::ScrollArea::vertical().show(ui, |ui| {
+            ui.label(egui::RichText::new(format!("Deck folder: {}", get_deck_directory_display())).weak().small());
+            ui.add_space(5.0);
 
-        // URL input section (from Import tab)
-        self.render_import_tab(ui, ctx);
+            // URL input section (from Import tab)
+            self.render_import_tab(ui, ctx);
 
-        ui.add_space(10.0);
-        ui.separator();
-        ui.add_space(5.0);
+            ui.add_space(10.0);
+            ui.separator();
+            ui.add_space(5.0);
 
-        // Sync section (from Sync tab)
-        self.render_sync_tab(ui, ctx);
+            // Sync section (from Sync tab)
+            self.render_sync_tab(ui, ctx);
+        });
     }
 
     fn detect_url_type(&self, url: &str) -> UrlType {
@@ -4460,10 +4466,14 @@ impl LauncherApp {
             ui.add_space(5.0);
             
             // MaMo Deck list with scrolling
-            let available_height = (ui.available_height() - 60.0) / 2.0;
+            let available_height = if ui.available_height().is_finite() {
+                (ui.available_height() - 60.0) / 2.0
+            } else {
+                200.0
+            };
             egui::ScrollArea::vertical()
                 .id_source("mamo_decks_scroll")
-                .max_height(available_height.max(100.0))
+                .max_height(available_height.clamp(100.0, 300.0))
                 .show(ui, |ui: &mut egui::Ui| {
                     for (i, _deck_id, name, format, is_selected, local_status, commander) in &mamo_decks_info {
                         let mut selected = *is_selected;
@@ -4550,10 +4560,14 @@ impl LauncherApp {
             ui.add_space(5.0);
             
             // Deck list with scrolling
-            let available_height = ui.available_height() - 60.0;
+            let available_height = if ui.available_height().is_finite() {
+                ui.available_height() - 60.0
+            } else {
+                250.0
+            };
             egui::ScrollArea::vertical()
                 .id_source("moxfield_decks_scroll")
-                .max_height(available_height.max(100.0))
+                .max_height(available_height.clamp(100.0, 300.0))
                 .show(ui, |ui: &mut egui::Ui| {
                     for (i, _deck_id, name, format, is_selected, local_status, local_date, moxfield_date) in &decks_info {
                         let mut selected = *is_selected;
@@ -4876,15 +4890,19 @@ impl LauncherApp {
         if saved_links.is_empty() {
             ui.label(egui::RichText::new("No saved links yet. Add a deck or user link to enable sync.").weak());
         } else {
-            let available_height = if !sync_results.is_empty() { 
-                ui.available_height() / 2.0 - 30.0 
-            } else { 
-                ui.available_height() - 100.0 
+            let available_height = if ui.available_height().is_finite() {
+                if !sync_results.is_empty() { 
+                    ui.available_height() / 2.0 - 30.0 
+                } else { 
+                    ui.available_height() - 100.0 
+                }
+            } else {
+                200.0
             };
             
             egui::ScrollArea::vertical()
                 .id_source("saved_links_scroll")
-                .max_height(available_height.max(100.0))
+                .max_height(available_height.clamp(100.0, 300.0))
                 .show(ui, |ui: &mut egui::Ui| {
                     let mut link_to_delete: Option<String> = None;
                     
