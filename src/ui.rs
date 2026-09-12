@@ -35,6 +35,30 @@ mod colors {
     pub const NEUTRAL: Color32 = Color32::from_rgb(100, 100, 100);
 }
 
+/// Named `ui.add_space(...)` gaps, so the 13 distinct values already in use across this file are
+/// discoverable and tunable from one place instead of scattered bare literals. These intentionally
+/// preserve every existing value rather than collapsing them onto a tighter scale: 3 of the 4 tabs
+/// (Get Decks, Setup, Settings) couldn't be visually verified in the environment this was written
+/// in — see the critique write-up — so changing actual pixel values here would be an unverified
+/// layout change, not a same-output rename. Collapsing SPACE_3→SPACE_4 and SPACE_15→SPACE_16 (the
+/// two closest near-duplicate pairs) is a reasonable next step once someone can eyeball all four
+/// tabs after the change.
+mod spacing {
+    pub const SPACE_2: f32 = 2.0;
+    pub const SPACE_3: f32 = 3.0;
+    pub const SPACE_4: f32 = 4.0;
+    pub const SPACE_5: f32 = 5.0;
+    pub const SPACE_6: f32 = 6.0;
+    pub const SPACE_8: f32 = 8.0;
+    pub const SPACE_10: f32 = 10.0;
+    pub const SPACE_12: f32 = 12.0;
+    pub const SPACE_14: f32 = 14.0;
+    pub const SPACE_15: f32 = 15.0;
+    pub const SPACE_16: f32 = 16.0;
+    pub const SPACE_20: f32 = 20.0;
+    pub const SPACE_24: f32 = 24.0;
+}
+
 #[derive(Clone, PartialEq, Eq)]
 enum Tab {
     Play,
@@ -420,8 +444,8 @@ fn render_status_pill(ui: &mut egui::Ui, text: &str, status: PillStatus) {
 
     egui::Frame::default()
         .fill(bg_color)
-        .rounding(10.0)
-        .inner_margin(egui::Margin::symmetric(8.0, 3.0))
+        .rounding(spacing::SPACE_10)
+        .inner_margin(egui::Margin::symmetric(spacing::SPACE_8, spacing::SPACE_3))
         .show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = 4.0;
@@ -1780,7 +1804,7 @@ impl eframe::App for LauncherApp {
                         let ver = update_ver.as_deref().unwrap_or("new");
                         egui::Frame::default()
                             .fill(egui::Color32::from_rgb(212, 237, 218))
-                            .inner_margin(egui::Margin::symmetric(8.0, 4.0))
+                            .inner_margin(egui::Margin::symmetric(spacing::SPACE_8, spacing::SPACE_4))
                             .show(ui, |ui| {
                                 ui.horizontal(|ui| {
                                     ui.label(
@@ -1804,7 +1828,7 @@ impl eframe::App for LauncherApp {
                                     });
                                 });
                             });
-                        ui.add_space(2.0);
+                        ui.add_space(spacing::SPACE_2);
                     } else if is_downloading {
                         let ver = update_ver.as_deref().unwrap_or("");
                         let status_text = self
@@ -1816,7 +1840,7 @@ impl eframe::App for LauncherApp {
                             .unwrap_or_else(|| "Downloading update…".to_string());
                         egui::Frame::default()
                             .fill(egui::Color32::from_rgb(226, 227, 229))
-                            .inner_margin(egui::Margin::symmetric(8.0, 4.0))
+                            .inner_margin(egui::Margin::symmetric(spacing::SPACE_8, spacing::SPACE_4))
                             .show(ui, |ui| {
                                 ui.horizontal(|ui| {
                                     ui.spinner();
@@ -1830,11 +1854,11 @@ impl eframe::App for LauncherApp {
                                     }
                                 });
                             });
-                        ui.add_space(2.0);
+                        ui.add_space(spacing::SPACE_2);
                     } else if let Some(ref err) = update_err {
                         egui::Frame::default()
                             .fill(egui::Color32::from_rgb(248, 215, 218))
-                            .inner_margin(egui::Margin::symmetric(8.0, 4.0))
+                            .inner_margin(egui::Margin::symmetric(spacing::SPACE_8, spacing::SPACE_4))
                             .show(ui, |ui| {
                                 ui.horizontal(|ui| {
                                     ui.label(
@@ -1857,11 +1881,11 @@ impl eframe::App for LauncherApp {
                                     });
                                 });
                             });
-                        ui.add_space(2.0);
+                        ui.add_space(spacing::SPACE_2);
                     } else if let Some(ref ver) = update_ver {
                         egui::Frame::default()
                             .fill(egui::Color32::from_rgb(255, 243, 205))
-                            .inner_margin(egui::Margin::symmetric(8.0, 4.0))
+                            .inner_margin(egui::Margin::symmetric(spacing::SPACE_8, spacing::SPACE_4))
                             .show(ui, |ui| {
                                 ui.horizontal(|ui| {
                                     ui.label(
@@ -1879,7 +1903,7 @@ impl eframe::App for LauncherApp {
                                     });
                                 });
                             });
-                        ui.add_space(2.0);
+                        ui.add_space(spacing::SPACE_2);
                     }
                 }
 
@@ -1913,7 +1937,7 @@ impl eframe::App for LauncherApp {
                 {
                     egui::Frame::default()
                         .fill(egui::Color32::from_rgb(205, 232, 255))
-                        .inner_margin(egui::Margin::symmetric(8.0, 4.0))
+                        .inner_margin(egui::Margin::symmetric(spacing::SPACE_8, spacing::SPACE_4))
                         .show(ui, |ui| {
                             ui.horizontal(|ui| {
                                 if let Some(ref prog) = forge_update_progress {
@@ -1957,7 +1981,7 @@ impl eframe::App for LauncherApp {
                                 });
                             });
                         });
-                    ui.add_space(2.0);
+                    ui.add_space(spacing::SPACE_2);
                 }
 
                 // Tab bar — 4 tabs, one per core journey: Play (start decks, launch Forge, watch
@@ -1991,7 +2015,7 @@ impl eframe::App for LauncherApp {
                     };
                     egui::Frame::default()
                         .fill(egui::Color32::from_rgb(238, 236, 247))
-                        .inner_margin(egui::Margin::symmetric(10.0, 5.0))
+                        .inner_margin(egui::Margin::symmetric(spacing::SPACE_10, spacing::SPACE_5))
                         .show(ui, |ui| {
                             ui.horizontal(|ui| {
                                 let (rect, _) = ui.allocate_exact_size(egui::vec2(8.0, 8.0), egui::Sense::hover());
@@ -2000,7 +2024,7 @@ impl eframe::App for LauncherApp {
                             });
                         });
                 }
-                ui.add_space(4.0);
+                ui.add_space(spacing::SPACE_4);
                 ui.separator();
 
                 // Tab content
@@ -2283,7 +2307,7 @@ impl LauncherApp {
                 .max_height(28.0)
                 .frame(egui::Frame::default()
                     .fill(egui::Color32::from_rgb(245, 245, 250))
-                    .inner_margin(egui::Margin::symmetric(8.0, 4.0))
+                    .inner_margin(egui::Margin::symmetric(spacing::SPACE_8, spacing::SPACE_4))
                     .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(220, 220, 230))))
                 .show(ctx, |ui| {
                     ui.horizontal(|ui| {
@@ -2316,7 +2340,7 @@ impl LauncherApp {
                 .default_height(150.0)
                 .frame(egui::Frame::default()
                     .fill(egui::Color32::from_rgb(245, 245, 250))
-                    .inner_margin(egui::Margin::symmetric(8.0, 4.0))
+                    .inner_margin(egui::Margin::symmetric(spacing::SPACE_8, spacing::SPACE_4))
                     .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(220, 220, 230))))
                 .show(ctx, |ui| {
                     // Header row
@@ -2646,7 +2670,7 @@ impl LauncherApp {
                             ui.spinner();
                             ui.label(egui::RichText::new(format!("Downloading '{deck_name}' from MaMo…")).small());
                         });
-                        ui.add_space(14.0);
+                        ui.add_space(spacing::SPACE_14);
                         ui.horizontal(|ui| {
                             if ui.button("Cancel").clicked() {
                                 action_cancel = true;
@@ -2684,9 +2708,9 @@ impl LauncherApp {
                                 }
                             });
                         });
-                        ui.add_space(12.0);
+                        ui.add_space(spacing::SPACE_12);
                         ui.label("A Forge window is already open. Would you like to start a new Forge instance?");
-                        ui.add_space(16.0);
+                        ui.add_space(spacing::SPACE_16);
                         ui.horizontal(|ui| {
                             if ui.button("Cancel").clicked() {
                                 action_cancel = true;
@@ -2706,7 +2730,7 @@ impl LauncherApp {
                             ui.spinner();
                             ui.label(egui::RichText::new("Checking if a newer Forge version is available…").small());
                         });
-                        ui.add_space(14.0);
+                        ui.add_space(spacing::SPACE_14);
                         ui.horizontal(|ui| {
                             if ui.button("Cancel").clicked() {
                                 action_cancel = true;
@@ -2742,9 +2766,9 @@ impl LauncherApp {
                                 }
                             });
                         });
-                        ui.add_space(12.0);
+                        ui.add_space(spacing::SPACE_12);
                         ui.label("Would you like to update before starting Forge?");
-                        ui.add_space(16.0);
+                        ui.add_space(spacing::SPACE_16);
                         ui.horizontal(|ui| {
                             if ui.button("Cancel").clicked() {
                                 action_cancel = true;
@@ -2781,10 +2805,10 @@ impl LauncherApp {
                             ui.spinner();
                             ui.label(egui::RichText::new("Downloading Forge update…").strong());
                         });
-                        ui.add_space(8.0);
+                        ui.add_space(spacing::SPACE_8);
                         ui.add(egui::ProgressBar::new(pct).show_percentage());
                         ui.label(egui::RichText::new(status_text).small().color(egui::Color32::GRAY));
-                        ui.add_space(14.0);
+                        ui.add_space(spacing::SPACE_14);
                         ui.horizontal(|ui| {
                             if ui.button("Cancel").clicked() {
                                 cancelled.store(true, Ordering::Relaxed);
@@ -2805,7 +2829,7 @@ impl LauncherApp {
                                 ui.label(egui::RichText::new(error).small().color(colors::ERROR));
                             });
                         });
-                        ui.add_space(14.0);
+                        ui.add_space(spacing::SPACE_14);
                         ui.horizontal(|ui| {
                             if ui.button("Cancel").clicked() {
                                 action_cancel = true;
@@ -3020,7 +3044,7 @@ impl LauncherApp {
             .show(ctx, |ui| {
                 ui.set_min_width(340.0);
                 ui.label(egui::RichText::new(body).color(egui::Color32::from_rgb(60, 60, 60)));
-                ui.add_space(16.0);
+                ui.add_space(spacing::SPACE_16);
                 ui.horizontal(|ui| {
                     if ui.button("Cancel").clicked() {
                         self.confirm_action = None;
@@ -3347,15 +3371,15 @@ impl LauncherApp {
     fn render_setup_wizard(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         egui::ScrollArea::vertical().show(ui, |ui| {
             ui.vertical_centered(|ui| {
-                ui.add_space(20.0);
+                ui.add_space(spacing::SPACE_20);
 
             match self.wizard.step.clone() {
                 // ── Step 1: Welcome ───────────────────────────────────────────
                 WizardStep::Welcome => {
                     ui.label(egui::RichText::new("🔌").size(48.0));
-                    ui.add_space(8.0);
+                    ui.add_space(spacing::SPACE_8);
                     ui.label(egui::RichText::new("Welcome to MaMo Connector").size(22.0).strong());
-                    ui.add_space(12.0);
+                    ui.add_space(spacing::SPACE_12);
                     ui.label(
                         egui::RichText::new(
                             "Before you can playtest in Forge, we need to find your\n\
@@ -3363,7 +3387,7 @@ impl LauncherApp {
                         )
                         .color(colors::NEUTRAL),
                     );
-                    ui.add_space(24.0);
+                    ui.add_space(spacing::SPACE_24);
                     if ui.add(egui::Button::new(
                         egui::RichText::new("Get Started →").size(16.0)
                     ).min_size(egui::vec2(160.0, 36.0))).clicked() {
@@ -3381,7 +3405,7 @@ impl LauncherApp {
                 WizardStep::DownloadForge => {
                     ui.set_max_width(500.0);
                     ui.label(egui::RichText::new("⬇ Download MaMo Forge").size(20.0).strong());
-                    ui.add_space(4.0);
+                    ui.add_space(spacing::SPACE_4);
                     ui.add(egui::Label::new(
                         egui::RichText::new(
                             "MaMo uses a custom Forge build with replay recording, \
@@ -3390,7 +3414,7 @@ impl LauncherApp {
                         )
                         .color(colors::NEUTRAL),
                     ).wrap());
-                    ui.add_space(16.0);
+                    ui.add_space(spacing::SPACE_16);
 
                     // Read current progress state
                     let (prog_fraction, prog_text, prog_finished, prog_error) = self
@@ -3409,7 +3433,7 @@ impl LauncherApp {
                             ui.spinner();
                             ui.label(egui::RichText::new(&prog_text).color(colors::INFO).strong());
                         });
-                        ui.add_space(6.0);
+                        ui.add_space(spacing::SPACE_6);
                         if prog_fraction > 0.0 {
                             ui.add(
                                 egui::ProgressBar::new(prog_fraction)
@@ -3430,7 +3454,7 @@ impl LauncherApp {
                                     .color(colors::SUCCESS)
                                     .strong(),
                             );
-                            ui.add_space(10.0);
+                            ui.add_space(spacing::SPACE_10);
                             ui.horizontal(|ui| {
                                 if ui.add(
                                     egui::Button::new(egui::RichText::new("Use Existing →").strong())
@@ -3445,7 +3469,7 @@ impl LauncherApp {
                                     self.start_forge_download(ctx);
                                 }
                             });
-                            ui.add_space(6.0);
+                            ui.add_space(spacing::SPACE_6);
                         } else {
                             // Show any previous error
                             if let Some(ref err) = prog_error {
@@ -3454,7 +3478,7 @@ impl LauncherApp {
                                         .color(colors::ERROR)
                                         .small(),
                                 );
-                                ui.add_space(6.0);
+                                ui.add_space(spacing::SPACE_6);
                             }
 
                             if ui.add(
@@ -3470,12 +3494,12 @@ impl LauncherApp {
                 // ── Step 2: Configure Forge path ─────────────────────────────
                 WizardStep::ConfigureForge => {
                     ui.label(egui::RichText::new("🎮 Configure Forge").size(20.0).strong());
-                    ui.add_space(4.0);
+                    ui.add_space(spacing::SPACE_4);
                     ui.label(
                         egui::RichText::new("Point MaMo Connector to your Forge installation.")
                             .color(colors::NEUTRAL),
                     );
-                    ui.add_space(16.0);
+                    ui.add_space(spacing::SPACE_16);
 
                     // Path input row
                     ui.horizontal(|ui| {
@@ -3498,7 +3522,7 @@ impl LauncherApp {
                             ui.label(egui::RichText::new("✗").color(colors::ERROR).strong());
                         }
                     });
-                    ui.add_space(8.0);
+                    ui.add_space(spacing::SPACE_8);
 
                     // Helper buttons
                     ui.horizontal(|ui| {
@@ -3534,7 +3558,7 @@ impl LauncherApp {
                             }
                         }
                     });
-                    ui.add_space(12.0);
+                    ui.add_space(spacing::SPACE_12);
 
                     // Test launch row
                     ui.horizontal(|ui| {
@@ -3577,7 +3601,7 @@ impl LauncherApp {
                             None => {}
                         }
                     });
-                    ui.add_space(16.0);
+                    ui.add_space(spacing::SPACE_16);
 
                     // Java runtime status — Forge needs Java 17+
                     if self.wizard.java_status.is_none() {
@@ -3602,14 +3626,14 @@ impl LauncherApp {
                             egui::Frame::default()
                                 .fill(egui::Color32::from_rgb(255, 244, 224))
                                 .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(230, 160, 60)))
-                                .inner_margin(egui::Margin::same(10.0))
-                                .rounding(6.0)
+                                .inner_margin(egui::Margin::same(spacing::SPACE_10))
+                                .rounding(spacing::SPACE_6)
                                 .show(ui, |ui| {
                                     ui.label(
                                         egui::RichText::new(msg)
                                             .color(colors::WARNING),
                                     );
-                                    ui.add_space(6.0);
+                                    ui.add_space(spacing::SPACE_6);
                                     ui.horizontal(|ui| {
                                         if ui.button("📥 Download Java 17 (Adoptium)").clicked() {
                                             let _ = std::process::Command::new("cmd")
@@ -3620,7 +3644,7 @@ impl LauncherApp {
                                             self.wizard.java_status = Some(crate::forge::detect_java());
                                         }
                                     });
-                                    ui.add_space(4.0);
+                                    ui.add_space(spacing::SPACE_4);
                                     ui.label(
                                         egui::RichText::new(
                                             "After running the Java installer, click Re-check. \
@@ -3634,7 +3658,7 @@ impl LauncherApp {
                         }
                         None => {}
                     }
-                    ui.add_space(16.0);
+                    ui.add_space(spacing::SPACE_16);
 
                     ui.horizontal(|ui| {
                         let can_finish = self.wizard.forge_path_valid;
@@ -3664,9 +3688,9 @@ impl LauncherApp {
                 // ── Step 3: Done ─────────────────────────────────────────────
                 WizardStep::Done => {
                     ui.label(egui::RichText::new("✅").size(48.0));
-                    ui.add_space(8.0);
+                    ui.add_space(spacing::SPACE_8);
                     ui.label(egui::RichText::new("You're all set!").size(22.0).strong());
-                    ui.add_space(12.0);
+                    ui.add_space(spacing::SPACE_12);
                     ui.label(
                         egui::RichText::new(
                             "Forge is configured. Click any playtest button in MaMo\n\
@@ -3674,7 +3698,7 @@ impl LauncherApp {
                         )
                         .color(colors::NEUTRAL),
                     );
-                    ui.add_space(24.0);
+                    ui.add_space(spacing::SPACE_24);
                     if ui.add(egui::Button::new(
                         egui::RichText::new("Close").size(15.0)
                     ).min_size(egui::vec2(100.0, 32.0))).clicked() {
@@ -3983,13 +4007,13 @@ impl LauncherApp {
                 });
             });
 
-            ui.add_space(10.0);
+            ui.add_space(spacing::SPACE_10);
 
             // Your decks — standalone start (pick a deck, launch Forge) plus manual log
             // upload/retry, independent of anything triggered from the website.
             ui.group(|ui| {
                 ui.label(egui::RichText::new("Your decks").strong());
-                ui.add_space(5.0);
+                ui.add_space(spacing::SPACE_5);
 
                 // Lazy-load local Forge decks on first render
                 if self.forge_local_decks.is_empty() {
@@ -4126,7 +4150,7 @@ impl LauncherApp {
                 }
             });
 
-            ui.add_space(10.0);
+            ui.add_space(spacing::SPACE_10);
 
             let directory_valid = self.gamelog_state.lock().unwrap().directory_valid;
             if !directory_valid {
@@ -4139,7 +4163,7 @@ impl LauncherApp {
                     });
                     ui.label(egui::RichText::new("Uploads (and the Activity below) can't work until this is set.").small().color(egui::Color32::GRAY));
                 });
-                ui.add_space(10.0);
+                ui.add_space(spacing::SPACE_10);
             }
 
             // Activity — the play-session timeline (journey 2's centerpiece). Always shows the
@@ -4158,7 +4182,7 @@ impl LauncherApp {
                     .small()
                     .color(egui::Color32::GRAY),
                 );
-                ui.add_space(6.0);
+                ui.add_space(spacing::SPACE_6);
 
                 let ps = self.play_session.lock().unwrap().clone();
                 let current = play_session_step_index(&ps);
@@ -4204,15 +4228,15 @@ impl LauncherApp {
                     egui::Frame::default()
                         .fill(fill)
                         .stroke(egui::Stroke::new(1.0, stroke))
-                        .inner_margin(egui::Margin::same(10.0))
-                        .rounding(6.0)
+                        .inner_margin(egui::Margin::same(spacing::SPACE_10))
+                        .rounding(spacing::SPACE_6)
                         .show(ui, |ui| {
                             ui.label(egui::RichText::new(title).strong().color(text_color));
                             if is_issue && i == 4 {
                                 if let PlaySession::UploadIssue { ref message, auth_expired } = ps {
                                     ui.label(egui::RichText::new(message).small().color(text_color));
                                     if auth_expired {
-                                        ui.add_space(4.0);
+                                        ui.add_space(spacing::SPACE_4);
                                         if ui.button("🔗 Reconnect MaMo account").clicked() {
                                             let _ = std::process::Command::new("cmd")
                                                 .args(["/c", "start", MAMO_WEBSITE_URL])
@@ -4246,7 +4270,7 @@ impl LauncherApp {
                                 ui.label(egui::RichText::new(default_sub).small().color(text_color));
                             }
                         });
-                    ui.add_space(6.0);
+                    ui.add_space(spacing::SPACE_6);
                 }
 
                 let hidden_steps = if self.play_timeline_expanded { 0 } else { 6 - visible_range.clone().count() };
@@ -4262,7 +4286,7 @@ impl LauncherApp {
                 }
             });
 
-            ui.add_space(10.0);
+            ui.add_space(spacing::SPACE_10);
 
             // Per-file detail for the last scan — secondary to the Activity timeline above
             // (which only ever reflects the single most relevant file), so a batch of several
@@ -4299,10 +4323,10 @@ impl LauncherApp {
                             }
                         });
                 });
-                ui.add_space(6.0);
+                ui.add_space(spacing::SPACE_6);
             }
 
-            ui.add_space(4.0);
+            ui.add_space(spacing::SPACE_4);
 
             // Build info (compact)
             ui.horizontal(|ui| {
@@ -4321,14 +4345,14 @@ impl LauncherApp {
     fn render_decks_tab(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         egui::ScrollArea::vertical().show(ui, |ui| {
             ui.label(egui::RichText::new(format!("Deck folder: {}", get_deck_directory_display())).weak().small());
-            ui.add_space(5.0);
+            ui.add_space(spacing::SPACE_5);
 
             // URL input section (from Import tab)
             self.render_import_tab(ui, ctx);
 
-            ui.add_space(10.0);
+            ui.add_space(spacing::SPACE_10);
             ui.separator();
-            ui.add_space(5.0);
+            ui.add_space(spacing::SPACE_5);
 
             // Sync section (from Sync tab)
             self.render_sync_tab(ui, ctx);
@@ -4392,11 +4416,11 @@ impl LauncherApp {
     
     fn render_import_tab(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         ui.label(egui::RichText::new("Import Decks").strong());
-        ui.add_space(5.0);
+        ui.add_space(spacing::SPACE_5);
         
         // Description
         ui.label("Paste a URL or username/deck ID to import decks. Supported sources:");
-        ui.add_space(3.0);
+        ui.add_space(spacing::SPACE_3);
         
         egui::Grid::new("sources_grid")
             .num_columns(2)
@@ -4423,9 +4447,9 @@ impl LauncherApp {
                 ui.end_row();
             });
         
-        ui.add_space(10.0);
+        ui.add_space(spacing::SPACE_10);
         ui.separator();
-        ui.add_space(10.0);
+        ui.add_space(spacing::SPACE_10);
         
         // URL input
         ui.horizontal(|ui| {
@@ -4440,7 +4464,7 @@ impl LauncherApp {
             }
         });
         
-        ui.add_space(10.0);
+        ui.add_space(spacing::SPACE_10);
         
         // Detect URL type
         let url_type = self.detect_url_type(&self.url_input);
@@ -4471,7 +4495,7 @@ impl LauncherApp {
             UrlType::Empty => {}
         }
         
-        ui.add_space(10.0);
+        ui.add_space(spacing::SPACE_10);
         
         // Get current state for Moxfield decks
         let (is_loading, result_message, has_moxfield_decks, decks_info) = {
@@ -4540,7 +4564,7 @@ impl LauncherApp {
         // Show MaMo user decks list if available
         if has_mamo_decks {
             ui.separator();
-            ui.add_space(5.0);
+            ui.add_space(spacing::SPACE_5);
             ui.label(egui::RichText::new("MaMo User Decks").strong());
             
             // Selection controls
@@ -4562,7 +4586,7 @@ impl LauncherApp {
                 ui.label(format!("{}/{} selected", selected_count, mamo_decks_info.len()));
             });
             
-            ui.add_space(5.0);
+            ui.add_space(spacing::SPACE_5);
             
             // MaMo Deck list with scrolling
             let available_height = if ui.available_height().is_finite() {
@@ -4616,7 +4640,7 @@ impl LauncherApp {
         // Show Moxfield user decks list if available
         if has_moxfield_decks {
             ui.separator();
-            ui.add_space(5.0);
+            ui.add_space(spacing::SPACE_5);
             ui.label(egui::RichText::new("Moxfield User Decks").strong());
             
             // Selection controls
@@ -4656,7 +4680,7 @@ impl LauncherApp {
                 ui.label(egui::RichText::new("● Up to date").color(colors::NEUTRAL));
             });
             
-            ui.add_space(5.0);
+            ui.add_space(spacing::SPACE_5);
             
             // Deck list with scrolling
             let available_height = if ui.available_height().is_finite() {
@@ -4701,7 +4725,7 @@ impl LauncherApp {
                     }
                 });
             
-            ui.add_space(10.0);
+            ui.add_space(spacing::SPACE_10);
             
             // Import selected button
             let selected_count = decks_info.iter().filter(|(_, _, _, _, s, _, _, _)| *s).count();
@@ -4935,9 +4959,9 @@ impl LauncherApp {
 
     fn render_sync_tab(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         ui.label(egui::RichText::new("Deck Synchronization").strong());
-        ui.add_space(5.0);
+        ui.add_space(spacing::SPACE_5);
         ui.label(egui::RichText::new(format!("Deck folder: {}", get_deck_directory_display())).weak().small());
-        ui.add_space(10.0);
+        ui.add_space(spacing::SPACE_10);
         
         // Get current state
         let (is_syncing, sync_message, sync_results) = {
@@ -4969,7 +4993,7 @@ impl LauncherApp {
             }
         });
 
-        ui.add_space(4.0);
+        ui.add_space(spacing::SPACE_4);
         let mut sync_as_ref = {
             let settings = self.settings.lock().unwrap();
             settings.sync_as_reference_decks
@@ -4988,12 +5012,12 @@ impl LauncherApp {
             self.render_add_link_dialog(ui, ctx);
         }
         
-        ui.add_space(10.0);
+        ui.add_space(spacing::SPACE_10);
         ui.separator();
         
         // Saved links list
         ui.label(egui::RichText::new("Saved Links").strong());
-        ui.add_space(5.0);
+        ui.add_space(spacing::SPACE_5);
         
         let saved_links: Vec<SavedLink> = {
             let settings = self.settings.lock().unwrap();
@@ -5103,7 +5127,7 @@ impl LauncherApp {
         
         // Sync results
         if !sync_results.is_empty() {
-            ui.add_space(10.0);
+            ui.add_space(spacing::SPACE_10);
             ui.separator();
             ui.label(egui::RichText::new("Sync Results").strong());
             
@@ -5146,7 +5170,7 @@ impl LauncherApp {
         
         // Show sync message
         if let Some(msg) = sync_message {
-            ui.add_space(5.0);
+            ui.add_space(spacing::SPACE_5);
             let color = if msg.contains("Error") || msg.contains("failed") {
                 colors::ERROR
             } else {
@@ -5160,11 +5184,11 @@ impl LauncherApp {
         egui::Frame::default()
             .fill(egui::Color32::from_rgb(245, 245, 245))
             .inner_margin(10.0)
-            .rounding(5.0)
+            .rounding(spacing::SPACE_5)
             .stroke(egui::Stroke::new(1.0, egui::Color32::GRAY))
             .show(ui, |ui| {
                 ui.label(egui::RichText::new("Add New Link").strong());
-                ui.add_space(5.0);
+                ui.add_space(spacing::SPACE_5);
                 
                 // URL input
                 ui.horizontal(|ui| {
@@ -5224,7 +5248,7 @@ impl LauncherApp {
                     }
                 });
                 
-                ui.add_space(5.0);
+                ui.add_space(spacing::SPACE_5);
                 
                 // Buttons
                 ui.horizontal(|ui| {
@@ -5780,9 +5804,9 @@ impl LauncherApp {
         
         ui.group(|ui| {
             ui.label(egui::RichText::new("🎯 Deck Mapping").strong());
-            ui.add_space(5.0);
+            ui.add_space(spacing::SPACE_5);
             ui.label(egui::RichText::new("Map deck names from game logs to your MaMo decks.").small().weak());
-            ui.add_space(5.0);
+            ui.add_space(spacing::SPACE_5);
             
             ui.horizontal(|ui| {
                 if ui.add_enabled(!is_fetching, egui::Button::new("🔄 Fetch My Decks")).clicked() {
@@ -5817,7 +5841,7 @@ impl LauncherApp {
             
             // Show current mappings
             if !deck_mappings.mappings.is_empty() {
-                ui.add_space(5.0);
+                ui.add_space(spacing::SPACE_5);
                 ui.label(egui::RichText::new("Current Mappings:").small());
                 
                 egui::ScrollArea::vertical()
@@ -5858,7 +5882,7 @@ impl LauncherApp {
             
             // Add new mapping section
             if !user_decks.is_empty() {
-                ui.add_space(5.0);
+                ui.add_space(spacing::SPACE_5);
                 ui.separator();
                 ui.label(egui::RichText::new("Add New Mapping:").small());
                 
@@ -5909,7 +5933,7 @@ impl LauncherApp {
                         }
                         
                         // Also show full deck list with search
-                        ui.add_space(5.0);
+                        ui.add_space(spacing::SPACE_5);
                         ui.horizontal(|ui| {
                             ui.label("Search:");
                             let mut filter = deck_search_filter.clone();
@@ -6064,7 +6088,7 @@ impl LauncherApp {
             (picker.is_loading, picker.scenarios.clone(), picker.error_message.clone())
         };
 
-        ui.add_space(6.0);
+        ui.add_space(spacing::SPACE_6);
         ui.group(|ui| {
             ui.label(egui::RichText::new("Scenarios").strong().small());
             if is_loading {
@@ -6127,12 +6151,12 @@ impl LauncherApp {
                         }
                     });
                 });
-                ui.add_space(6.0);
+                ui.add_space(spacing::SPACE_6);
 
                 if has_token {
                     ui.label("Game logs upload automatically, and your MaMo decks show up in Play.");
                     ui.label(egui::RichText::new("Seeing an auth error? Your token may have been revoked — reconnect below.").small().weak());
-                    ui.add_space(5.0);
+                    ui.add_space(spacing::SPACE_5);
                     if ui.button("Disconnect").clicked() {
                         {
                             let mut state = self.settings_state.lock().unwrap();
@@ -6140,7 +6164,7 @@ impl LauncherApp {
                         }
                         self.save_auth_token();
                     }
-                    ui.add_space(8.0);
+                    ui.add_space(spacing::SPACE_8);
                 } else {
                     ui.label("On the MaMo website, click the profile icon (top-right), then \"Connect Connector\".");
                 }
@@ -6151,7 +6175,7 @@ impl LauncherApp {
                 {
                     ctx.output_mut(|o| o.open_url = Some(egui::OpenUrl::new_tab(MAMO_WEBSITE_URL)));
                 }
-                ui.add_space(8.0);
+                ui.add_space(spacing::SPACE_8);
                 ui.label(egui::RichText::new("Or paste a token directly:").small().weak());
                 ui.horizontal(|ui| {
                     let mut token_input = {
@@ -6174,7 +6198,7 @@ impl LauncherApp {
                 });
             });
 
-            ui.add_space(12.0);
+            ui.add_space(spacing::SPACE_12);
 
             // ── Forge ──────────────────────────────────────────────────────
             ui.group(|ui| {
@@ -6199,7 +6223,7 @@ impl LauncherApp {
                         }
                     });
                 });
-                ui.add_space(6.0);
+                ui.add_space(spacing::SPACE_6);
 
                 ui.horizontal(|ui| {
                     ui.label("Path:");
@@ -6222,7 +6246,7 @@ impl LauncherApp {
                         }
                     }
                 });
-                ui.add_space(5.0);
+                ui.add_space(spacing::SPACE_5);
                 ui.horizontal(|ui| {
                     if ui.button("Auto-detect").clicked() {
                         if let Some(path) = get_default_forge_path() {
@@ -6282,7 +6306,7 @@ impl LauncherApp {
                     let p = std::path::Path::new(&forge_path_input);
                     if p.is_dir() {
                         if let Some(jar) = resolve_latest_forge_jar(p) {
-                            ui.add_space(3.0);
+                            ui.add_space(spacing::SPACE_3);
                             ui.label(
                                 egui::RichText::new(format!("└─  {}", jar.file_name().unwrap_or_default().to_string_lossy()))
                                     .color(egui::Color32::from_rgb(80, 130, 200))
@@ -6292,14 +6316,14 @@ impl LauncherApp {
                     }
                 }
 
-                ui.add_space(5.0);
+                ui.add_space(spacing::SPACE_5);
                 let forge_auto_launch = self.settings_state.lock().unwrap().forge_auto_launch;
                 let mut auto_launch = forge_auto_launch;
                 if ui.checkbox(&mut auto_launch, "Auto-launch Forge after downloading a deck").changed() {
                     self.settings_state.lock().unwrap().forge_auto_launch = auto_launch;
                 }
 
-                ui.add_space(5.0);
+                ui.add_space(spacing::SPACE_5);
                 ui.horizontal(|ui| {
                     if ui.add_enabled(forge_path_valid, egui::Button::new("Test Launch Forge")).clicked() {
                         match launch_forge_from_settings(None, None) {
@@ -6323,11 +6347,11 @@ impl LauncherApp {
                         (s.busy, s.staged.is_some(), s.dismissed)
                     };
                     let forge_update_progress = self.forge_update_progress.lock().unwrap().clone();
-                    ui.add_space(8.0);
+                    ui.add_space(spacing::SPACE_8);
                     egui::Frame::default()
                         .fill(egui::Color32::from_rgb(205, 232, 255))
-                        .inner_margin(egui::Margin::same(8.0))
-                        .rounding(6.0)
+                        .inner_margin(egui::Margin::same(spacing::SPACE_8))
+                        .rounding(spacing::SPACE_6)
                         .show(ui, |ui| {
                             ui.horizontal(|ui| {
                                 if let Some(ref prog) = forge_update_progress {
@@ -6359,7 +6383,7 @@ impl LauncherApp {
                 }
             });
 
-            ui.add_space(12.0);
+            ui.add_space(spacing::SPACE_12);
 
             // ── MaMo Connector itself ────────────────────────────────────
             ui.group(|ui| {
@@ -6390,7 +6414,7 @@ impl LauncherApp {
                         }
                     });
                 });
-                ui.add_space(4.0);
+                ui.add_space(spacing::SPACE_4);
                 ui.horizontal(|ui| {
                     ui.label(egui::RichText::new(format!("You're on v{}", env!("CARGO_PKG_VERSION"))).small().weak());
                     if !is_downloading && staged_path.is_none() {
@@ -6403,13 +6427,13 @@ impl LauncherApp {
                 });
 
                 if let Some(ref err) = update_err {
-                    ui.add_space(4.0);
+                    ui.add_space(spacing::SPACE_4);
                     ui.label(egui::RichText::new(format!("Update check failed: {err}")).small().color(colors::ERROR));
                 }
 
                 if let Some(ref staged) = staged_path {
                     let ver = update_ver.as_deref().unwrap_or("new");
-                    ui.add_space(6.0);
+                    ui.add_space(spacing::SPACE_6);
                     ui.horizontal(|ui| {
                         ui.label(egui::RichText::new(format!("v{ver} has been downloaded and is ready")).color(colors::SUCCESS));
                         if ui.button("Restart & Apply").clicked() {
@@ -6426,7 +6450,7 @@ impl LauncherApp {
                         .as_ref()
                         .map(|p| p.status_text.clone())
                         .unwrap_or_else(|| "Downloading…".to_string());
-                    ui.add_space(6.0);
+                    ui.add_space(spacing::SPACE_6);
                     ui.horizontal(|ui| {
                         ui.spinner();
                         ui.label(status_text);
@@ -6435,7 +6459,7 @@ impl LauncherApp {
                         }
                     });
                 } else if let Some(ref ver) = update_ver {
-                    ui.add_space(6.0);
+                    ui.add_space(spacing::SPACE_6);
                     ui.horizontal(|ui| {
                         ui.label(egui::RichText::new(format!("v{ver} is available")).color(colors::WARNING));
                         if ui.button("Download & Install").clicked() {
@@ -6450,7 +6474,7 @@ impl LauncherApp {
                 }
             });
 
-            ui.add_space(16.0);
+            ui.add_space(spacing::SPACE_16);
 
             // ── Advanced ──────────────────────────────────────────────────
             ui.collapsing("Advanced", |ui| {
@@ -6466,7 +6490,7 @@ impl LauncherApp {
                     }
                     ui.label(egui::RichText::new("Re-run the setup wizard and clear all settings").weak().small());
                 });
-                ui.add_space(4.0);
+                ui.add_space(spacing::SPACE_4);
                 ui.horizontal(|ui| {
                     if ui.add(
                         egui::Button::new("🗑 Uninstall")
@@ -6482,7 +6506,7 @@ impl LauncherApp {
             });
 
             if let Some(msg) = status_message {
-                ui.add_space(10.0);
+                ui.add_space(spacing::SPACE_10);
                 let color = if msg.contains("failed") || msg.contains("Could not") || msg.contains("Error") {
                     colors::ERROR
                 } else if msg.contains("Found") || msg.contains("Saved") || msg.contains("success") {
@@ -6501,7 +6525,7 @@ impl LauncherApp {
         egui::ScrollArea::vertical().show(ui, |ui| {
         ui.label(egui::RichText::new("⚙ Settings").strong());
         ui.label(egui::RichText::new("MaMo account and Forge configuration moved to the Setup tab — this is everything else.").small().weak());
-        ui.add_space(10.0);
+        ui.add_space(spacing::SPACE_10);
 
         // Get current state
         let (forge_scripts_path_input, status_message) = {
@@ -6519,7 +6543,7 @@ impl LauncherApp {
             ui.group(|ui| {
                 ui.label(egui::RichText::new("📁 Game log folder").strong());
                 ui.label(egui::RichText::new("Where Forge writes game logs — Connector watches this while Forge is running.").small().weak());
-                ui.add_space(5.0);
+                ui.add_space(spacing::SPACE_5);
 
                 ui.horizontal(|ui| {
                     ui.label("Watch Directory:");
@@ -6576,7 +6600,7 @@ impl LauncherApp {
                     }
                 });
 
-                ui.add_space(5.0);
+                ui.add_space(spacing::SPACE_5);
 
                 // Processed files info
                 let processed_count = {
@@ -6592,12 +6616,12 @@ impl LauncherApp {
             });
         }
 
-        ui.add_space(15.0);
+        ui.add_space(spacing::SPACE_15);
 
         // Deck Mapping section (moved from GameLogs tab)
         self.render_deck_mapping_section(ui, ctx);
 
-        ui.add_space(15.0);
+        ui.add_space(spacing::SPACE_15);
         ui.label(
             egui::RichText::new("Full list of mamoConnector:// links the website can open: see the project docs.")
                 .small()
@@ -6606,7 +6630,7 @@ impl LauncherApp {
 
         // Status message
         if let Some(msg) = status_message {
-            ui.add_space(10.0);
+            ui.add_space(spacing::SPACE_10);
             let color = if msg.contains("failed") || msg.contains("Could not") || msg.contains("Error") {
                 colors::ERROR
             } else if msg.contains("Found") || msg.contains("Saved") || msg.contains("success") {
@@ -6617,14 +6641,14 @@ impl LauncherApp {
             ui.label(egui::RichText::new(msg).color(color));
         }
 
-        ui.add_space(20.0);
+        ui.add_space(spacing::SPACE_20);
 
         // ── Advanced (rare/technical knobs) ────────────────────────────────
         ui.collapsing("Advanced", |ui| {
             ui.group(|ui| {
                 ui.label(egui::RichText::new("Simulation scripts").strong());
                 ui.label(egui::RichText::new("Optional — only needed for local AI simulation. Path to the folder containing run_commander_simulation.ps1 and analyze_commander_stats.py.").small().weak());
-                ui.add_space(8.0);
+                ui.add_space(spacing::SPACE_8);
 
                 ui.horizontal(|ui| {
                     ui.label("Scripts folder:");
@@ -6652,7 +6676,7 @@ impl LauncherApp {
                     }
                 });
 
-                ui.add_space(5.0);
+                ui.add_space(spacing::SPACE_5);
                 ui.horizontal(|ui| {
                     if ui.button("📂 Browse…").clicked() {
                         if let Some(folder) = rfd::FileDialog::new().pick_folder() {
