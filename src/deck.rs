@@ -2778,26 +2778,43 @@ pub async fn sync_mamo_deck(deck_id: &str) -> Result<DeckSyncResult> {
 }
 
 /// Find an existing deck file matching the pattern "author - deck_name (date).dck"
+/// Finds the local deck file matching this author/deck-name pair.
+///
+/// More than one file can match (a legacy date-less filename, a leftover from an
+/// interrupted sync, or an old copy left behind after the deck was renamed on the
+/// source), and previously only the first one `fs::read_dir` happened to yield - in
+/// OS-dependent order - was ever considered. If the sync then decided that file was
+/// already up to date, it returned early and never cleaned up the others, so stray
+/// duplicates of the same deck could linger in Forge's deck list indefinitely. Now all
+/// matches are collected, the one with the newest embedded date is kept, and the rest
+/// are deleted here so this always self-heals regardless of whether the caller ends up
+/// downloading a new version.
 fn find_existing_deck_file(author: &str, deck_name: &str, deck_dir: &PathBuf) -> Result<(Option<PathBuf>, Option<String>)> {
     if !deck_dir.exists() {
         return Ok((None, None));
     }
-    
+
     let sanitized_deck_name = sanitize_filename(deck_name);
     let pattern_start = format!("{} - {}", author, sanitized_deck_name);
-    
+
+    let mut matches: Vec<(PathBuf, Option<String>)> = Vec::new();
+
     if let Ok(entries) = fs::read_dir(deck_dir) {
         for entry in entries.filter_map(|e| e.ok()) {
             let path = entry.path();
             let filename = path.file_name()
                 .and_then(|n| n.to_str())
                 .unwrap_or("");
-            
-            // Skip archived versions (legacy prefix or _archive_ prefix)
-            if filename.starts_with("PASTVersionS_") || filename.starts_with("_archive_") {
+
+            // Skip archived/legacy versions - these are cleaned up elsewhere
+            if filename.starts_with("PASTVersionS_")
+                || filename.starts_with("_archive_")
+                || filename.starts_with("archive_")
+                || filename.starts_with("Archived_")
+            {
                 continue;
             }
-            
+
             // Check if filename matches our pattern
             if filename.starts_with(&pattern_start) && filename.ends_with(".dck") {
                 // Extract date from filename: "user - name (YYYY-MM-DD).dck"
@@ -2810,13 +2827,30 @@ fn find_existing_deck_file(author: &str, deck_name: &str, deck_dir: &PathBuf) ->
                 } else {
                     None
                 };
-                
-                return Ok((Some(path), date));
+
+                matches.push((path, date));
             }
         }
     }
-    
-    Ok((None, None))
+
+    // Prefer the entry with the newest embedded date; a date-less legacy entry sorts first
+    // and is only kept when nothing else matches.
+    matches.sort_by(|a, b| a.1.cmp(&b.1));
+    let Some((keep_path, keep_date)) = matches.pop() else {
+        return Ok((None, None));
+    };
+
+    // Any remaining matches are stale duplicates of the same deck - remove them so they
+    // don't keep showing up as separate entries in Forge's deck list.
+    for (stray_path, _) in matches {
+        if let Err(e) = fs::remove_file(&stray_path) {
+            warn!("Failed to remove stale duplicate deck file {:?}: {}", stray_path, e);
+        } else {
+            info!("Removed stale duplicate deck file: {:?}", stray_path);
+        }
+    }
+
+    Ok((Some(keep_path), keep_date))
 }
 
 /// Get the public deck directory path (for UI display)
@@ -4005,7 +4039,12 @@ Name=Example Commander Deck
         assert!(forge_output.contains("1 Sol Ring|LTC|100"));
     }
 
+    // Not a unit test: hits the real Moxfield production API and writes real files into
+    // this machine's actual Forge deck directory. Ignored by default so a normal
+    // `cargo test` run never does that unexpectedly; run explicitly with
+    // `cargo test test_sync_real_moxfield_decks_food_and_yuna -- --ignored --nocapture`.
     #[tokio::test]
+    #[ignore]
     async fn test_sync_real_moxfield_decks_food_and_yuna() {
         let res1 = sync_moxfield_deck_with_mamo_id("kSC0iw59a0mGZWlu2aJipQ", None).await;
         assert!(res1.is_ok(), "Food for Thought sync failed: {:?}", res1.err());
