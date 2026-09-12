@@ -589,12 +589,51 @@ pub async fn download_forge_update_staged(
     }
 }
 
+/// Prefix for old `res/` directories renamed aside during finalize, pending background deletion.
+/// Renaming rather than deleting in place keeps the finalize swap a fast, metadata-only rename
+/// no matter how many loose files `res/` holds (Forge's `res/` — cardsfolder scripts, skins,
+/// sounds — commonly runs into the tens of thousands). A previous version called
+/// `std::fs::remove_dir_all` on the old `res/` directly inside `finalize_staged_forge_update`,
+/// which every caller invokes synchronously from the egui UI thread (the 500ms
+/// `finalize_staged_forge_update_if_ready` tick, and three dialog button/completion handlers in
+/// ui.rs) — a large enough `res/` (especially under antivirus real-time scanning) froze the main
+/// thread long enough for Windows to mark the whole app "Not Responding".
+const RES_STALE_PREFIX: &str = "res.stale-";
+
+/// Deletes any `res.stale-*` directories left behind in `dest_dir` by a previous finalize whose
+/// background deletion (below) never got to finish, e.g. the app was closed mid-delete. Spawns
+/// the actual deletion on a background thread per entry so this is never a source of blocking
+/// either.
+fn cleanup_stale_res_backups(dest_dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(dest_dir) else { return };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let is_stale_res_dir = path.is_dir()
+            && path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with(RES_STALE_PREFIX));
+        if is_stale_res_dir {
+            std::thread::spawn(move || {
+                if let Err(e) = std::fs::remove_dir_all(&path) {
+                    log::warn!("Failed to delete leftover stale res/ backup {:?}: {e}", path);
+                }
+            });
+        }
+    }
+}
+
 /// Swaps a staged download (from `download_forge_update_staged`) into place, replacing whatever
 /// jar (and, for a full-bundle update, `res/`) is currently there, and records sidecar metadata.
 /// Caller is responsible for confirming Forge isn't currently running before calling this — an
 /// atomic rename is safe against a *closed* Forge's next launch reading a half-written file, but
 /// not against a *currently open* Forge that might still be reading from the path being replaced.
+///
+/// Renames the old `res/` aside and deletes it in the background rather than in place (see
+/// `RES_STALE_PREFIX`) — this function runs synchronously on the UI thread in every caller, so it
+/// must stay fast regardless of how large `res/` is.
 pub fn finalize_staged_forge_update(dest_dir: &Path, staged_path: &Path, asset: &ForgeAsset) -> Result<PathBuf> {
+    cleanup_stale_res_backups(dest_dir);
     if staged_path.is_dir() {
         let staged_jar = crate::forge::resolve_latest_forge_jar(staged_path)
             .context("Staged MaMo Forge bundle has no jar inside it")?;
@@ -608,8 +647,20 @@ pub fn finalize_staged_forge_update(dest_dir: &Path, staged_path: &Path, asset: 
         if staged_res.is_dir() {
             let final_res = dest_dir.join(RES_DIR_NAME);
             if final_res.exists() {
-                std::fs::remove_dir_all(&final_res)
-                    .with_context(|| format!("Failed to remove stale res/ at {:?}", final_res))?;
+                let stale_res = dest_dir.join(format!(
+                    "{RES_STALE_PREFIX}{}",
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_nanos())
+                        .unwrap_or(0)
+                ));
+                std::fs::rename(&final_res, &stale_res)
+                    .with_context(|| format!("Failed to move stale res/ aside at {:?}", final_res))?;
+                std::thread::spawn(move || {
+                    if let Err(e) = std::fs::remove_dir_all(&stale_res) {
+                        log::warn!("Failed to delete stale res/ backup {:?}: {e}", stale_res);
+                    }
+                });
             }
             std::fs::rename(&staged_res, &final_res)
                 .with_context(|| format!("Failed to move staged res/ into place at {:?}", final_res))?;
@@ -1184,6 +1235,66 @@ mod tests {
             "res/ freshness sidecar should now match the build it was refreshed from"
         );
         assert!(!staged_dir.exists(), "staging directory should be cleaned up after finalize");
+
+        let _ = std::fs::remove_dir_all(&dest);
+    }
+
+    /// Regression test for the "Mamo Connector (Not Responding)" freeze: finalize previously
+    /// called `std::fs::remove_dir_all` on the old `res/` directory synchronously, which every
+    /// caller in ui.rs invokes on the egui UI thread — a large `res/` (Forge's real one has tens
+    /// of thousands of loose files) could block the UI thread long enough for Windows to mark the
+    /// whole app unresponsive. Finalize must instead rename the old res/ aside (fast, same-volume,
+    /// file-count-independent) and delete it on a background thread.
+    #[test]
+    fn finalize_staged_forge_update_renames_old_res_aside_instead_of_deleting_it_in_place() {
+        let dest = std::env::temp_dir().join("mamo-connector-finalize-stale-res-test");
+        let _ = std::fs::remove_dir_all(&dest);
+        std::fs::create_dir_all(&dest).unwrap();
+
+        std::fs::create_dir_all(dest.join("res").join("cardsfolder")).unwrap();
+        std::fs::write(dest.join("res").join("cardsfolder").join("old_card.txt"), b"old").unwrap();
+
+        let staged_dir = dest.join(".forge-update-staging");
+        let staged_jar = staged_dir.join("forge-gui-desktop-2.0.15-SNAPSHOT-jar-with-dependencies.jar");
+        std::fs::create_dir_all(&staged_dir).unwrap();
+        std::fs::write(&staged_jar, b"new jar").unwrap();
+        std::fs::create_dir_all(staged_dir.join("res").join("cardsfolder")).unwrap();
+        std::fs::write(staged_dir.join("res").join("cardsfolder").join("new_card.txt"), b"new").unwrap();
+
+        let asset = ForgeAsset {
+            download_url: "https://example.com/MaMoForge-portable.zip".to_string(),
+            name: "MaMoForge-portable.zip".to_string(),
+            updated_at: "2026-09-12T00:00:00Z".to_string(),
+        };
+
+        finalize_staged_forge_update(&dest, &staged_dir, &asset).expect("finalize should succeed");
+
+        // The swap itself is synchronous: new res/ content must be visible the instant finalize
+        // returns, whether or not the old res/ has finished being deleted yet.
+        assert_eq!(
+            std::fs::read(dest.join("res").join("cardsfolder").join("new_card.txt")).unwrap(),
+            b"new"
+        );
+
+        let stale_dirs: Vec<_> = std::fs::read_dir(&dest)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().starts_with(RES_STALE_PREFIX))
+            .collect();
+        assert!(
+            !stale_dirs.is_empty(),
+            "old res/ should have been renamed aside for background deletion, not removed synchronously inside finalize"
+        );
+
+        // The background thread should eventually clean it up.
+        let stale_path = stale_dirs[0].path();
+        for _ in 0..50 {
+            if !stale_path.exists() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(!stale_path.exists(), "stale res/ backup should be deleted in the background");
 
         let _ = std::fs::remove_dir_all(&dest);
     }
