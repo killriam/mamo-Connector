@@ -345,6 +345,38 @@ struct MoxfieldFullDeck {
     sideboard: serde_json::Value,
     #[serde(default)]
     companions: serde_json::Value,
+    #[serde(default)]
+    boards: Option<serde_json::Value>,
+}
+
+impl MoxfieldFullDeck {
+    pub fn get_commanders_value(&self) -> &serde_json::Value {
+        self.boards
+            .as_ref()
+            .and_then(|b| b.get("commanders"))
+            .and_then(|c| c.get("cards").or(Some(c)))
+            .filter(|v| !v.is_null())
+            .unwrap_or(&self.commanders)
+    }
+
+    pub fn get_mainboard_value(&self) -> &serde_json::Value {
+        self.boards
+            .as_ref()
+            .and_then(|b| b.get("mainboard"))
+            .and_then(|m| m.get("cards").or(Some(m)))
+            .filter(|v| !v.is_null())
+            .unwrap_or(&self.mainboard)
+    }
+
+    #[allow(dead_code)]
+    pub fn get_sideboard_value(&self) -> &serde_json::Value {
+        self.boards
+            .as_ref()
+            .and_then(|b| b.get("sideboard"))
+            .and_then(|s| s.get("cards").or(Some(s)))
+            .filter(|v| !v.is_null())
+            .unwrap_or(&self.sideboard)
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -519,10 +551,20 @@ fn convert_moxfield_to_forge(deck_name: &str, raw_json: &str) -> Result<String> 
     
     // Parse the raw JSON to access card data
     let parsed: serde_json::Value = serde_json::from_str(raw_json)?;
+    let boards = parsed.get("boards");
+    
+    fn extract_cards_map(board_val: Option<&serde_json::Value>) -> Option<&serde_json::Map<String, serde_json::Value>> {
+        let val = board_val?;
+        let cards = val.get("cards").unwrap_or(val);
+        cards.as_object()
+    }
     
     // Commander section
     lines.push("[Commander]".to_string());
-    if let Some(commanders) = parsed.get("commanders").and_then(|c| c.as_object()) {
+    let commanders_val = boards
+        .and_then(|b| b.get("commanders"))
+        .or_else(|| parsed.get("commanders"));
+    if let Some(commanders) = extract_cards_map(commanders_val) {
         for (_, card_entry) in commanders {
             if let Some(card_line) = format_moxfield_card(card_entry) {
                 lines.push(card_line);
@@ -533,7 +575,10 @@ fn convert_moxfield_to_forge(deck_name: &str, raw_json: &str) -> Result<String> 
     
     // Main deck section
     lines.push("[Main]".to_string());
-    if let Some(mainboard) = parsed.get("mainboard").and_then(|c| c.as_object()) {
+    let mainboard_val = boards
+        .and_then(|b| b.get("mainboard"))
+        .or_else(|| parsed.get("mainboard"));
+    if let Some(mainboard) = extract_cards_map(mainboard_val) {
         for (_, card_entry) in mainboard {
             if let Some(card_line) = format_moxfield_card(card_entry) {
                 lines.push(card_line);
@@ -544,7 +589,10 @@ fn convert_moxfield_to_forge(deck_name: &str, raw_json: &str) -> Result<String> 
     
     // Sideboard section
     lines.push("[Sideboard]".to_string());
-    if let Some(sideboard) = parsed.get("sideboard").and_then(|c| c.as_object()) {
+    let sideboard_val = boards
+        .and_then(|b| b.get("sideboard"))
+        .or_else(|| parsed.get("sideboard"));
+    if let Some(sideboard) = extract_cards_map(sideboard_val) {
         let mut sideboard_count = 0;
         for (_, card_entry) in sideboard {
             if sideboard_count >= MAX_FORGE_SIDEBOARD_CARDS {
@@ -2380,8 +2428,8 @@ pub async fn sync_moxfield_deck_with_mamo_id(
                     &settings.gamelog_config.api_url
                 };
 
-                let commanders = extract_moxfield_cards(&deck.commanders);
-                let maincards = extract_moxfield_cards(&deck.mainboard);
+                let commanders = extract_moxfield_cards(deck.get_commanders_value());
+                let maincards = extract_moxfield_cards(deck.get_mainboard_value());
                 let source_url = format!("https://www.moxfield.com/decks/{}", deck_id);
 
                 let payload = SyncReferenceDeckPayload {
@@ -2438,7 +2486,10 @@ pub async fn sync_moxfield_deck_with_mamo_id(
     if let Some(existing_path) = existing_file {
         // Compare dates to see if we need to update
         if let Some(ref local_date) = existing_date {
-            if local_date >= &moxfield_date.to_string() {
+            let is_empty_or_broken = fs::metadata(&existing_path)
+                .map(|m| m.len() < 150)
+                .unwrap_or(false);
+            if !is_empty_or_broken && local_date >= &moxfield_date.to_string() {
                 info!("Deck '{}' is already up to date (local: {}, moxfield: {})", 
                       deck.name, local_date, moxfield_date);
                 return Ok(with_mamo_note(DeckSyncResult::already_up_to_date(deck.name), mamo_sync_note));
@@ -3912,4 +3963,54 @@ Name=Example Commander Deck
         );
         assert_eq!(parse_moxfield_url("https://archidekt.com/decks/123"), None);
     }
+
+    #[test]
+    fn test_convert_moxfield_to_forge_v3_boards() {
+        let raw = serde_json::json!({
+            "name": "Food for Thought",
+            "boards": {
+                "commanders": {
+                    "count": 1,
+                    "cards": {
+                        "card_c": {
+                            "quantity": 1,
+                            "card": {
+                                "name": "Frodo, Adventurous Hobbit",
+                                "set": "ltc",
+                                "cn": "461"
+                            }
+                        }
+                    }
+                },
+                "mainboard": {
+                    "count": 1,
+                    "cards": {
+                        "card_m": {
+                            "quantity": 1,
+                            "card": {
+                                "name": "Sol Ring",
+                                "set": "ltc",
+                                "cn": "100"
+                            }
+                        }
+                    }
+                }
+            }
+        }).to_string();
+
+        let forge_output = convert_moxfield_to_forge("IceMagma - Food for Thought", &raw).unwrap();
+        assert!(forge_output.contains("[Commander]"));
+        assert!(forge_output.contains("1 Frodo, Adventurous Hobbit|LTC|461"));
+        assert!(forge_output.contains("[Main]"));
+        assert!(forge_output.contains("1 Sol Ring|LTC|100"));
+    }
+
+    #[tokio::test]
+    async fn test_sync_real_moxfield_decks_food_and_yuna() {
+        let res1 = sync_moxfield_deck_with_mamo_id("kSC0iw59a0mGZWlu2aJipQ", None).await;
+        assert!(res1.is_ok(), "Food for Thought sync failed: {:?}", res1.err());
+        let res2 = sync_moxfield_deck_with_mamo_id("oR2h0X7tREyhBBW3AlC8tw", None).await;
+        assert!(res2.is_ok(), "Yuna's Grand Journey sync failed: {:?}", res2.err());
+    }
 }
+
