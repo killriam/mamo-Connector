@@ -15,6 +15,18 @@ use crate::gamelog::{GameLogConfig, GameLogProcessResult, ScanSummary, get_defau
 use crate::registration::{RegistrationOutcome, RegistrationStatus};
 use crate::settings::{Settings, SavedLink, SavedLinkType};
 
+/// Shared plain-text semantic colors, so "error red"/"success green"/etc. stop being spelled
+/// with a different exact RGB triple depending on which part of the file wrote it. These are
+/// for standalone text/icons outside a colored container; `render_status_pill`'s own bg/fg/dot
+/// triples stay as they are — that's a deliberately self-contained two-tone component, not an
+/// ad-hoc duplicate of these.
+mod colors {
+    use eframe::egui::Color32;
+
+    pub const ERROR: Color32 = Color32::from_rgb(176, 0, 32);
+    pub const SUCCESS: Color32 = Color32::from_rgb(0, 128, 0);
+}
+
 #[derive(Clone, PartialEq, Eq)]
 enum Tab {
     Play,
@@ -106,6 +118,9 @@ struct ForgeUpdateCheckState {
 enum ConfirmAction {
     ResetFirstRun,
     Uninstall,
+    /// "Launch Forge" clicked with no deck picked in the "Your decks" selector — confirms the
+    /// player actually wants a deck-less Forge session rather than having missed the picker.
+    LaunchWithoutDeck,
 }
 
 /// The MaMo website's own base URL — the one place the Connector links back out to it.
@@ -385,7 +400,7 @@ fn render_status_pill(ui: &mut egui::Ui, text: &str, status: PillStatus) {
         ),
         PillStatus::Error => (
             egui::Color32::from_rgb(253, 232, 232),
-            egui::Color32::from_rgb(176, 0, 32),
+            colors::ERROR,
             egui::Color32::from_rgb(210, 30, 30),
         ),
         PillStatus::Neutral => (
@@ -1084,6 +1099,10 @@ struct LauncherApp {
     last_auto_gamelog_scan: Option<Instant>,
     /// Whether the bottom activity panel is collapsed
     activity_panel_collapsed: bool,
+    /// Whether the Play tab's 6-card session timeline shows every step (true) or is narrowed to
+    /// just the previous/active/next step (false, the default) — keeps "what's happening right
+    /// now" visible without scrolling at the app's own default 800×600 window size.
+    play_timeline_expanded: bool,
     /// Track entry count to auto-expand on new errors
     last_seen_entry_count: usize,
     /// Account deck (from MaMo, not necessarily downloaded yet) to pre-select when launching Forge
@@ -1149,7 +1168,12 @@ impl LauncherApp {
         let cached_decks = load_cached_decks()
             .map(|c| c.decks)
             .unwrap_or_default();
-        
+
+        // Restore the deck picked before the last relaunch, if it's still in the cached list.
+        let selected_account_deck = settings.last_selected_deck_id.as_ref().and_then(|id| {
+            cached_decks.iter().find(|d| &d.deck_id == id).cloned()
+        });
+
         // Initialize gamelog state with settings
         let gamelog_state = GameLogState {
             directory_input: settings.gamelog_config.watch_directory.clone(),
@@ -1351,8 +1375,9 @@ impl LauncherApp {
             forge_launcher_exited_at: None,
             last_auto_gamelog_scan: None,
             activity_panel_collapsed: !started_with_deeplink,
+            play_timeline_expanded: false,
             last_seen_entry_count: 0,
-            selected_account_deck: None,
+            selected_account_deck,
             scenario_picker: Arc::new(Mutex::new(ScenarioPickerState::default())),
             forge_local_decks: Vec::new(),
             update_check,
@@ -1887,7 +1912,7 @@ impl eframe::App for LauncherApp {
                                     if let Some(ref err) = prog.error {
                                         ui.label(
                                             egui::RichText::new(format!("✗ MaMo Forge update failed: {err}"))
-                                                .color(egui::Color32::from_rgb(176, 0, 32))
+                                                .color(colors::ERROR)
                                                 .small(),
                                         );
                                     } else {
@@ -2261,9 +2286,9 @@ impl LauncherApp {
                         if let Ok(log) = self.activity_log.lock() {
                             if let Some(entry) = log.entries.first() {
                                 let (text_color, prefix) = if entry.is_error {
-                                    (egui::Color32::from_rgb(176, 0, 32), "[ERR]")
+                                    (colors::ERROR, "[ERR]")
                                 } else if entry.is_success {
-                                    (egui::Color32::from_rgb(0, 128, 0), "[OK]")
+                                    (colors::SUCCESS, "[OK]")
                                 } else {
                                     (egui::Color32::GRAY, "[INFO]")
                                 };
@@ -2317,9 +2342,9 @@ impl LauncherApp {
                                                 .color(egui::Color32::GRAY));
 
                                             let (color, prefix) = if entry.is_error {
-                                                (egui::Color32::from_rgb(176, 0, 32), "[ERR] ")
+                                                (colors::ERROR, "[ERR] ")
                                             } else if entry.is_success {
-                                                (egui::Color32::from_rgb(0, 128, 0), "[OK] ")
+                                                (colors::SUCCESS, "[OK] ")
                                             } else {
                                                 (egui::Color32::BLACK, "[INFO] ")
                                             };
@@ -2766,10 +2791,10 @@ impl LauncherApp {
                     }
                     PreLaunchUpdateState::Failed { error, .. } => {
                         ui.horizontal(|ui| {
-                            ui.label(egui::RichText::new("✗").color(egui::Color32::from_rgb(176, 0, 32)).size(24.0));
+                            ui.label(egui::RichText::new("✗").color(colors::ERROR).size(24.0));
                             ui.vertical(|ui| {
                                 ui.label(egui::RichText::new("Failed to update MaMo Forge").strong());
-                                ui.label(egui::RichText::new(error).small().color(egui::Color32::from_rgb(176, 0, 32)));
+                                ui.label(egui::RichText::new(error).small().color(colors::ERROR));
                             });
                         });
                         ui.add_space(14.0);
@@ -2969,7 +2994,13 @@ impl LauncherApp {
                 "Uninstall MaMo Connector?",
                 "This will:\n• De-register the mamoConnector:// URL scheme\n• Delete all settings and data\n• Delete the application executable\n\nThis cannot be undone.",
                 "Uninstall",
-                egui::Color32::from_rgb(200, 0, 0),
+                colors::ERROR,
+            ),
+            ConfirmAction::LaunchWithoutDeck => (
+                "Launch Forge without a deck?",
+                "No deck is picked in \"Your decks\" above. Forge will open with nothing preloaded — you'll need to pick a deck yourself once it's running.\n\nPick a deck from the dropdown first if that's not what you meant to do.",
+                "Launch Anyway",
+                egui::Color32::from_rgb(0, 120, 215),
             ),
         };
 
@@ -2995,6 +3026,9 @@ impl LauncherApp {
                             match action {
                                 ConfirmAction::ResetFirstRun => self.do_reset(),
                                 ConfirmAction::Uninstall => self.do_uninstall(ctx),
+                                ConfirmAction::LaunchWithoutDeck => {
+                                    self.request_forge_launch(PendingForgeLaunch::Plain, ctx);
+                                }
                             }
                         }
                     });
@@ -3385,7 +3419,7 @@ impl LauncherApp {
                             // Already downloaded — offer to reuse or re-download
                             ui.label(
                                 egui::RichText::new("✓ MaMo Forge already downloaded")
-                                    .color(egui::Color32::from_rgb(0, 140, 0))
+                                    .color(colors::SUCCESS)
                                     .strong(),
                             );
                             ui.add_space(10.0);
@@ -3409,7 +3443,7 @@ impl LauncherApp {
                             if let Some(ref err) = prog_error {
                                 ui.label(
                                     egui::RichText::new(format!("✗ {err}"))
-                                        .color(egui::Color32::from_rgb(200, 0, 0))
+                                        .color(colors::ERROR)
                                         .small(),
                                 );
                                 ui.add_space(6.0);
@@ -3451,9 +3485,9 @@ impl LauncherApp {
                         if self.wizard.forge_path_input.is_empty() {
                             ui.label(egui::RichText::new("  ").weak());
                         } else if self.wizard.forge_path_valid {
-                            ui.label(egui::RichText::new("✓").color(egui::Color32::from_rgb(0, 150, 0)).strong());
+                            ui.label(egui::RichText::new("✓").color(colors::SUCCESS).strong());
                         } else {
-                            ui.label(egui::RichText::new("✗").color(egui::Color32::from_rgb(200, 0, 0)).strong());
+                            ui.label(egui::RichText::new("✗").color(colors::ERROR).strong());
                         }
                     });
                     ui.add_space(8.0);
@@ -3527,10 +3561,10 @@ impl LauncherApp {
                                 ui.label(egui::RichText::new("Launching Forge…").weak());
                             }
                             Some(WizardTestStatus::Ok) => {
-                                ui.label(egui::RichText::new("✓ Forge launched successfully").color(egui::Color32::from_rgb(0, 150, 0)));
+                                ui.label(egui::RichText::new("✓ Forge launched successfully").color(colors::SUCCESS));
                             }
                             Some(WizardTestStatus::Err(msg)) => {
-                                ui.label(egui::RichText::new(format!("✗ {msg}")).color(egui::Color32::from_rgb(200, 0, 0)));
+                                ui.label(egui::RichText::new(format!("✗ {msg}")).color(colors::ERROR));
                             }
                             None => {}
                         }
@@ -3546,7 +3580,7 @@ impl LauncherApp {
                             let display_path = path.to_string_lossy();
                             ui.label(
                                 egui::RichText::new(format!("✓ Java {major} detected ({display_path})"))
-                                    .color(egui::Color32::from_rgb(0, 150, 0))
+                                    .color(colors::SUCCESS)
                                     .small(),
                             );
                         }
@@ -3912,9 +3946,9 @@ impl LauncherApp {
                         !state.auth_token_input.is_empty()
                     };
                     if has_token {
-                        ui.label(egui::RichText::new("Connected to MaMo").color(egui::Color32::from_rgb(0, 128, 0)));
+                        ui.label(egui::RichText::new("Connected to MaMo").color(colors::SUCCESS));
                     } else {
-                        ui.label(egui::RichText::new("Not connected to MaMo account").color(egui::Color32::from_rgb(176, 0, 32)));
+                        ui.label(egui::RichText::new("Not connected to MaMo account").color(colors::ERROR));
                         if ui.small_button("Connect").clicked() {
                             let _ = std::process::Command::new("cmd")
                                 .args(["/c", "start", MAMO_WEBSITE_URL])
@@ -3927,10 +3961,10 @@ impl LauncherApp {
                         // Registration status (compact)
                         let reg_text = match self.state.registration.status {
                             RegistrationStatus::Registered => {
-                                egui::RichText::new("Deeplink OK").small().color(egui::Color32::from_rgb(0, 128, 0)).strong()
+                                egui::RichText::new("Deeplink OK").small().color(colors::SUCCESS).strong()
                             }
                             RegistrationStatus::Failed => {
-                                egui::RichText::new("Deeplink FAIL").small().color(egui::Color32::from_rgb(176, 0, 32)).strong()
+                                egui::RichText::new("Deeplink FAIL").small().color(colors::ERROR).strong()
                             }
                             RegistrationStatus::Skipped => {
                                 egui::RichText::new("Deeplink N/A").small().color(egui::Color32::from_rgb(196, 112, 0))
@@ -3966,7 +4000,7 @@ impl LauncherApp {
                         if ui.add_enabled(!is_launching, egui::Button::new(label)).clicked() {
                             match self.selected_account_deck.clone() {
                                 None => {
-                                    self.request_forge_launch(PendingForgeLaunch::Plain, ctx);
+                                    self.confirm_action = Some(ConfirmAction::LaunchWithoutDeck);
                                 }
                                 Some(deck) => match find_local_deck_path(&deck, &self.forge_local_decks) {
                                     Some(local_stem) => {
@@ -4008,9 +4042,9 @@ impl LauncherApp {
                     let reparse_status = self.gamelog_state.lock().unwrap().reparse_status.clone();
                     if let Some(ref msg) = reparse_status {
                         let color = if msg.starts_with("Error") {
-                            egui::Color32::from_rgb(176, 0, 32)
+                            colors::ERROR
                         } else {
-                            egui::Color32::from_rgb(0, 128, 0)
+                            colors::SUCCESS
                         };
                         ui.label(egui::RichText::new(msg).small().color(color));
                     }
@@ -4065,9 +4099,15 @@ impl LauncherApp {
                         }
                     });
 
-                    // Selecting a different deck refreshes its scenario picker below.
+                    // Selecting a different deck refreshes its scenario picker below and is
+                    // remembered so the next relaunch doesn't forget it (see `runtime_handle`'s
+                    // sibling `selected_account_deck` restore in `LauncherApp::new`).
                     let deck_id_after = self.selected_account_deck.as_ref().map(|d| d.deck_id.clone());
                     if deck_id_after != deck_id_before {
+                        if let Ok(mut s) = self.settings.lock() {
+                            s.last_selected_deck_id = deck_id_after.clone();
+                            let _ = s.save();
+                        }
                         match self.selected_account_deck.clone() {
                             Some(deck) => self.fetch_scenarios_for_deck(deck.deck_id, ctx),
                             None => *self.scenario_picker.lock().unwrap() = ScenarioPickerState::default(),
@@ -4116,6 +4156,16 @@ impl LauncherApp {
                 let current = play_session_step_index(&ps);
                 let is_issue = matches!(ps, PlaySession::UploadIssue { .. });
 
+                // Narrowed by default to previous/active/next so "what's happening right now"
+                // stays visible without scrolling at the app's own default 800×600 window size
+                // (the full 6-card list used to push the active card below the fold before a
+                // game had even started). "Show all steps" reveals the rest on demand.
+                let visible_range = if self.play_timeline_expanded {
+                    0..=5
+                } else {
+                    current.saturating_sub(1)..=(current + 1).min(5)
+                };
+
                 // No leading glyph on these titles — egui's bundled font doesn't cover the
                 // dotted-circle/circled-digit/dingbat characters that would naturally go here
                 // (confirmed by a real screenshot: they rendered as tofu boxes), and the
@@ -4130,6 +4180,9 @@ impl LauncherApp {
                 ];
 
                 for (i, (title, default_sub)) in steps.into_iter().enumerate() {
+                    if !visible_range.contains(&i) {
+                        continue;
+                    }
                     let (fill, stroke, text_color) = if is_issue && i == 4 {
                         (egui::Color32::from_rgb(251, 228, 226), egui::Color32::from_rgb(211, 55, 47), egui::Color32::from_rgb(140, 30, 25))
                     } else if i < current {
@@ -4187,6 +4240,18 @@ impl LauncherApp {
                         });
                     ui.add_space(6.0);
                 }
+
+                let hidden_steps = if self.play_timeline_expanded { 0 } else { 6 - visible_range.clone().count() };
+                if hidden_steps > 0 || self.play_timeline_expanded {
+                    let label = if self.play_timeline_expanded {
+                        "Show fewer steps".to_string()
+                    } else {
+                        format!("Show all steps ({hidden_steps} more)")
+                    };
+                    if ui.small_button(label).clicked() {
+                        self.play_timeline_expanded = !self.play_timeline_expanded;
+                    }
+                }
             });
 
             ui.add_space(10.0);
@@ -4210,15 +4275,15 @@ impl LauncherApp {
                             for result in &scan_results {
                                 ui.horizontal(|ui| {
                                     let (icon, color) = if result.success {
-                                        ("✓", egui::Color32::from_rgb(0, 128, 0))
+                                        ("✓", colors::SUCCESS)
                                     } else {
-                                        ("✗", egui::Color32::from_rgb(176, 0, 32))
+                                        ("✗", colors::ERROR)
                                     };
                                     ui.label(egui::RichText::new(icon).color(color));
                                     ui.label(egui::RichText::new(&result.filename).small());
                                     if !result.success {
                                         let (friendly, _) = friendly_upload_error(&result.message);
-                                        ui.label(egui::RichText::new(&friendly).small().color(egui::Color32::from_rgb(176, 0, 32)));
+                                        ui.label(egui::RichText::new(&friendly).small().color(colors::ERROR));
                                     } else if let Some(ref deck) = result.deck_identifier {
                                         ui.label(egui::RichText::new(format!("→ {}", deck)).small().color(egui::Color32::from_rgb(100, 149, 237)));
                                     }
@@ -4375,22 +4440,22 @@ impl LauncherApp {
         // Show detection result
         match &url_type {
             UrlType::MoxfieldDeck(id) => {
-                ui.label(egui::RichText::new(format!("✓ Moxfield Deck: {}", id)).color(egui::Color32::from_rgb(0, 128, 0)));
+                ui.label(egui::RichText::new(format!("✓ Moxfield Deck: {}", id)).color(colors::SUCCESS));
             }
             UrlType::MoxfieldUser(username) => {
-                ui.label(egui::RichText::new(format!("✓ Moxfield User: {} → will list all decks", username)).color(egui::Color32::from_rgb(0, 128, 0)));
+                ui.label(egui::RichText::new(format!("✓ Moxfield User: {} → will list all decks", username)).color(colors::SUCCESS));
             }
             UrlType::ArchidektDeck(id) => {
-                ui.label(egui::RichText::new(format!("✓ Archidekt Deck: {}", id)).color(egui::Color32::from_rgb(0, 128, 0)));
+                ui.label(egui::RichText::new(format!("✓ Archidekt Deck: {}", id)).color(colors::SUCCESS));
             }
             UrlType::DeckstatsDeck(owner, deck) => {
-                ui.label(egui::RichText::new(format!("✓ Deckstats Deck: {}/{}", owner, deck)).color(egui::Color32::from_rgb(0, 128, 0)));
+                ui.label(egui::RichText::new(format!("✓ Deckstats Deck: {}/{}", owner, deck)).color(colors::SUCCESS));
             }
             UrlType::MamoDeck(uuid) => {
-                ui.label(egui::RichText::new(format!("✓ MaMo Deck: {}", uuid)).color(egui::Color32::from_rgb(0, 128, 0)));
+                ui.label(egui::RichText::new(format!("✓ MaMo Deck: {}", uuid)).color(colors::SUCCESS));
             }
             UrlType::MamoUser(username) => {
-                ui.label(egui::RichText::new(format!("✓ MaMo User: {} → will list all decks", username)).color(egui::Color32::from_rgb(0, 128, 0)));
+                ui.label(egui::RichText::new(format!("✓ MaMo User: {} → will list all decks", username)).color(colors::SUCCESS));
             }
             UrlType::Unknown => {
                 ui.label(egui::RichText::new("⚠ Unknown URL format").color(egui::Color32::from_rgb(200, 100, 0)));
@@ -4513,10 +4578,10 @@ impl LauncherApp {
                             
                             // Status indicator
                             let status_text = match local_status {
-                                Some(DeckStatus::New) => egui::RichText::new("●").color(egui::Color32::from_rgb(0, 150, 0)),
+                                Some(DeckStatus::New) => egui::RichText::new("●").color(colors::SUCCESS),
                                 Some(DeckStatus::NeedsUpdate) => egui::RichText::new("●").color(egui::Color32::from_rgb(255, 165, 0)),
                                 Some(DeckStatus::UpToDate) => egui::RichText::new("●").color(egui::Color32::from_rgb(100, 100, 100)),
-                                None => egui::RichText::new("●").color(egui::Color32::from_rgb(0, 150, 0)),
+                                None => egui::RichText::new("●").color(colors::SUCCESS),
                             };
                             ui.label(status_text);
                             
@@ -4578,7 +4643,7 @@ impl LauncherApp {
             // Status legend
             ui.horizontal(|ui| {
                 ui.label("Status: ");
-                ui.label(egui::RichText::new("● New").color(egui::Color32::from_rgb(0, 150, 0)));
+                ui.label(egui::RichText::new("● New").color(colors::SUCCESS));
                 ui.label(egui::RichText::new("● Needs Update").color(egui::Color32::from_rgb(255, 165, 0)));
                 ui.label(egui::RichText::new("● Up to date").color(egui::Color32::from_rgb(100, 100, 100)));
             });
@@ -4607,7 +4672,7 @@ impl LauncherApp {
                             
                             // Status indicator
                             let (status_char, status_color) = match local_status {
-                                Some(DeckStatus::New) => ("●", egui::Color32::from_rgb(0, 150, 0)),
+                                Some(DeckStatus::New) => ("●", colors::SUCCESS),
                                 Some(DeckStatus::NeedsUpdate) => ("●", egui::Color32::from_rgb(255, 165, 0)),
                                 Some(DeckStatus::UpToDate) => ("●", egui::Color32::from_rgb(100, 100, 100)),
                                 None => ("?", egui::Color32::GRAY),
@@ -4646,9 +4711,9 @@ impl LauncherApp {
         if let Some(msg) = result_message {
             ui.separator();
             let color = if msg.starts_with("Error") || msg.contains("failed") {
-                egui::Color32::from_rgb(176, 0, 32)
+                colors::ERROR
             } else if msg.contains("Successfully") || msg.contains("Imported") {
-                egui::Color32::from_rgb(0, 128, 0)
+                colors::SUCCESS
             } else {
                 egui::Color32::DARK_GRAY
             };
@@ -5041,7 +5106,7 @@ impl LauncherApp {
             
             ui.horizontal(|ui| {
                 if updated > 0 {
-                    ui.label(egui::RichText::new(format!("📥 {} updated", updated)).color(egui::Color32::from_rgb(0, 128, 0)));
+                    ui.label(egui::RichText::new(format!("📥 {} updated", updated)).color(colors::SUCCESS));
                 }
                 if new > 0 {
                     ui.label(egui::RichText::new(format!("🆕 {} new", new)).color(egui::Color32::from_rgb(0, 100, 200)));
@@ -5050,7 +5115,7 @@ impl LauncherApp {
                     ui.label(egui::RichText::new(format!("✓ {} up to date", up_to_date)).color(egui::Color32::GRAY));
                 }
                 if failed > 0 {
-                    ui.label(egui::RichText::new(format!("❌ {} failed", failed)).color(egui::Color32::from_rgb(200, 0, 0)));
+                    ui.label(egui::RichText::new(format!("❌ {} failed", failed)).color(colors::ERROR));
                 }
             });
             
@@ -5060,10 +5125,10 @@ impl LauncherApp {
                 .show(ui, |ui: &mut egui::Ui| {
                     for result in &sync_results {
                         let (icon, color) = match result.status {
-                            SyncStatus::Updated => ("📥", egui::Color32::from_rgb(0, 128, 0)),
+                            SyncStatus::Updated => ("📥", colors::SUCCESS),
                             SyncStatus::NewDownloaded => ("🆕", egui::Color32::from_rgb(0, 100, 200)),
                             SyncStatus::AlreadyUpToDate => ("✓", egui::Color32::GRAY),
-                            SyncStatus::Failed => ("❌", egui::Color32::from_rgb(200, 0, 0)),
+                            SyncStatus::Failed => ("❌", colors::ERROR),
                             SyncStatus::Skipped => ("⏭", egui::Color32::from_rgb(150, 150, 0)),
                         };
                         ui.label(egui::RichText::new(format!("{} {}", icon, result.message)).color(color).small());
@@ -5075,9 +5140,9 @@ impl LauncherApp {
         if let Some(msg) = sync_message {
             ui.add_space(5.0);
             let color = if msg.contains("Error") || msg.contains("failed") {
-                egui::Color32::from_rgb(176, 0, 32)
+                colors::ERROR
             } else {
-                egui::Color32::from_rgb(0, 128, 0)
+                colors::SUCCESS
             };
             ui.label(egui::RichText::new(msg).color(color));
         }
@@ -5115,22 +5180,22 @@ impl LauncherApp {
                 // Show detected type
                 match &url_type {
                     UrlType::MoxfieldDeck(id) => {
-                        ui.label(egui::RichText::new(format!("✓ Moxfield Deck: {}", id)).color(egui::Color32::from_rgb(0, 128, 0)));
+                        ui.label(egui::RichText::new(format!("✓ Moxfield Deck: {}", id)).color(colors::SUCCESS));
                     }
                     UrlType::MoxfieldUser(username) => {
-                        ui.label(egui::RichText::new(format!("✓ Moxfield User: {} (all decks)", username)).color(egui::Color32::from_rgb(0, 128, 0)));
+                        ui.label(egui::RichText::new(format!("✓ Moxfield User: {} (all decks)", username)).color(colors::SUCCESS));
                     }
                     UrlType::ArchidektDeck(id) => {
-                        ui.label(egui::RichText::new(format!("✓ Archidekt Deck: {}", id)).color(egui::Color32::from_rgb(0, 128, 0)));
+                        ui.label(egui::RichText::new(format!("✓ Archidekt Deck: {}", id)).color(colors::SUCCESS));
                     }
                     UrlType::DeckstatsDeck(owner, deck) => {
-                        ui.label(egui::RichText::new(format!("✓ Deckstats Deck: {}/{}", owner, deck)).color(egui::Color32::from_rgb(0, 128, 0)));
+                        ui.label(egui::RichText::new(format!("✓ Deckstats Deck: {}/{}", owner, deck)).color(colors::SUCCESS));
                     }
                     UrlType::MamoDeck(uuid) => {
-                        ui.label(egui::RichText::new(format!("✓ MaMo Deck: {}", uuid)).color(egui::Color32::from_rgb(0, 128, 0)));
+                        ui.label(egui::RichText::new(format!("✓ MaMo Deck: {}", uuid)).color(colors::SUCCESS));
                     }
                     UrlType::MamoUser(username) => {
-                        ui.label(egui::RichText::new(format!("✓ MaMo User: {} (all decks)", username)).color(egui::Color32::from_rgb(0, 128, 0)));
+                        ui.label(egui::RichText::new(format!("✓ MaMo User: {} (all decks)", username)).color(colors::SUCCESS));
                     }
                     UrlType::Unknown => {
                         ui.label(egui::RichText::new("⚠ Unknown URL format").color(egui::Color32::from_rgb(200, 100, 0)));
@@ -5762,7 +5827,7 @@ impl LauncherApp {
                                     
                                     ui.label(format!("\"{}\"", log_name));
                                     ui.label("→");
-                                    ui.label(egui::RichText::new(deck_name).color(egui::Color32::from_rgb(0, 128, 0)));
+                                    ui.label(egui::RichText::new(deck_name).color(colors::SUCCESS));
                                     
                                     if ui.small_button("✕").clicked() {
                                         to_remove.push(log_name.clone());
@@ -6000,7 +6065,7 @@ impl LauncherApp {
                     ui.label(egui::RichText::new("Loading scenarios…").small());
                 });
             } else if let Some(err) = error_message {
-                ui.label(egui::RichText::new(err).small().color(egui::Color32::from_rgb(176, 0, 32)));
+                ui.label(egui::RichText::new(err).small().color(colors::ERROR));
             } else if scenarios.is_empty() {
                 ui.label(
                     egui::RichText::new(
@@ -6143,9 +6208,9 @@ impl LauncherApp {
                     }
                     if !forge_path_input.is_empty() {
                         if forge_path_valid {
-                            ui.label(egui::RichText::new("OK").color(egui::Color32::from_rgb(0, 128, 0)).small().strong());
+                            ui.label(egui::RichText::new("OK").color(colors::SUCCESS).small().strong());
                         } else {
-                            ui.label(egui::RichText::new("Invalid").color(egui::Color32::from_rgb(176, 0, 32)).small().strong());
+                            ui.label(egui::RichText::new("Invalid").color(colors::ERROR).small().strong());
                         }
                     }
                 });
@@ -6260,7 +6325,7 @@ impl LauncherApp {
                                 if let Some(ref prog) = forge_update_progress {
                                     if let Some(ref err) = prog.error {
                                         if !forge_update_dismissed {
-                                            ui.label(egui::RichText::new(format!("MaMo Forge update failed: {err}")).color(egui::Color32::from_rgb(176, 0, 32)));
+                                            ui.label(egui::RichText::new(format!("MaMo Forge update failed: {err}")).color(colors::ERROR));
                                             if ui.small_button("✕").clicked() {
                                                 self.forge_update_check.lock().unwrap().dismissed = true;
                                             }
@@ -6276,7 +6341,7 @@ impl LauncherApp {
                                 } else if forge_busy {
                                     ui.label(egui::RichText::new("Checking for a MaMo Forge update…").color(egui::Color32::GRAY));
                                 } else {
-                                    ui.label(egui::RichText::new("MaMo Forge is up to date.").color(egui::Color32::from_rgb(0, 128, 0)));
+                                    ui.label(egui::RichText::new("MaMo Forge is up to date.").color(colors::SUCCESS));
                                     if ui.small_button("Check now").clicked() {
                                         self.trigger_forge_update_check(ctx);
                                     }
@@ -6331,14 +6396,14 @@ impl LauncherApp {
 
                 if let Some(ref err) = update_err {
                     ui.add_space(4.0);
-                    ui.label(egui::RichText::new(format!("Update check failed: {err}")).small().color(egui::Color32::from_rgb(176, 0, 32)));
+                    ui.label(egui::RichText::new(format!("Update check failed: {err}")).small().color(colors::ERROR));
                 }
 
                 if let Some(ref staged) = staged_path {
                     let ver = update_ver.as_deref().unwrap_or("new");
                     ui.add_space(6.0);
                     ui.horizontal(|ui| {
-                        ui.label(egui::RichText::new(format!("v{ver} has been downloaded and is ready")).color(egui::Color32::from_rgb(0, 128, 0)));
+                        ui.label(egui::RichText::new(format!("v{ver} has been downloaded and is ready")).color(colors::SUCCESS));
                         if ui.button("Restart & Apply").clicked() {
                             if let Err(e) = crate::download::apply_connector_update_and_restart(staged) {
                                 log::error!("Failed to restart and apply update: {e}");
@@ -6411,9 +6476,9 @@ impl LauncherApp {
             if let Some(msg) = status_message {
                 ui.add_space(10.0);
                 let color = if msg.contains("failed") || msg.contains("Could not") || msg.contains("Error") {
-                    egui::Color32::from_rgb(176, 0, 32)
+                    colors::ERROR
                 } else if msg.contains("Found") || msg.contains("Saved") || msg.contains("success") {
-                    egui::Color32::from_rgb(0, 128, 0)
+                    colors::SUCCESS
                 } else {
                     egui::Color32::from_rgb(100, 100, 100)
                 };
@@ -6494,12 +6559,12 @@ impl LauncherApp {
                     }
 
                     if directory_valid {
-                        ui.label(egui::RichText::new("✓ Valid").color(egui::Color32::from_rgb(0, 128, 0)));
+                        ui.label(egui::RichText::new("✓ Valid").color(colors::SUCCESS));
                         if let Some(count) = file_count {
                             ui.label(format!("({} log files)", count));
                         }
                     } else if !directory_input.is_empty() {
-                        ui.label(egui::RichText::new("✗ Invalid or inaccessible").color(egui::Color32::from_rgb(176, 0, 32)));
+                        ui.label(egui::RichText::new("✗ Invalid or inaccessible").color(colors::ERROR));
                     }
                 });
 
@@ -6535,9 +6600,9 @@ impl LauncherApp {
         if let Some(msg) = status_message {
             ui.add_space(10.0);
             let color = if msg.contains("failed") || msg.contains("Could not") || msg.contains("Error") {
-                egui::Color32::from_rgb(176, 0, 32)
+                colors::ERROR
             } else if msg.contains("Found") || msg.contains("Saved") || msg.contains("success") {
-                egui::Color32::from_rgb(0, 128, 0)
+                colors::SUCCESS
             } else {
                 egui::Color32::from_rgb(100, 100, 100)
             };
@@ -6572,9 +6637,9 @@ impl LauncherApp {
                             .exists();
                     if !forge_scripts_path_input.is_empty() {
                         if scripts_valid {
-                            ui.label(egui::RichText::new("✓").color(egui::Color32::from_rgb(0, 128, 0)));
+                            ui.label(egui::RichText::new("✓").color(colors::SUCCESS));
                         } else {
-                            ui.label(egui::RichText::new("✗ ps1 not found").color(egui::Color32::from_rgb(176, 0, 32)));
+                            ui.label(egui::RichText::new("✗ ps1 not found").color(colors::ERROR));
                         }
                     }
                 });

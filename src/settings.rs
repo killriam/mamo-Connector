@@ -136,6 +136,10 @@ pub struct Settings {
     /// Whether to backward-import and synchronize decks as Reference Decks in MaMo
     #[serde(default = "default_true")]
     pub sync_as_reference_decks: bool,
+    /// The last MaMo account deck picked in the Play tab's "Your decks" selector, so a
+    /// relaunch doesn't forget it. `None` for "— none —" explicitly picked, or never set.
+    #[serde(default)]
+    pub last_selected_deck_id: Option<String>,
 }
 
 impl Default for Settings {
@@ -152,6 +156,7 @@ impl Default for Settings {
             simulation_games: default_simulation_games(),
             simulation_opponent_deck: default_simulation_opponent_deck(),
             sync_as_reference_decks: true,
+            last_selected_deck_id: None,
         }
     }
 }
