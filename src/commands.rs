@@ -1102,10 +1102,14 @@ fn encode_deck_input(input: &serde_json::Value) -> anyhow::Result<(Vec<u8>, Vec<
     // no card-identity field) — only card_values + thresholds carry through.
     let mulligan = &input["mulliganConfig"];
     let card_values = &mulligan["card_values"];
-    let land_value    = card_values["land"].as_f64().unwrap_or(1.0) as f32;
-    let cmc_0_2_value = card_values["cmc_0_to_2"].as_f64().unwrap_or(0.8) as f32;
-    let cmc_3_value   = card_values["cmc_3"].as_f64().unwrap_or(0.5) as f32;
-    let other_value   = card_values["other"].as_f64().unwrap_or(0.3) as f32;
+    let land_value = card_values["land"].as_f64().unwrap_or(1.0) as f32;
+    // Standard curve, indexed by exact mana value 0-6 plus a 7+ catch-all — mirrors
+    // MaMoFrontend's MulliganCardValues / mamo-sim's MulliganConfig::mv_values.
+    const MV_KEYS: [&str; 8] = ["mv0", "mv1", "mv2", "mv3", "mv4", "mv5", "mv6", "mv7Plus"];
+    const MV_DEFAULTS: [f64; 8] = [0.85, 0.8, 0.75, 0.6, 0.45, 0.4, 0.35, 0.3];
+    let mv_values: [f32; 8] = std::array::from_fn(|i| {
+        card_values[MV_KEYS[i]].as_f64().unwrap_or(MV_DEFAULTS[i]) as f32
+    });
     let thresholds: Vec<(u8, f32)> = mulligan["thresholds"]
         .as_array()
         .map(|arr| {
@@ -1119,14 +1123,14 @@ fn encode_deck_input(input: &serde_json::Value) -> anyhow::Result<(Vec<u8>, Vec<
         })
         .unwrap_or_default();
 
-    let header_len = 8 + 20 + thresholds.len() * 5;
+    let header_len = 8 + 40 + thresholds.len() * 5;
     let mut buf = Vec::with_capacity(header_len + card_count as usize * 16 + mechanic_count as usize * 12);
     buf.extend_from_slice(&card_count.to_le_bytes());
     buf.extend_from_slice(&mechanic_count.to_le_bytes());
     buf.extend_from_slice(&land_value.to_le_bytes());
-    buf.extend_from_slice(&cmc_0_2_value.to_le_bytes());
-    buf.extend_from_slice(&cmc_3_value.to_le_bytes());
-    buf.extend_from_slice(&other_value.to_le_bytes());
+    for v in &mv_values {
+        buf.extend_from_slice(&v.to_le_bytes());
+    }
     buf.push(thresholds.len().min(255) as u8);
     buf.extend_from_slice(&[0u8; 3]); // reserved padding
     for &(round, min_value) in &thresholds {
@@ -1652,8 +1656,8 @@ mod tests {
 
     // ==================== encode_deck_input Mulligan Header Tests ====================
     //
-    // The wire format's mulligan-config header (land/cmc-tier values + thresholds) must stay
-    // byte-for-byte in sync with mamo-sim's codec.rs decoder and MaMoFrontend's codec.ts
+    // The wire format's mulligan-config header (land + per-mana-value curve + thresholds) must
+    // stay byte-for-byte in sync with mamo-sim's codec.rs decoder and MaMoFrontend's codec.ts
     // encoder — these lock in this file's half of that contract.
 
     fn minimal_deck_input(mulligan_config: Option<serde_json::Value>) -> serde_json::Value {
@@ -1671,7 +1675,10 @@ mod tests {
     #[test]
     fn test_encode_deck_input_writes_custom_mulligan_header() {
         let input = minimal_deck_input(Some(serde_json::json!({
-            "card_values": { "land": 2.0, "cmc_0_to_2": 0.9, "cmc_3": 0.6, "other": 0.1 },
+            "card_values": {
+                "land": 2.0, "mv0": 0.95, "mv1": 0.9, "mv2": 0.85, "mv3": 0.7,
+                "mv4": 0.6, "mv5": 0.5, "mv6": 0.4, "mv7Plus": 0.1,
+            },
             "thresholds": [
                 { "round": 0, "min_value": 4.0 },
                 { "round": 1, "min_value": 3.5 },
@@ -1681,23 +1688,29 @@ mod tests {
         let (buf, _mech_keys) = encode_deck_input(&input).expect("encode should succeed");
 
         // 0 cards, 0 mechanics — header is the entire buffer.
-        assert_eq!(buf.len(), 8 + 20 + 2 * 5);
+        assert_eq!(buf.len(), 8 + 40 + 2 * 5);
 
         let card_count = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
         let mechanic_count = u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]);
         assert_eq!(card_count, 0);
         assert_eq!(mechanic_count, 0);
 
-        assert_eq!(f32::from_le_bytes([buf[8], buf[9], buf[10], buf[11]]), 2.0); // land
-        assert_eq!(f32::from_le_bytes([buf[12], buf[13], buf[14], buf[15]]), 0.9); // cmc_0_2
-        assert_eq!(f32::from_le_bytes([buf[16], buf[17], buf[18], buf[19]]), 0.6); // cmc_3
-        assert_eq!(f32::from_le_bytes([buf[20], buf[21], buf[22], buf[23]]), 0.1); // other
-        assert_eq!(buf[24], 2); // threshold_count
+        let f = |o: usize| f32::from_le_bytes([buf[o], buf[o + 1], buf[o + 2], buf[o + 3]]);
+        assert_eq!(f(8), 2.0); // land
+        assert_eq!(f(12), 0.95); // mv0
+        assert_eq!(f(16), 0.9); // mv1
+        assert_eq!(f(20), 0.85); // mv2
+        assert_eq!(f(24), 0.7); // mv3
+        assert_eq!(f(28), 0.6); // mv4
+        assert_eq!(f(32), 0.5); // mv5
+        assert_eq!(f(36), 0.4); // mv6
+        assert_eq!(f(40), 0.1); // mv7Plus
+        assert_eq!(buf[44], 2); // threshold_count
 
-        assert_eq!(buf[28], 0); // round 0
-        assert_eq!(f32::from_le_bytes([buf[29], buf[30], buf[31], buf[32]]), 4.0);
-        assert_eq!(buf[33], 1); // round 1
-        assert_eq!(f32::from_le_bytes([buf[34], buf[35], buf[36], buf[37]]), 3.5);
+        assert_eq!(buf[48], 0); // round 0
+        assert_eq!(f(49), 4.0);
+        assert_eq!(buf[53], 1); // round 1
+        assert_eq!(f(54), 3.5);
     }
 
     #[test]
@@ -1709,12 +1722,18 @@ mod tests {
 
         let (buf, _mech_keys) = encode_deck_input(&input).expect("encode should succeed");
 
-        assert_eq!(buf.len(), 8 + 20); // no thresholds
-        assert_eq!(f32::from_le_bytes([buf[8], buf[9], buf[10], buf[11]]), 1.0); // land default
-        assert_eq!(f32::from_le_bytes([buf[12], buf[13], buf[14], buf[15]]), 0.8); // cmc_0_2 default
-        assert_eq!(f32::from_le_bytes([buf[16], buf[17], buf[18], buf[19]]), 0.5); // cmc_3 default
-        assert_eq!(f32::from_le_bytes([buf[20], buf[21], buf[22], buf[23]]), 0.3); // other default
-        assert_eq!(buf[24], 0); // threshold_count
+        assert_eq!(buf.len(), 8 + 40); // no thresholds
+        let f = |o: usize| f32::from_le_bytes([buf[o], buf[o + 1], buf[o + 2], buf[o + 3]]);
+        assert_eq!(f(8), 1.0); // land default
+        assert_eq!(f(12), 0.85); // mv0 default
+        assert_eq!(f(16), 0.8); // mv1 default
+        assert_eq!(f(20), 0.75); // mv2 default
+        assert_eq!(f(24), 0.6); // mv3 default
+        assert_eq!(f(28), 0.45); // mv4 default
+        assert_eq!(f(32), 0.4); // mv5 default
+        assert_eq!(f(36), 0.35); // mv6 default
+        assert_eq!(f(40), 0.3); // mv7Plus default
+        assert_eq!(buf[44], 0); // threshold_count
     }
 
     #[test]
@@ -1722,13 +1741,17 @@ mod tests {
         // End-to-end proof that this file's encoder and mamo-sim's decoder agree byte-for-byte,
         // not just that each independently produces/parses bytes it thinks are right.
         let input = minimal_deck_input(Some(serde_json::json!({
-            "card_values": { "land": 1.5, "cmc_0_to_2": 0.7, "cmc_3": 0.4, "other": 0.2 },
+            "card_values": {
+                "land": 1.5, "mv0": 0.9, "mv1": 0.8, "mv2": 0.7, "mv3": 0.6,
+                "mv4": 0.5, "mv5": 0.4, "mv6": 0.3, "mv7Plus": 0.2,
+            },
             "thresholds": [{ "round": 0, "min_value": 5.0 }],
         })));
         let (buf, _mech_keys) = encode_deck_input(&input).expect("encode should succeed");
 
         let (_cards, _mechanics, mulligan) = mamo_sim::codec::decode(&buf).expect("decode should succeed");
         assert_eq!(mulligan.land_value, 1.5);
+        assert_eq!(mulligan.mv_values, [0.9, 0.8, 0.7, 0.6, 0.5, 0.4, 0.3, 0.2]);
         assert_eq!(mulligan.min_value_for_round(0), 5.0);
     }
 }
