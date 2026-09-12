@@ -11,6 +11,7 @@ pub struct Deeplink {
     pub doc: Option<String>,
     pub deck_id: Option<String>,
     pub username: Option<String>,
+    pub path_segment: Option<String>,
 }
 
 pub fn parse_deeplink(args: &[String], scheme_prefix: &str) -> Option<Deeplink> {
@@ -53,11 +54,13 @@ pub fn parse_deeplink_url(raw: &str) -> Option<Deeplink> {
             
             // Also check path for deck ID (e.g., mamoConnector://deck/DECK_ID or mamoConnector://playtest/UUID)
             let path = url.path();
+            let mut path_segment = None;
             if !path.is_empty() && path != "/" {
                 let path_parts: Vec<&str> = path.trim_start_matches('/').split('/').collect();
                 if !path_parts.is_empty() && !path_parts[0].is_empty() {
+                    path_segment = Some(path_parts[0].to_string());
                     // If action refers to a deck operation, the first path segment is the deck ID
-                    if (action == "deck" || action == "mamo" || action == "download-deck" || action == "playtest" || action == "playtest-scenario" || action == "launch-forge" || action == "launchforge" || action == "replay-game" || action == "replaygame" || action == "simulate") && deck_id.is_none() {
+                    if (action == "deck" || action == "mamo" || action == "download-deck" || action == "playtest" || action == "playtest-scenario" || action == "launch-forge" || action == "launchforge" || action == "replay-game" || action == "replaygame" || action == "simulate" || action == "sync-moxfield" || action == "syncmoxfield" || action == "sync-deck" || action == "syncdeck") && deck_id.is_none() {
                         deck_id = Some(path_parts[0].to_string());
                     } else if action == "user" && username.is_none() {
                         username = Some(path_parts[0].to_string());
@@ -73,6 +76,7 @@ pub fn parse_deeplink_url(raw: &str) -> Option<Deeplink> {
                 doc,
                 deck_id,
                 username,
+                path_segment,
             })
         }
         Err(err) => {
@@ -114,6 +118,19 @@ mod tests {
         
         assert_eq!(result.action, "createdeck");
         assert_eq!(result.deck_id, Some("xyz789".to_string()));
+    }
+
+    #[test]
+    fn test_parse_sync_moxfield_url() {
+        let url = "mamoConnector://sync-moxfield/k749mE000kG9v-X?token=test_tok&deckId=mamo-uuid-1&sourceUrl=https://www.moxfield.com/decks/k749mE000kG9v-X";
+        let result = parse_deeplink_url(url).unwrap();
+
+        assert_eq!(result.action, "sync-moxfield");
+        assert_eq!(result.deck_id, Some("mamo-uuid-1".to_string()));
+        assert_eq!(result.token, Some("test_tok".to_string()));
+        assert_eq!(result.path_segment, Some("k749mE000kG9v-X".to_string()));
+        assert!(result.params.iter().any(|(k, v)| k == "deckId" && v == "mamo-uuid-1"));
+        assert!(result.params.iter().any(|(k, v)| k == "sourceUrl" && v == "https://www.moxfield.com/decks/k749mE000kG9v-X"));
     }
 
     #[test]

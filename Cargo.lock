@@ -2453,7 +2453,7 @@ dependencies = [
 
 [[package]]
 name = "mamo-connector"
-version = "0.3.26"
+version = "0.3.27"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -2485,7 +2485,7 @@ dependencies = [
 
 [[package]]
 name = "mamo-sim"
-version = "0.1.7"
+version = "0.1.8"
 dependencies = [
  "wasm-bindgen",
 ]

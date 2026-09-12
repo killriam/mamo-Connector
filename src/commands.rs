@@ -1,7 +1,7 @@
 use log::{error, info, warn};
 use std::sync::{Arc, Mutex};
 use crate::deeplink::Deeplink;
-use crate::deck::{create_deck_from_id, create_deck_from_moxfield, create_deck_from_mamo, create_deck_from_mamo_with_progress, create_deck_and_scenario_for_forge, DeckCreationResult, UserDecksImportResult, import_user_decks, list_moxfield_user_decks, MoxfieldDeckEntry, ProgressCallback};
+use crate::deck::{create_deck_from_id, create_deck_from_moxfield, create_deck_from_mamo, create_deck_from_mamo_with_progress, create_deck_and_scenario_for_forge, DeckCreationResult, DeckSyncResult, SyncStatus, sync_moxfield_deck_with_mamo_id, parse_moxfield_url, UserDecksImportResult, import_user_decks, list_moxfield_user_decks, MoxfieldDeckEntry, ProgressCallback};
 use crate::forge::{launch_forge_from_settings, launch_forge_replay, ForgeLaunchResult};
 use crate::gamelog::{download_replay_content, save_replay_to_forge_dir, ScenarioSyncResult, sync_forge_scenario_file, sync_all_scenario_files};
 use crate::settings::Settings;
@@ -24,6 +24,7 @@ pub fn make_log_collector(collector: SharedLogCollector) -> ProgressCallback {
 pub enum CommandResult {
     DeckCreated(DeckCreationResult),
     DeckCreatedAndLaunched(DeckCreationResult, ForgeLaunchResult),
+    DeckSynced(DeckSyncResult),
     ForgeLaunched(ForgeLaunchResult),
     ReplayGameLaunched(ForgeLaunchResult),
     UserDecksImported(UserDecksImportResult),
@@ -44,6 +45,7 @@ impl CommandResult {
             CommandResult::DeckCreatedAndLaunched(deck_result, forge_result) => {
                 format!("{} | {}", deck_result.message, forge_result.message)
             }
+            CommandResult::DeckSynced(result) => result.message.clone(),
             CommandResult::ForgeLaunched(result) => result.message.clone(),
             CommandResult::ReplayGameLaunched(result) => result.message.clone(),
             CommandResult::UserDecksImported(result) => result.message.clone(),
@@ -63,6 +65,7 @@ impl CommandResult {
             CommandResult::DeckCreatedAndLaunched(deck_result, forge_result) => {
                 deck_result.success && forge_result.success
             }
+            CommandResult::DeckSynced(result) => result.status != SyncStatus::Failed,
             CommandResult::ForgeLaunched(result) => result.success,
             CommandResult::ReplayGameLaunched(result) => result.success,
             CommandResult::UserDecksImported(result) => result.success,
@@ -122,6 +125,7 @@ pub async fn handle_command_with_logger(deeplink: &Deeplink, log_collector: Opti
     match deeplink.action.as_str() {
         "create-deck" => handle_create_deck(deeplink).await,
         "createdeck" => handle_create_deck(deeplink).await, // Alternative format
+        "sync-moxfield" | "syncmoxfield" | "sync-deck" | "syncdeck" => handle_sync_moxfield(deeplink).await,
         "deck" => handle_deck_download(deeplink).await, // New: mamoConnector://deck/DECK_ID
         "mamo" => handle_mamo_deck_download(deeplink).await, // MaMo backend: mamoConnector://mamo/DECK_UUID
         "download-deck" => handle_download_deck_only(deeplink).await, // Save .dck to Forge dir without launching Forge
@@ -138,6 +142,48 @@ pub async fn handle_command_with_logger(deeplink: &Deeplink, log_collector: Opti
         action => {
             warn!("Unknown action received: {}", action);
             CommandResult::UnknownAction(action.to_string())
+        }
+    }
+}
+
+/// Handle mamoConnector://sync-moxfield/MOXFIELD_ID?deckId=MAMO_DECK_UUID&token=JWT
+/// Syncs Moxfield deck, saves to Forge storage, and updates MaMo reference deck with revisions
+async fn handle_sync_moxfield(deeplink: &Deeplink) -> CommandResult {
+    let mox_id = deeplink.path_segment.clone()
+        .or_else(|| get_parameter(&deeplink.params, "moxfieldId"))
+        .or_else(|| get_parameter(&deeplink.params, "moxfield_id"))
+        .or_else(|| {
+            get_parameter(&deeplink.params, "url")
+                .or_else(|| get_parameter(&deeplink.params, "sourceUrl"))
+                .and_then(|u| parse_moxfield_url(&u))
+        })
+        .or_else(|| deeplink.deck_id.clone())
+        .or_else(|| get_parameter(&deeplink.params, "id"));
+
+    let mox_id = match mox_id {
+        Some(id) if !id.is_empty() => id,
+        _ => {
+            error!("No Moxfield deck ID provided in sync-moxfield command");
+            return CommandResult::MissingParameters(
+                "Moxfield deck ID is required. Use mamoConnector://sync-moxfield/MOXFIELD_ID".to_string()
+            );
+        }
+    };
+
+    let mamo_deck_id = get_parameter(&deeplink.params, "deckId")
+        .or_else(|| get_parameter(&deeplink.params, "deck_id"))
+        .or_else(|| get_parameter(&deeplink.params, "mamoDeckId"));
+
+    info!("Syncing Moxfield deck via deeplink: {} (mamo_deck_id: {:?})", mox_id, mamo_deck_id);
+
+    match sync_moxfield_deck_with_mamo_id(&mox_id, mamo_deck_id.as_deref()).await {
+        Ok(result) => {
+            info!("Moxfield deck sync completed: {}", result.message);
+            CommandResult::DeckSynced(result)
+        }
+        Err(err) => {
+            error!("Failed to sync Moxfield deck: {:?}", err);
+            CommandResult::Error(format!("Failed to sync Moxfield deck: {}", err))
         }
     }
 }
@@ -1415,6 +1461,7 @@ mod tests {
             doc: None,
             deck_id,
             username,
+            path_segment: None,
         }
     }
 
@@ -1615,6 +1662,34 @@ mod tests {
                 // Network error is acceptable in test environment
             }
             _ => panic!("Expected UserDecksList or Error result"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_handle_command_sync_moxfield_missing_parameters() {
+        let deeplink = create_test_deeplink("sync-moxfield", vec![]);
+        let result = handle_command(&deeplink).await;
+
+        match result {
+            CommandResult::MissingParameters(msg) => {
+                assert!(msg.contains("Moxfield deck ID"));
+            }
+            _ => panic!("Expected MissingParameters result for missing moxfield id"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_handle_command_sync_moxfield_with_source_url() {
+        let deeplink = create_test_deeplink("sync-moxfield", vec![
+            ("sourceUrl", "https://www.moxfield.com/decks/test-mox-id"),
+            ("deckId", "mamo-uuid-test"),
+        ]);
+        let result = handle_command(&deeplink).await;
+
+        // Will attempt to fetch from Moxfield and either succeed, fail with DeckSynced(status=Failed), or Error
+        match result {
+            CommandResult::DeckSynced(_) | CommandResult::Error(_) => {}
+            _ => panic!("Expected DeckSynced or Error result"),
         }
     }
 

@@ -962,6 +962,26 @@ fn convert_archidekt_to_forge(deck_name: &str, deck: &ArchidektDeck) -> Result<S
     Ok(lines.join("\n"))
 }
 
+/// Parse a Moxfield URL and extract the deck ID
+/// URL format: https://moxfield.com/decks/{deck_id} or https://www.moxfield.com/decks/{deck_id}
+pub fn parse_moxfield_url(url: &str) -> Option<String> {
+    let trimmed = url.trim();
+    if (trimmed.starts_with("http://") || trimmed.starts_with("https://")) && !trimmed.contains("moxfield") {
+        return None;
+    }
+    if let Some(idx) = trimmed.find("/decks/") {
+        let after = &trimmed[idx + 7..];
+        let id = after.split(&['/', '?', '#'][..]).next().unwrap_or(after);
+        if !id.is_empty() {
+            return Some(id.to_string());
+        }
+    }
+    if !trimmed.contains('/') && !trimmed.is_empty() {
+        return Some(trimmed.to_string());
+    }
+    None
+}
+
 /// Parse an Archidekt URL and extract the deck ID
 /// URL format: https://archidekt.com/decks/{deck_id}/{deck_name}
 pub fn parse_archidekt_url(url: &str) -> Option<String> {
@@ -2082,6 +2102,9 @@ pub enum SyncStatus {
 
 #[allow(dead_code)]
 impl DeckSyncResult {
+    pub fn is_success(&self) -> bool {
+        self.status != SyncStatus::Failed
+    }
     pub fn updated(deck_name: String, old_file: PathBuf, new_file: PathBuf) -> Self {
         Self {
             deck_name: deck_name.clone(),
@@ -2163,6 +2186,8 @@ pub struct SyncReferenceCard {
 /// Request payload for `POST /api/decks/sync-external-reference`
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SyncReferenceDeckPayload {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub deck_id: Option<String>,
     pub name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub source_url: Option<String>,
@@ -2326,7 +2351,15 @@ fn with_mamo_note(mut result: DeckSyncResult, note: Option<String>) -> DeckSyncR
 
 /// Sync a single Moxfield deck - check if newer and update if needed
 pub async fn sync_moxfield_deck(deck_id: &str) -> Result<DeckSyncResult> {
-    info!("Syncing Moxfield deck: {}", deck_id);
+    sync_moxfield_deck_with_mamo_id(deck_id, None).await
+}
+
+/// Sync a single Moxfield deck with an optional MaMo deck UUID for targeted reference sync
+pub async fn sync_moxfield_deck_with_mamo_id(
+    deck_id: &str,
+    mamo_deck_id: Option<&str>,
+) -> Result<DeckSyncResult> {
+    info!("Syncing Moxfield deck: {} (mamo_id: {:?})", deck_id, mamo_deck_id);
     
     // Fetch deck info from Moxfield
     let url = format!("{}/decks/all/{}", MOXFIELD_API_URL, deck_id);
@@ -2352,6 +2385,7 @@ pub async fn sync_moxfield_deck(deck_id: &str) -> Result<DeckSyncResult> {
                 let source_url = format!("https://www.moxfield.com/decks/{}", deck_id);
 
                 let payload = SyncReferenceDeckPayload {
+                    deck_id: mamo_deck_id.map(|s| s.to_string()),
                     name: deck.name.clone(),
                     source_url: Some(source_url),
                     source_type: Some("moxfield".to_string()),
@@ -2482,6 +2516,7 @@ pub async fn sync_archidekt_deck(deck_id: &str) -> Result<DeckSyncResult> {
                 let source_url = format!("https://archidekt.com/decks/{}", deck_id);
 
                 let payload = SyncReferenceDeckPayload {
+                    deck_id: None,
                     name: deck.name.clone(),
                     source_url: Some(source_url),
                     source_type: Some("archidekt".to_string()),
@@ -2590,6 +2625,7 @@ pub async fn sync_deckstats_deck(owner_id: &str, deck_id: &str) -> Result<DeckSy
                 let source_url = format!("https://deckstats.net/decks/{}/{}", owner_id, deck_id);
 
                 let payload = SyncReferenceDeckPayload {
+                    deck_id: None,
                     name: deck_name.to_string(),
                     source_url: Some(source_url),
                     source_type: Some("deckstats".to_string()),
@@ -3861,5 +3897,19 @@ Name=Example Commander Deck
         assert_eq!(main.len(), 1);
         assert_eq!(main[0].name, "Sol Ring");
         assert_eq!(main[0].amount, 1);
+    }
+
+    #[test]
+    fn test_parse_moxfield_url() {
+        assert_eq!(parse_moxfield_url("k749mE000kG9v-X"), Some("k749mE000kG9v-X".to_string()));
+        assert_eq!(
+            parse_moxfield_url("https://www.moxfield.com/decks/k749mE000kG9v-X"),
+            Some("k749mE000kG9v-X".to_string())
+        );
+        assert_eq!(
+            parse_moxfield_url("https://moxfield.com/decks/abc_123-def"),
+            Some("abc_123-def".to_string())
+        );
+        assert_eq!(parse_moxfield_url("https://archidekt.com/decks/123"), None);
     }
 }

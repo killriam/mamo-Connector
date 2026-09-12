@@ -1010,6 +1010,13 @@ pub fn launch(
         command_result,
     };
 
+    // Captured once, here, where we're guaranteed to be running inside the #[tokio::main]
+    // runtime `main.rs` set up. Every background thread below reuses this handle instead of
+    // constructing its own `Runtime::new()` — that pattern used to be able to panic the whole
+    // app (out of threads/file descriptors) from inside a UI click handler; a cloned `Handle`
+    // never fails and doesn't spin up a second reactor per click.
+    let runtime_handle = tokio::runtime::Handle::current();
+
     let native_options = NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([800.0, 600.0])
@@ -1018,7 +1025,7 @@ pub fn launch(
     };
     
     eframe::run_native(
-        "Mamo Connector",
+        "MaMo Connector",
         native_options,
         Box::new(move |cc| {
             // Force light theme with explicit text colors
@@ -1037,7 +1044,7 @@ pub fn launch(
             ].into();
             cc.egui_ctx.set_style(style);
             
-            Ok(Box::new(LauncherApp::new(state.clone(), cc.egui_ctx.clone())))
+            Ok(Box::new(LauncherApp::new(state.clone(), cc.egui_ctx.clone(), runtime_handle.clone())))
         }),
     ).map_err(|e| anyhow::anyhow!("Failed to run native app: {}", e))?;
 
@@ -1046,6 +1053,11 @@ pub fn launch(
 
 struct LauncherApp {
     state: AppState,
+    /// Shared handle into the app's single tokio runtime (owned by `#[tokio::main] async fn
+    /// main()`). Every background thread below blocks on this instead of constructing its own
+    /// `Runtime::new()` — cloning a `Handle` is cheap and infallible, unlike spinning up a new
+    /// runtime from inside a UI click handler.
+    runtime_handle: tokio::runtime::Handle,
     url_input: String,
     current_tab: Tab,
     import_state: Arc<Mutex<ImportState>>,
@@ -1118,7 +1130,7 @@ struct LauncherApp {
 }
 
 impl LauncherApp {
-    fn new(state: AppState, ctx: egui::Context) -> Self {
+    fn new(state: AppState, ctx: egui::Context, runtime_handle: tokio::runtime::Handle) -> Self {
         // Load settings
         let mut settings = Settings::load().unwrap_or_default();
         
@@ -1238,6 +1250,13 @@ impl LauncherApp {
                 CommandResult::ScenarioSynced(results) => {
                     activity_log.log_success(format!("Synchronized {} scenario(s) to MaMo", results.len()));
                 }
+                CommandResult::DeckSynced(deck_result) => {
+                    if deck_result.is_success() {
+                        activity_log.log_success(&deck_result.message);
+                    } else {
+                        activity_log.log_error(&deck_result.message);
+                    }
+                }
             }
         }
 
@@ -1271,10 +1290,10 @@ impl LauncherApp {
         {
             let update_check_bg = Arc::clone(&update_check);
             let ctx_bg = ctx.clone();
+            let runtime_handle_bg = runtime_handle.clone();
             std::thread::spawn(move || {
                 std::thread::sleep(std::time::Duration::from_secs(5));
-                let runtime = tokio::runtime::Runtime::new().unwrap();
-                runtime.block_on(async {
+                runtime_handle_bg.block_on(async {
                     if let Ok(asset) = crate::download::resolve_connector_release_asset().await {
                         if is_newer_version(&asset.version, env!("CARGO_PKG_VERSION")) {
                             if let Ok(mut s) = update_check_bg.lock() {
@@ -1301,10 +1320,10 @@ impl LauncherApp {
             let forge_update_progress_bg = Arc::clone(&forge_update_progress);
             let forge_update_cancelled_bg = Arc::clone(&forge_update_cancelled);
             let ctx_bg = ctx.clone();
+            let runtime_handle_bg = runtime_handle.clone();
             std::thread::spawn(move || {
                 std::thread::sleep(std::time::Duration::from_secs(5));
-                let runtime = tokio::runtime::Runtime::new().unwrap();
-                runtime.block_on(run_forge_update_check_and_download(
+                runtime_handle_bg.block_on(run_forge_update_check_and_download(
                     forge_update_check_bg,
                     forge_update_progress_bg,
                     forge_update_cancelled_bg,
@@ -1315,6 +1334,7 @@ impl LauncherApp {
 
         Self {
             state,
+            runtime_handle,
             url_input: String::new(),
             current_tab: initial_tab,
             import_state: Arc::new(Mutex::new(ImportState::default())),
@@ -1837,7 +1857,7 @@ impl eframe::App for LauncherApp {
 
                 // Title with version info
                 ui.horizontal(|ui| {
-                    ui.heading("Mamo Connector");
+                    ui.heading("MaMo Connector");
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         ui.small(egui::RichText::new(format!("v{} ({})", env!("CARGO_PKG_VERSION"), env!("GIT_HASH")))
                             .color(egui::Color32::GRAY));
@@ -2024,15 +2044,14 @@ impl LauncherApp {
         let ctx_for_polling = ctx.clone();
         let wizard_requested = Arc::clone(&self.wizard_requested);
         let decks_fetch_requested = Arc::clone(&self.decks_fetch_requested);
+        let runtime_handle = self.runtime_handle.clone();
 
         // Create a log collector for the command handler
         let log_collector: SharedLogCollector = Arc::new(Mutex::new(Vec::new()));
         let log_collector_for_command = log_collector.clone();
 
         std::thread::spawn(move || {
-            let runtime = tokio::runtime::Runtime::new().unwrap();
-            
-            let result = runtime.block_on(async {
+            let result = runtime_handle.block_on(async {
                 // Spawn a polling task to transfer logs to activity_log in real-time
                 let collector_for_polling = log_collector.clone();
                 let poll_handle = tokio::spawn(async move {
@@ -2135,6 +2154,13 @@ impl LauncherApp {
                     commands::CommandResult::ScenarioSynced(results) => {
                         log.log_success(format!("Synchronized {} scenario(s) to MaMo", results.len()));
                     }
+                    commands::CommandResult::DeckSynced(deck_result) => {
+                        if deck_result.is_success() {
+                            log.log_success(&deck_result.message);
+                        } else {
+                            log.log_error(&deck_result.message);
+                        }
+                    }
                 }
             }
 
@@ -2228,7 +2254,7 @@ impl LauncherApp {
                     .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(220, 220, 230))))
                 .show(ctx, |ui| {
                     ui.horizontal(|ui| {
-                        if ui.small_button("▴ Show Activity").clicked() {
+                        if ui.small_button("Show Activity").clicked() {
                             self.activity_panel_collapsed = false;
                         }
                         // Show latest entry inline
@@ -2262,7 +2288,7 @@ impl LauncherApp {
                 .show(ctx, |ui| {
                     // Header row
                     ui.horizontal(|ui| {
-                        if ui.small_button("▾ Hide Activity").clicked() {
+                        if ui.small_button("Hide Activity").clicked() {
                             self.activity_panel_collapsed = true;
                         }
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -2412,14 +2438,14 @@ impl LauncherApp {
             let result_rx_bg = Arc::clone(&result_rx);
             let ctx_bg = ctx.clone();
             let launch_clone = launch.clone();
+            let runtime_handle = self.runtime_handle.clone();
 
             if let Ok(mut log) = self.activity_log.lock() {
                 log.log_info(format!("Downloading deck '{deck_name}' before launching Forge…"));
             }
 
             std::thread::spawn(move || {
-                let runtime = tokio::runtime::Runtime::new().unwrap();
-                let res = runtime.block_on(async {
+                let res = runtime_handle.block_on(async {
                     Self::prepare_launch_deck(launch_clone).await
                 });
                 *result_rx_bg.lock().unwrap() = Some(res);
@@ -2507,10 +2533,10 @@ impl LauncherApp {
         let result_rx = Arc::new(Mutex::new(None));
         let result_rx_bg = Arc::clone(&result_rx);
         let ctx_bg = ctx.clone();
+        let runtime_handle = self.runtime_handle.clone();
 
         std::thread::spawn(move || {
-            let runtime = tokio::runtime::Runtime::new().unwrap();
-            let res = runtime.block_on(async {
+            let res = runtime_handle.block_on(async {
                 // Cap update check to 4 seconds so a slow network/GitHub doesn't hang launch
                 tokio::select! {
                     res = check_forge_update_available() => res,
@@ -2847,13 +2873,13 @@ impl LauncherApp {
             let ctx_bg = ctx.clone();
             let forge_update_check = Arc::clone(&self.forge_update_check);
             let downloaded_asset = asset.clone();
+            let runtime_handle = self.runtime_handle.clone();
 
             std::thread::spawn(move || {
-                let runtime = tokio::runtime::Runtime::new().unwrap();
                 let dest_dir = forge_download_dir();
                 let ctx_callback = ctx_bg.clone();
                 let progress_cb = Arc::clone(&progress_bg);
-                let outcome = runtime.block_on(async {
+                let outcome = runtime_handle.block_on(async {
                     crate::download::download_forge_update_staged(
                         &dest_dir,
                         move |update| {
@@ -3049,10 +3075,10 @@ impl LauncherApp {
         let progress_bg = Arc::clone(&progress_arc);
         let result_bg = Arc::clone(&result_arc);
         let cancelled_bg = Arc::clone(&cancelled);
+        let runtime_handle = self.runtime_handle.clone();
 
         std::thread::spawn(move || {
-            let runtime = tokio::runtime::Runtime::new().unwrap();
-            let outcome = runtime.block_on(async {
+            let outcome = runtime_handle.block_on(async {
                 crate::download::download_forge_portable(
                     &forge_dir,
                     move |update| {
@@ -3116,10 +3142,10 @@ impl LauncherApp {
         let progress_bg = Arc::clone(&self.connector_update_progress);
         let cancelled_bg = Arc::clone(&self.connector_update_cancelled);
         let ctx_progress = ctx.clone();
+        let runtime_handle = self.runtime_handle.clone();
 
         std::thread::spawn(move || {
-            let runtime = tokio::runtime::Runtime::new().unwrap();
-            runtime.block_on(async {
+            runtime_handle.block_on(async {
                 let progress_cb = Arc::clone(&progress_bg);
                 let ctx_cb = ctx_progress.clone();
                 let outcome = crate::download::download_connector_update_staged(
@@ -3191,9 +3217,9 @@ impl LauncherApp {
         let forge_update_progress = Arc::clone(&self.forge_update_progress);
         let cancelled = Arc::clone(&self.forge_update_cancelled);
         let ctx = ctx.clone();
+        let runtime_handle = self.runtime_handle.clone();
         std::thread::spawn(move || {
-            let runtime = tokio::runtime::Runtime::new().unwrap();
-            runtime.block_on(run_forge_update_check_and_download(
+            runtime_handle.block_on(run_forge_update_check_and_download(
                 forge_update_check,
                 forge_update_progress,
                 cancelled,
@@ -3214,9 +3240,9 @@ impl LauncherApp {
         }
         let update_check = Arc::clone(&self.update_check);
         let ctx = ctx.clone();
+        let runtime_handle = self.runtime_handle.clone();
         std::thread::spawn(move || {
-            let runtime = tokio::runtime::Runtime::new().unwrap();
-            runtime.block_on(async {
+            runtime_handle.block_on(async {
                 match crate::download::resolve_connector_release_asset().await {
                     Ok(asset) => {
                         let is_newer = is_newer_version(&asset.version, env!("CARGO_PKG_VERSION"));
@@ -6700,6 +6726,7 @@ mod deck_picker_tests {
             doc: None,
             deck_id: deck_id.map(|s| s.to_string()),
             username: None,
+            path_segment: None,
         }
     }
 
