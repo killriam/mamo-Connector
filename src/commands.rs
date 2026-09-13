@@ -174,6 +174,18 @@ async fn handle_sync_moxfield(deeplink: &Deeplink) -> CommandResult {
         .or_else(|| get_parameter(&deeplink.params, "deck_id"))
         .or_else(|| get_parameter(&deeplink.params, "mamoDeckId"));
 
+    // Save auth token from deeplink if provided
+    if let Some(token) = get_parameter(&deeplink.params, "token") {
+        if !token.is_empty() {
+            if let Ok(mut settings) = crate::settings::Settings::load() {
+                if settings.auth_token.as_deref() != Some(&token) {
+                    settings.auth_token = Some(token);
+                    let _ = settings.save();
+                }
+            }
+        }
+    }
+
     info!("Syncing Moxfield deck via deeplink: {} (mamo_deck_id: {:?})", mox_id, mamo_deck_id);
 
     match sync_moxfield_deck_with_mamo_id(&mox_id, mamo_deck_id.as_deref()).await {
@@ -856,10 +868,22 @@ async fn handle_import_user_decks(deeplink: &Deeplink) -> CommandResult {
         }
     };
 
-    // Extract API base URL (with default fallback)
+    // Extract API base URL (with default fallback to MaMo backend)
     let api_base_url = get_parameter(&deeplink.params, "api_url")
         .or_else(|| get_parameter(&deeplink.params, "api"))
-        .unwrap_or_else(|| "https://api.example.com".to_string());
+        .unwrap_or_else(|| crate::deck::MAMO_API_URL.to_string());
+
+    // Save auth token from deeplink if provided
+    if let Some(token) = get_parameter(&deeplink.params, "token") {
+        if !token.is_empty() {
+            if let Ok(mut settings) = crate::settings::Settings::load() {
+                if settings.auth_token.as_deref() != Some(&token) {
+                    settings.auth_token = Some(token);
+                    let _ = settings.save();
+                }
+            }
+        }
+    }
 
     info!("Importing decks for user: {} from API: {}", username, api_base_url);
 

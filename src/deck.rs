@@ -1203,7 +1203,7 @@ pub fn parse_deckstats_url(url: &str) -> Option<(String, String)> {
 // ==================== MaMo Support ====================
 
 /// MaMo API base URL for deck export
-const MAMO_API_URL: &str = "https://new-backend-two-eosin.vercel.app";
+pub const MAMO_API_URL: &str = "https://new-backend-two-eosin.vercel.app";
 
 /// Progress callback type for deck operations
 pub type ProgressCallback = Box<dyn Fn(&str) + Send + Sync>;
