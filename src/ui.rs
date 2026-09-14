@@ -1573,6 +1573,14 @@ impl eframe::App for LauncherApp {
                                         log::error!("Failed to finalize updated Forge jar: {e}");
                                     }
                                 }
+                                // This staged_path came from the same download that also
+                                // populated the shared forge_update_check.staged (see
+                                // action_start_download) — clear it so the next
+                                // finalize_staged_forge_update_if_ready tick doesn't redundantly
+                                // re-finalize an already-consumed (deleted/renamed) staged_path,
+                                // which fails with a spurious "Failed to move staged Forge update
+                                // into place" error since the source no longer exists.
+                                self.forge_update_check.lock().unwrap().staged = None;
                                 prelaunch_action = Some(dialog.launch.clone());
                             }
                             Err(e) if is_cancelled_error(&e) => {
