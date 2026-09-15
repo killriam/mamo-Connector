@@ -143,6 +143,11 @@ struct ForgeUpdateCheckState {
     dismissed: bool,
     /// The asset currently being downloaded in the background, if any.
     downloading_asset: Option<crate::download::ForgeAsset>,
+    /// True while a background thread spawned by `ensure_forge_finalize_started` is running
+    /// `finalize_staged_forge_update` for `staged` — guards against spawning a second one for
+    /// the same update (e.g. the periodic tick and the pre-launch dialog both wanting to
+    /// install the same staged download).
+    finalizing: bool,
 }
 
 /// Destructive actions that require a confirmation dialog
@@ -518,6 +523,55 @@ fn forge_download_dir() -> std::path::PathBuf {
         .unwrap_or_else(|_| std::path::PathBuf::from("forge"))
 }
 
+/// Starts a background thread running `finalize_staged_forge_update` for whatever's in
+/// `forge_update_check.staged`, if one isn't already running for it. Never blocks — the old
+/// code called `finalize_staged_forge_update` directly on the UI thread from four different
+/// call sites, which mostly stayed fast because the slow part (deleting an old, possibly huge
+/// `res/`) was itself pushed onto a background thread, but that background delete can still
+/// saturate disk I/O (worse under antivirus real-time scanning) badly enough to stall the
+/// *remaining* synchronous rename/write calls in the very same function — freezing the window
+/// for minutes despite that earlier fix. Running the whole thing off-thread closes that gap.
+/// A free function rather than a method: it only needs these two fields, so calling it while a
+/// caller already holds a `&mut` borrow into another field of `LauncherApp` (e.g. the pre-launch
+/// dialog's state, borrowed via `if let Some(ref mut dialog) = self.prelaunch_update_dialog`)
+/// doesn't conflict the way a `&self` method call would.
+/// The outcome lands in `forge_finalize_result` for the caller to poll on a later tick. No-op if
+/// nothing is staged or a finalize is already in flight.
+fn ensure_forge_finalize_started(
+    forge_update_check: &Arc<Mutex<ForgeUpdateCheckState>>,
+    forge_finalize_result: &Arc<Mutex<Option<(crate::download::ForgeAsset, Result<(), String>)>>>,
+    ctx: &egui::Context,
+) {
+    let staged = {
+        let mut s = forge_update_check.lock().unwrap();
+        if s.finalizing {
+            return;
+        }
+        let Some(staged) = s.staged.clone() else { return };
+        s.finalizing = true;
+        staged
+    };
+
+    let forge_dir = forge_download_dir();
+    let forge_update_check = Arc::clone(forge_update_check);
+    let result_slot = Arc::clone(forge_finalize_result);
+    let ctx = ctx.clone();
+    std::thread::spawn(move || {
+        let outcome = crate::download::finalize_staged_forge_update(&forge_dir, &staged.staged_path, &staged.asset)
+            .map(|_| ())
+            .map_err(|e| e.to_string());
+        *result_slot.lock().unwrap() = Some((staged.asset, outcome));
+        if let Ok(mut s) = forge_update_check.lock() {
+            s.finalizing = false;
+            // Clear either way — a failed rename (e.g. Forge opened again in the instant
+            // between the "not running" check and now) will simply be re-detected and
+            // re-downloaded next check.
+            s.staged = None;
+        }
+        ctx.request_repaint();
+    });
+}
+
 /// True when `forge_path` is the Connector's own managed Forge download directory, rather than
 /// a Forge install the user pointed at manually. Only Connector-managed installs are safe to
 /// offer an "update" for — there's no "latest" baseline to compare a user-provided install
@@ -824,6 +878,12 @@ enum PreLaunchUpdateState {
         progress: Arc<Mutex<Option<DownloadProgress>>>,
         cancelled: Arc<AtomicBool>,
         result: Arc<Mutex<Option<Result<std::path::PathBuf, String>>>>,
+    },
+    /// Waiting for the shared background finalize (`ensure_forge_finalize_started`) to finish
+    /// swapping the downloaded update into place — kept off the UI thread since the swap can
+    /// take a while under antivirus real-time scanning.
+    Finalizing {
+        asset: crate::download::ForgeAsset,
     },
     /// Download or install failed
     Failed {
@@ -1155,6 +1215,11 @@ struct LauncherApp {
     forge_update_progress: Arc<Mutex<Option<DownloadProgress>>>,
     /// Set by the banner's Cancel button; read by the update download task
     forge_update_cancelled: Arc<AtomicBool>,
+    /// Outcome of the most recent background finalize kicked off by
+    /// `ensure_forge_finalize_started`, polled by whichever caller is currently watching it
+    /// (the periodic tick, or the pre-launch dialog's `Finalizing` state — never both at once,
+    /// see `finalize_staged_forge_update_if_ready`).
+    forge_finalize_result: Arc<Mutex<Option<(crate::download::ForgeAsset, Result<(), String>)>>>,
     /// Whether the setup wizard is currently visible
     show_setup_wizard: bool,
     /// State for the setup wizard
@@ -1371,6 +1436,7 @@ impl LauncherApp {
         let forge_update_check = Arc::new(Mutex::new(ForgeUpdateCheckState::default()));
         let forge_update_progress: Arc<Mutex<Option<DownloadProgress>>> = Arc::new(Mutex::new(None));
         let forge_update_cancelled = Arc::new(AtomicBool::new(false));
+        let forge_finalize_result = Arc::new(Mutex::new(None));
         if is_connector_managed_forge(settings.forge_path.as_deref().unwrap_or(""), &forge_download_dir()) {
             let forge_update_check_bg = Arc::clone(&forge_update_check);
             let forge_update_progress_bg = Arc::clone(&forge_update_progress);
@@ -1418,6 +1484,7 @@ impl LauncherApp {
             forge_update_check,
             forge_update_progress,
             forge_update_cancelled,
+            forge_finalize_result,
             show_setup_wizard: forge_not_configured,
             wizard,
             wizard_requested,
@@ -1561,27 +1628,15 @@ impl eframe::App for LauncherApp {
                     let res = result.lock().unwrap().take();
                     if let Some(res) = res {
                         match res {
-                            Ok(staged_path) => {
-                                let forge_dir = forge_download_dir();
-                                match crate::download::finalize_staged_forge_update(&forge_dir, &staged_path, asset) {
-                                    Ok(_) => {
-                                        if let Ok(mut log) = self.activity_log.lock() {
-                                            log.log_success(forge_update_success_message(asset));
-                                        }
-                                    }
-                                    Err(e) => {
-                                        log::error!("Failed to finalize updated Forge jar: {e}");
-                                    }
-                                }
-                                // This staged_path came from the same download that also
-                                // populated the shared forge_update_check.staged (see
-                                // action_start_download) — clear it so the next
-                                // finalize_staged_forge_update_if_ready tick doesn't redundantly
-                                // re-finalize an already-consumed (deleted/renamed) staged_path,
-                                // which fails with a spurious "Failed to move staged Forge update
-                                // into place" error since the source no longer exists.
-                                self.forge_update_check.lock().unwrap().staged = None;
-                                prelaunch_action = Some(dialog.launch.clone());
+                            Ok(_staged_path) => {
+                                // The download already populated the shared
+                                // forge_update_check.staged (see action_start_download) —
+                                // ensure_forge_finalize_started reads from there, so hand off to
+                                // it instead of finalizing inline on the UI thread. Calling the
+                                // free function (not the self.method() wrapper) since `dialog`
+                                // still holds self.prelaunch_update_dialog mutably borrowed here.
+                                ensure_forge_finalize_started(&self.forge_update_check, &self.forge_finalize_result, ctx);
+                                dialog.state = PreLaunchUpdateState::Finalizing { asset: asset.clone() };
                             }
                             Err(e) if is_cancelled_error(&e) => {
                                 // Cancelled
@@ -1595,20 +1650,9 @@ impl eframe::App for LauncherApp {
                                 };
                             }
                         }
-                    } else if let Some(staged) = self.forge_update_check.lock().unwrap().staged.clone() {
-                        let forge_dir = forge_download_dir();
-                        match crate::download::finalize_staged_forge_update(&forge_dir, &staged.staged_path, &staged.asset) {
-                            Ok(_) => {
-                                if let Ok(mut log) = self.activity_log.lock() {
-                                    log.log_success(forge_update_success_message(&staged.asset));
-                                }
-                            }
-                            Err(e) => {
-                                log::error!("Failed to finalize updated Forge jar: {e}");
-                            }
-                        }
-                        self.forge_update_check.lock().unwrap().staged = None;
-                        prelaunch_action = Some(dialog.launch.clone());
+                    } else if self.forge_update_check.lock().unwrap().staged.is_some() {
+                        ensure_forge_finalize_started(&self.forge_update_check, &self.forge_finalize_result, ctx);
+                        dialog.state = PreLaunchUpdateState::Finalizing { asset: asset.clone() };
                     } else if let Some(ref prog) = *self.forge_update_progress.lock().unwrap() {
                         if let Some(ref err) = prog.error {
                             dialog.state = PreLaunchUpdateState::Failed {
@@ -1617,6 +1661,24 @@ impl eframe::App for LauncherApp {
                             };
                         }
                     }
+                }
+                PreLaunchUpdateState::Finalizing { .. } => {
+                    if let Some((asset, outcome)) = self.forge_finalize_result.lock().unwrap().take() {
+                        match outcome {
+                            Ok(()) => {
+                                if let Ok(mut log) = self.activity_log.lock() {
+                                    log.log_success(forge_update_success_message(&asset));
+                                }
+                                prelaunch_action = Some(dialog.launch.clone());
+                            }
+                            Err(e) => {
+                                log::error!("Failed to finalize updated Forge jar: {e}");
+                                dialog.state = PreLaunchUpdateState::Failed { error: e, asset };
+                            }
+                        }
+                    }
+                    // Still in flight — try again on the next tick. ensure_forge_finalize_started
+                    // is idempotent, so no need to re-call it here.
                 }
                 _ => {}
             }
@@ -1632,7 +1694,7 @@ impl eframe::App for LauncherApp {
         if !self.show_setup_wizard && now.duration_since(self.last_pending_check).as_millis() > 500 {
             self.last_pending_check = now;
             self.check_pending_commands(ctx);
-            self.finalize_staged_forge_update_if_ready();
+            self.finalize_staged_forge_update_if_ready(ctx);
         }
 
         // Auto gamelog scanning after deeplink Forge launch
@@ -2657,6 +2719,7 @@ impl LauncherApp {
             PreLaunchUpdateState::Prompt { is_staged: true, .. } => "✨ MaMo Forge Update Ready",
             PreLaunchUpdateState::Prompt { is_staged: false, .. } => "⬆ MaMo Forge Update Available",
             PreLaunchUpdateState::Downloading { .. } => "⏳ Updating MaMo Forge…",
+            PreLaunchUpdateState::Finalizing { .. } => "⏳ Installing MaMo Forge Update…",
             PreLaunchUpdateState::Failed { .. } => "⚠ Update Failed",
         };
 
@@ -2829,6 +2892,23 @@ impl LauncherApp {
                             });
                         });
                     }
+                    PreLaunchUpdateState::Finalizing { asset } => {
+                        ui.horizontal(|ui| {
+                            ui.spinner();
+                            ui.label(egui::RichText::new(format!("Installing {} — swapping Forge files into place…", asset.name)).small());
+                        });
+                        ui.add_space(spacing::SPACE_14);
+                        ui.horizontal(|ui| {
+                            if ui.button("Cancel").clicked() {
+                                action_cancel = true;
+                            }
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                if ui.button("Launch Current Version").clicked() {
+                                    action_launch_anyway = true;
+                                }
+                            });
+                        });
+                    }
                     PreLaunchUpdateState::Failed { error, .. } => {
                         ui.horizontal(|ui| {
                             ui.label(egui::RichText::new("✗").color(colors::ERROR).size(24.0));
@@ -2880,23 +2960,15 @@ impl LauncherApp {
         } else if action_apply_staged {
             let dialog_data = self.prelaunch_update_dialog.take().unwrap();
             if let PreLaunchUpdateState::Prompt { asset, .. } = dialog_data.state {
-                let staged_path = self.forge_update_check.lock().unwrap().staged.as_ref().map(|s| s.staged_path.clone());
-                if let Some(staged_path) = staged_path {
-                    let forge_dir = forge_download_dir();
-                    match crate::download::finalize_staged_forge_update(&forge_dir, &staged_path, &asset) {
-                        Ok(_) => {
-                            if let Ok(mut log) = self.activity_log.lock() {
-                                log.log_success(forge_update_success_message(&asset));
-                            }
-                        }
-                        Err(e) => {
-                            log::error!("Failed to finalize staged Forge jar: {e}");
-                        }
-                    }
-                }
-                self.forge_update_check.lock().unwrap().staged = None;
+                self.ensure_forge_finalize_started(ctx);
+                self.prelaunch_update_dialog = Some(PreLaunchUpdateDialog {
+                    launch: dialog_data.launch,
+                    state: PreLaunchUpdateState::Finalizing { asset },
+                });
+                ctx.request_repaint();
+            } else {
+                self.execute_pending_forge_launch(dialog_data.launch, ctx);
             }
-            self.execute_pending_forge_launch(dialog_data.launch, ctx);
         } else if action_start_download {
             let (asset, launch) = match &self.prelaunch_update_dialog {
                 Some(d) => match &d.state {
@@ -3345,35 +3417,47 @@ impl LauncherApp {
         });
     }
 
+    /// Method-call convenience wrapper around the free function of the same name (see its doc)
+    /// — split out as a free function so it can be called while another field of `self` (e.g.
+    /// `prelaunch_update_dialog`) is already mutably borrowed.
+    fn ensure_forge_finalize_started(&self, ctx: &egui::Context) {
+        ensure_forge_finalize_started(&self.forge_update_check, &self.forge_finalize_result, ctx);
+    }
+
     /// Swaps a fully-downloaded, staged MaMo Forge update into place the moment Forge is
     /// confirmed not running — called from the same 500ms tick `check_pending_commands` already
     /// runs on. Unlike the old click-triggered `start_forge_update` this replaced, downloading
-    /// happens automatically the moment an update is detected (`run_forge_update_check_and_download`);
-    /// this step only ever does a fast local rename, deferred as many ticks as it takes for
-    /// Forge to close, so it never risks overwriting a jar Forge might still have open.
-    fn finalize_staged_forge_update_if_ready(&mut self) {
-        let staged = self.forge_update_check.lock().unwrap().staged.clone();
-        let Some(staged) = staged else { return };
+    /// happens automatically the moment an update is detected (`run_forge_update_check_and_download`).
+    /// Backs off entirely while the pre-launch dialog is open: that dialog owns the finalize (and
+    /// polls `forge_finalize_result` itself) whenever the user is actively launching into a deck,
+    /// so only one watcher is ever reading that shared slot at a time.
+    fn finalize_staged_forge_update_if_ready(&mut self, ctx: &egui::Context) {
+        if self.prelaunch_update_dialog.is_some() {
+            return;
+        }
+        if self.forge_update_check.lock().unwrap().staged.is_none() {
+            return;
+        }
         if crate::forge::is_forge_window_open() {
             return; // still running — try again on the next tick
         }
 
-        let forge_dir = forge_download_dir();
-        match crate::download::finalize_staged_forge_update(&forge_dir, &staged.staged_path, &staged.asset) {
-            Ok(_final_path) => {
-                if let Ok(mut log) = self.activity_log.lock() {
-                    log.log_success(forge_update_success_message(&staged.asset));
+        self.ensure_forge_finalize_started(ctx);
+
+        if let Some((asset, outcome)) = self.forge_finalize_result.lock().unwrap().take() {
+            match outcome {
+                Ok(()) => {
+                    if let Ok(mut log) = self.activity_log.lock() {
+                        log.log_success(forge_update_success_message(&asset));
+                    }
                 }
-            }
-            Err(e) => {
-                if let Ok(mut log) = self.activity_log.lock() {
-                    log.log_error(format!("Failed to install downloaded MaMo Forge update: {e}"));
+                Err(e) => {
+                    if let Ok(mut log) = self.activity_log.lock() {
+                        log.log_error(format!("Failed to install downloaded MaMo Forge update: {e}"));
+                    }
                 }
             }
         }
-        // Clear either way — a failed rename (e.g. Forge opened again in the instant between
-        // the check above and now) will simply be re-detected and re-downloaded next check.
-        self.forge_update_check.lock().unwrap().staged = None;
     }
 
     fn render_setup_wizard(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
