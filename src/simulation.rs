@@ -114,7 +114,8 @@ pub async fn run_simulation_for_deck(
 
     // Step 2: Analyse stats
     let report_path = scripts_dir.join("commander_simulation_report.json");
-    if let Err(e) = run_analysis_script(&scripts_dir, &report_path, config.games, log).await {
+    let limit = if config.games == 0 { 5 } else { config.games };
+    if let Err(e) = run_analysis_script(&scripts_dir, &report_path, limit, log).await {
         return SimulationResult::failure(format!("Analysis script failed: {}", e));
     }
 
@@ -204,10 +205,25 @@ async fn run_simulation_script(
         config.games
     ));
 
-    let output = TokioCommand::new("powershell")
-        .args(&args)
+    let mut cmd = TokioCommand::new("powershell");
+    cmd.args(&args)
         .stdin(Stdio::null()) // prevent any interactive prompt from blocking
-        .current_dir(scripts_dir)
+        .current_dir(scripts_dir);
+
+    // If Java 17+ is detected, ensure PATH and JAVA_HOME point to it so PowerShell runs the modern runtime
+    if let crate::forge::JavaStatus::Ok { path, .. } = crate::forge::detect_java() {
+        if let Some(bin_dir) = path.parent() {
+            let current_path = std::env::var("PATH").unwrap_or_default();
+            let new_path = format!("{};{}", bin_dir.display(), current_path);
+            cmd.env("PATH", new_path);
+
+            if let Some(java_home) = bin_dir.parent() {
+                cmd.env("JAVA_HOME", java_home);
+            }
+        }
+    }
+
+    let output = cmd
         .output()
         .await
         .context("Failed to spawn PowerShell simulation script")?;
