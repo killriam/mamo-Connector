@@ -370,6 +370,7 @@ fn resolve_scripts_dir(settings: &Settings) -> Option<PathBuf> {
         let candidates = [
             forge.parent().map(|p| p.join("forge")),
             forge.parent().and_then(|p| p.parent()).map(|p| p.join("forge")),
+            Some(PathBuf::from("C:\\SWProjects\\Forge")),
         ];
         for candidate in candidates.into_iter().flatten() {
             if candidate.join("run_commander_simulation.ps1").exists() {
