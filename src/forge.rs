@@ -283,7 +283,7 @@ pub fn discover_java_runtimes() -> Vec<(PathBuf, u32)> {
 
 /// Resolve which `java` command to actually invoke: the best available 17+ Java executable,
 /// or fallback to bare `"java"` (PATH-resolved).
-fn resolve_java_command() -> std::ffi::OsString {
+pub(crate) fn resolve_java_command() -> std::ffi::OsString {
     match detect_java() {
         JavaStatus::Ok { path, .. } => path.into_os_string(),
         JavaStatus::TooOld { path, .. } => path.into_os_string(),

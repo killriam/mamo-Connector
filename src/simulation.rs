@@ -436,3 +436,210 @@ pub fn sanitize_deck_name(name: &str) -> String {
         })
         .collect()
 }
+
+// ==================== Headless replay verification ====================
+
+/// Result of a single headless `sim -r <replay>` verification run.
+///
+/// This does NOT verify that the game reproduces the original recorded outcome — `sim` mode
+/// pilots BOTH seats with fresh AI decisions from the reordered opening library (there is no
+/// human seat in headless mode), so a different winner than the original replay is expected
+/// and is not a failure. What it verifies is structural: the replay JSON parses, both decks
+/// load, and Forge's engine can play the reconstructed game to completion (or a clean draw)
+/// without crashing — the thing the interactive `replay <path>` GUI path can never confirm in
+/// an automated run, since it always launches a window and can block on operator-only dialogs
+/// ("Already Replayed", AI-deck-compatibility warnings) that `sim` mode never shows.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ReplayVerificationResult {
+    pub success: bool,
+    pub is_draw: bool,
+    pub winner: Option<String>,
+    pub duration_ms: Option<u64>,
+    pub message: String,
+}
+
+/// Run `java -jar <forge.jar> sim -d <deck1> <deck2> -n 1 -f commander -c <timeout> -r <replay_json>`
+/// and parse its "Game Result" line.
+///
+/// `deck1_name`/`deck2_name` are deck stems (no `.dck`, no path) as Forge's own deck storage
+/// resolves them — same convention `run_simulation_for_deck` already uses for `-d`. Callers are
+/// responsible for confirming both decks actually exist locally before calling this; a missing
+/// deck surfaces as a normal Forge "Could not load deck" failure in `stdout`/`stderr` here rather
+/// than as a distinct error path.
+pub async fn run_replay_verification(
+    deck1_name: &str,
+    deck2_name: &str,
+    replay_json_path: &Path,
+    timeout_secs: u32,
+    log: &dyn Fn(&str),
+) -> Result<ReplayVerificationResult> {
+    let settings = Settings::load()?;
+    let forge_path = settings
+        .forge_path
+        .as_deref()
+        .filter(|p| !p.is_empty())
+        .ok_or_else(|| anyhow!("Forge path not configured. Set it in the Setup tab."))?;
+
+    let forge_path_buf = PathBuf::from(forge_path);
+    let jar_path = if forge_path_buf.is_dir() {
+        crate::forge::resolve_latest_forge_jar(&forge_path_buf)
+            .ok_or_else(|| anyhow!("No forge-gui-desktop JAR found in: {}", forge_path_buf.display()))?
+    } else {
+        forge_path_buf
+    };
+
+    log(&format!(
+        "Verifying replay headlessly: '{}' vs '{}' ({})",
+        deck1_name,
+        deck2_name,
+        jar_path.display()
+    ));
+
+    let mut cmd = TokioCommand::new(crate::forge::resolve_java_command());
+    cmd.arg("-Xmx4096m")
+        .arg("-Dfile.encoding=UTF-8")
+        .arg("-jar")
+        .arg(&jar_path)
+        .arg("sim")
+        .arg("-d")
+        .arg(deck1_name)
+        .arg(deck2_name)
+        .arg("-n")
+        .arg("1")
+        .arg("-f")
+        .arg("commander")
+        .arg("-c")
+        .arg(timeout_secs.to_string())
+        .arg("-r")
+        .arg(replay_json_path)
+        .stdin(Stdio::null());
+
+    if let Some(dir) = jar_path.parent() {
+        cmd.current_dir(dir);
+    }
+
+    let output = cmd
+        .output()
+        .await
+        .context("Failed to spawn headless Forge verification process")?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+
+    for line in stdout.lines() {
+        info!("[verify-replay] {}", line);
+    }
+    if !stderr.trim().is_empty() {
+        warn!("[verify-replay stderr] {}", stderr.trim());
+    }
+
+    if !output.status.success() {
+        let msg = format!(
+            "Verification failed: Forge exited with status {:?} before completing the game. stderr: {}",
+            output.status.code(),
+            stderr.trim()
+        );
+        log(&msg);
+        return Ok(ReplayVerificationResult {
+            success: false,
+            is_draw: false,
+            winner: None,
+            duration_ms: None,
+            message: msg,
+        });
+    }
+
+    match parse_game_result_line(&stdout) {
+        Some(result) => {
+            log(&result.message);
+            Ok(result)
+        }
+        None => {
+            let msg = "Verification failed: Forge exited cleanly but no 'Game Result' line was \
+                found in its output — the game may not have started (check the deck names resolved)."
+                .to_string();
+            log(&msg);
+            Ok(ReplayVerificationResult {
+                success: false,
+                is_draw: false,
+                winner: None,
+                duration_ms: None,
+                message: msg,
+            })
+        }
+    }
+}
+
+/// Parse Forge's `SimulateMatch` stdout for its "Game Result" line. Pure function, no I/O — see
+/// `SimulateMatch.java` (forge-gui-desktop) for the exact formats this mirrors:
+///   "Game Result: Game %d ended in a Draw! Took %d ms."
+///   "Game Result: Game %d ended in %d ms. %s has won!"
+fn parse_game_result_line(stdout: &str) -> Option<ReplayVerificationResult> {
+    let line = stdout.lines().find(|l| l.contains("Game Result:"))?;
+
+    if let Some(rest) = line.split("ended in a Draw! Took ").nth(1) {
+        let ms: u64 = rest.trim().trim_end_matches("ms.").trim().parse().ok()?;
+        return Some(ReplayVerificationResult {
+            success: true,
+            is_draw: true,
+            winner: None,
+            duration_ms: Some(ms),
+            message: format!("Replay verified: game ended in a draw after {} ms.", ms),
+        });
+    }
+
+    // "... ended in <ms> ms. <winner> has won!"
+    let after_ended = line.split("ended in ").nth(1)?;
+    let (ms_part, rest) = after_ended.split_once(" ms. ")?;
+    let winner = rest.trim().trim_end_matches(" has won!").to_string();
+    if winner.is_empty() {
+        return None;
+    }
+    let ms: u64 = ms_part.trim().parse().ok()?;
+
+    Some(ReplayVerificationResult {
+        success: true,
+        is_draw: false,
+        winner: Some(winner.clone()),
+        duration_ms: Some(ms),
+        message: format!("Replay verified: game completed in {} ms, {} won.", ms, winner),
+    })
+}
+
+#[cfg(test)]
+mod replay_verification_tests {
+    use super::*;
+
+    #[test]
+    fn parses_win_line() {
+        let stdout = "Simulation mode\nReplay mode enabled: C:\\replay.json\n\
+            \nGame Result: Game 1 ended in 4567 ms. Ai(2)-Edgar Markov Aggro 5.0 has won!\n";
+        let result = parse_game_result_line(stdout).expect("should parse a win line");
+        assert!(result.success);
+        assert!(!result.is_draw);
+        assert_eq!(result.winner.as_deref(), Some("Ai(2)-Edgar Markov Aggro 5.0"));
+        assert_eq!(result.duration_ms, Some(4567));
+    }
+
+    #[test]
+    fn parses_draw_line() {
+        let stdout = "\nGame Result: Game 1 ended in a Draw! Took 1234 ms.\n";
+        let result = parse_game_result_line(stdout).expect("should parse a draw line");
+        assert!(result.success);
+        assert!(result.is_draw);
+        assert_eq!(result.winner, None);
+        assert_eq!(result.duration_ms, Some(1234));
+    }
+
+    #[test]
+    fn returns_none_when_no_game_result_line_present() {
+        let stdout = "Simulation mode\nCould not load deck - Foo, match cannot start\n";
+        assert!(parse_game_result_line(stdout).is_none());
+    }
+
+    #[test]
+    fn returns_none_on_malformed_result_line() {
+        let stdout = "Game Result: Game 1 ended weirdly\n";
+        assert!(parse_game_result_line(stdout).is_none());
+    }
+}

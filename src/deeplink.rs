@@ -60,7 +60,7 @@ pub fn parse_deeplink_url(raw: &str) -> Option<Deeplink> {
                 if !path_parts.is_empty() && !path_parts[0].is_empty() {
                     path_segment = Some(path_parts[0].to_string());
                     // If action refers to a deck operation, the first path segment is the deck ID
-                    if (action == "deck" || action == "mamo" || action == "download-deck" || action == "playtest" || action == "playtest-scenario" || action == "launch-forge" || action == "launchforge" || action == "replay-game" || action == "replaygame" || action == "simulate" || action == "sync-moxfield" || action == "syncmoxfield" || action == "sync-deck" || action == "syncdeck") && deck_id.is_none() {
+                    if (action == "deck" || action == "mamo" || action == "download-deck" || action == "playtest" || action == "playtest-scenario" || action == "launch-forge" || action == "launchforge" || action == "replay-game" || action == "replaygame" || action == "verify-replay-game" || action == "verifyreplaygame" || action == "simulate" || action == "sync-moxfield" || action == "syncmoxfield" || action == "sync-deck" || action == "syncdeck") && deck_id.is_none() {
                         deck_id = Some(path_parts[0].to_string());
                     } else if action == "user" && username.is_none() {
                         username = Some(path_parts[0].to_string());

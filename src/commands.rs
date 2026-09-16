@@ -1,11 +1,11 @@
 use log::{error, info, warn};
 use std::sync::{Arc, Mutex};
 use crate::deeplink::Deeplink;
-use crate::deck::{create_deck_from_id, create_deck_from_moxfield, create_deck_from_mamo, create_deck_from_mamo_with_progress, create_deck_and_scenario_for_forge, DeckCreationResult, DeckSyncResult, SyncStatus, sync_moxfield_deck_with_mamo_id, parse_moxfield_url, UserDecksImportResult, import_user_decks, list_moxfield_user_decks, MoxfieldDeckEntry, ProgressCallback};
+use crate::deck::{create_deck_from_id, create_deck_from_moxfield, create_deck_from_mamo, create_deck_from_mamo_with_progress, create_deck_and_scenario_for_forge, get_deck_directory, DeckCreationResult, DeckSyncResult, SyncStatus, sync_moxfield_deck_with_mamo_id, parse_moxfield_url, UserDecksImportResult, import_user_decks, list_moxfield_user_decks, MoxfieldDeckEntry, ProgressCallback};
 use crate::forge::{launch_forge_from_settings, launch_forge_replay, ForgeLaunchResult};
 use crate::gamelog::{download_replay_content, save_replay_to_forge_dir, ScenarioSyncResult, sync_forge_scenario_file, sync_all_scenario_files};
 use crate::settings::Settings;
-use crate::simulation::{run_simulation_for_deck, post_simulation_report, SimulationResult};
+use crate::simulation::{run_simulation_for_deck, run_replay_verification, post_simulation_report, SimulationResult, ReplayVerificationResult};
 
 /// Type alias for a shared log collector
 pub type SharedLogCollector = Arc<Mutex<Vec<String>>>;
@@ -27,6 +27,7 @@ pub enum CommandResult {
     DeckSynced(DeckSyncResult),
     ForgeLaunched(ForgeLaunchResult),
     ReplayGameLaunched(ForgeLaunchResult),
+    ReplayVerified(ReplayVerificationResult),
     UserDecksImported(UserDecksImportResult),
     UserDecksList(Vec<MoxfieldDeckEntry>),
     AuthTokenSaved(String),  // Success message
@@ -48,6 +49,7 @@ impl CommandResult {
             CommandResult::DeckSynced(result) => result.message.clone(),
             CommandResult::ForgeLaunched(result) => result.message.clone(),
             CommandResult::ReplayGameLaunched(result) => result.message.clone(),
+            CommandResult::ReplayVerified(result) => result.message.clone(),
             CommandResult::UserDecksImported(result) => result.message.clone(),
             CommandResult::UserDecksList(decks) => format!("Found {} decks", decks.len()),
             CommandResult::AuthTokenSaved(msg) => msg.clone(),
@@ -68,6 +70,7 @@ impl CommandResult {
             CommandResult::DeckSynced(result) => result.status != SyncStatus::Failed,
             CommandResult::ForgeLaunched(result) => result.success,
             CommandResult::ReplayGameLaunched(result) => result.success,
+            CommandResult::ReplayVerified(result) => result.success,
             CommandResult::UserDecksImported(result) => result.success,
             CommandResult::UserDecksList(decks) => !decks.is_empty(),
             CommandResult::AuthTokenSaved(_) => true,
@@ -133,6 +136,7 @@ pub async fn handle_command_with_logger(deeplink: &Deeplink, log_collector: Opti
         "sync-scenarios" | "syncscenarios" | "sync-scenario" | "syncscenario" => handle_sync_scenarios(deeplink, log_collector).await, // Sync Forge scenario(s) back to MaMo
         "launch-forge" | "launchforge" | "playtest" => handle_launch_forge_with_logger(deeplink, log_collector).await, // Launch Forge with deck
         "replay-game" | "replaygame" => handle_replay_game_with_logger(deeplink, log_collector).await, // Replay a game in Forge
+        "verify-replay-game" | "verifyreplaygame" => handle_verify_replay_game_with_logger(deeplink, log_collector).await, // Headless: verify a replay reconstructs & plays without the GUI
         "import-user-decks" | "importuserdecks" => handle_import_user_decks(deeplink).await,
         "list-user-decks" | "listuserdecks" => handle_list_user_decks(deeplink).await,
         "auth" | "authenticate" | "connect" => handle_auth(deeplink).await, // Auth token: mamoConnector://auth?token=xxx
@@ -818,6 +822,152 @@ async fn handle_replay_game_with_logger(deeplink: &Deeplink, log_collector: Opti
         Err(e) => {
             log(&format!("Failed to launch Forge: {}", e));
             CommandResult::Error(format!("Replay file saved but Forge launch failed: {}", e))
+        }
+    }
+}
+
+/// Handle mamoConnector://verify-replay-game/GAMELOG_UUID — download the same replay content
+/// `replay-game` uses, then play it to completion headlessly via Forge's `sim -r` mode instead
+/// of launching the interactive GUI. Exists because the GUI path can never be verified in an
+/// automated run: it always opens a window, and can block indefinitely on operator-only dialogs
+/// ("Already Replayed", AI-deck-compatibility warnings) that `sim` mode never shows. See
+/// `SIMULATION_EXPERIMENT_SPEC.md` — this doubles as groundwork for that spec's Phase 2/3
+/// headless A/B simulation engine, which needs the same "resolve decks, run `sim`, parse the
+/// Game Result line" machinery.
+async fn handle_verify_replay_game_with_logger(deeplink: &Deeplink, log_collector: Option<SharedLogCollector>) -> CommandResult {
+    let log = |msg: &str| {
+        info!("{}", msg);
+        if let Some(ref collector) = log_collector {
+            if let Ok(mut logs) = collector.lock() {
+                logs.push(msg.to_string());
+            }
+        }
+    };
+
+    let gamelog_id = deeplink.deck_id.clone()
+        .or_else(|| get_parameter(&deeplink.params, "id"))
+        .or_else(|| get_parameter(&deeplink.params, "gamelog_id"))
+        .or_else(|| get_parameter(&deeplink.params, "gamelogId"));
+
+    let gamelog_id = match gamelog_id {
+        Some(id) if !id.is_empty() => id,
+        _ => {
+            error!("No gamelog ID provided in verify-replay-game command");
+            return CommandResult::MissingParameters(
+                "Verification failed: gamelog ID is required. Use mamoConnector://verify-replay-game/GAMELOG_UUID".to_string()
+            );
+        }
+    };
+
+    let timeout_secs: u32 = get_parameter(&deeplink.params, "timeout")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(180);
+
+    log(&format!("Verify-replay command — gamelog ID: {}", gamelog_id));
+
+    let settings = match Settings::load() {
+        Ok(s) => s,
+        Err(e) => {
+            let msg = format!("Verification failed: could not load settings: {}", e);
+            log(&msg);
+            return CommandResult::Error(msg);
+        }
+    };
+
+    let auth_token = match settings.auth_token.as_ref().or(settings.gamelog_config.auth_token.as_ref()) {
+        Some(t) if !t.is_empty() => t.clone(),
+        _ => {
+            let msg = "Verification failed: not authenticated. Please connect the Connector to MaMo first (use the auth deeplink).".to_string();
+            log(&msg);
+            return CommandResult::Error(msg);
+        }
+    };
+
+    let api_url = &settings.gamelog_config.api_url;
+    log(&format!("Downloading replay from backend: {}", api_url));
+
+    let (content, filename) = match download_replay_content(api_url, &gamelog_id, &auth_token).await {
+        Ok(result) => result,
+        Err(e) => {
+            let msg = format!("Verification failed: could not download replay: {}", e);
+            log(&msg);
+            return CommandResult::Error(msg);
+        }
+    };
+
+    log(&format!("Downloaded replay: {} ({} bytes)", filename, content.len()));
+
+    // Both seats' deck names come from the replay JSON itself (meta.players.P1/P2.deck_name),
+    // not from MaMo's *current* deck state — the replay must be played with the decks it was
+    // actually recorded with, which may differ from how either deck looks today.
+    let parsed: serde_json::Value = match serde_json::from_str(&content) {
+        Ok(v) => v,
+        Err(e) => {
+            let msg = format!("Verification failed: replay content is not valid JSON: {}", e);
+            log(&msg);
+            return CommandResult::Error(msg);
+        }
+    };
+
+    let deck_name = |seat: &str| -> Option<String> {
+        parsed.pointer(&format!("/meta/players/{}/deck_name", seat))
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+    };
+
+    let (deck1_name, deck2_name) = match (deck_name("P1"), deck_name("P2")) {
+        (Some(a), Some(b)) => (a, b),
+        _ => {
+            let msg = "Verification failed: replay JSON is missing meta.players.P1/P2.deck_name — cannot resolve decks to verify with.".to_string();
+            log(&msg);
+            return CommandResult::Error(msg);
+        }
+    };
+
+    let deck_dir = match get_deck_directory() {
+        Ok(d) => d,
+        Err(e) => {
+            let msg = format!("Verification failed: could not resolve Forge deck directory: {}", e);
+            log(&msg);
+            return CommandResult::Error(msg);
+        }
+    };
+
+    for name in [&deck1_name, &deck2_name] {
+        let path = deck_dir.join(format!("{}.dck", name));
+        if !path.exists() {
+            let msg = format!(
+                "Verification failed: deck '{}' not found locally at {} — headless verification \
+                 needs both decks already present as .dck files (this replay's decks aren't \
+                 auto-exported yet; run an interactive replay once first, or download the deck \
+                 separately).",
+                name, path.display()
+            );
+            log(&msg);
+            return CommandResult::Error(msg);
+        }
+    }
+
+    // Save replay to Forge's gamelogs directory — same location and format `replay-game` uses.
+    // `sim -r` never calls markAsReplayed(), so this doesn't pollute the "Already Replayed"
+    // state that the interactive GUI path checks.
+    let replay_path = match save_replay_to_forge_dir(&filename, &content) {
+        Ok(path) => path,
+        Err(e) => {
+            let msg = format!("Verification failed: could not save replay file: {}", e);
+            log(&msg);
+            return CommandResult::Error(msg);
+        }
+    };
+
+    log(&format!("Running headless verification: '{}' vs '{}'…", deck1_name, deck2_name));
+
+    match run_replay_verification(&deck1_name, &deck2_name, &replay_path, timeout_secs, &log).await {
+        Ok(result) => CommandResult::ReplayVerified(result),
+        Err(e) => {
+            let msg = format!("Verification failed: headless run could not start: {}", e);
+            log(&msg);
+            CommandResult::Error(msg)
         }
     }
 }

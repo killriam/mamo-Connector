@@ -1368,6 +1368,13 @@ impl LauncherApp {
                         activity_log.log_error(&sim_result.message);
                     }
                 }
+                CommandResult::ReplayVerified(verify_result) => {
+                    if verify_result.success {
+                        activity_log.log_success(&verify_result.message);
+                    } else {
+                        activity_log.log_error(&verify_result.message);
+                    }
+                }
                 CommandResult::ScenarioSynced(results) => {
                     activity_log.log_success(format!("Synchronized {} scenario(s) to MaMo", results.len()));
                 }
@@ -2276,6 +2283,13 @@ impl LauncherApp {
                             log.log_success(&sim_result.message);
                         } else {
                             log.log_error(&sim_result.message);
+                        }
+                    }
+                    commands::CommandResult::ReplayVerified(verify_result) => {
+                        if verify_result.success {
+                            log.log_success(&verify_result.message);
+                        } else {
+                            log.log_error(&verify_result.message);
                         }
                     }
                     commands::CommandResult::ScenarioSynced(results) => {
@@ -7045,7 +7059,7 @@ mod deck_picker_tests {
         for action in ["playtest", "launch-forge", "launchforge", "playtest-scenario", "replay-game", "replaygame"] {
             assert!(deeplink_starts_play_session(action), "{action} should start a play session");
         }
-        for action in ["auth", "import-user-decks", "list-user-decks", "simulate", "simulate-ai", "unknown"] {
+        for action in ["auth", "import-user-decks", "list-user-decks", "simulate", "simulate-ai", "verify-replay-game", "verifyreplaygame", "unknown"] {
             assert!(!deeplink_starts_play_session(action), "{action} should not start a play session");
         }
     }
