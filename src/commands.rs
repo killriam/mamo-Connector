@@ -1326,7 +1326,8 @@ fn encode_deck_input(input: &serde_json::Value) -> anyhow::Result<(Vec<u8>, Vec<
     // Standard curve, indexed by exact mana value 0-6 plus a 7+ catch-all — mirrors
     // MaMoFrontend's MulliganCardValues / mamo-sim's MulliganConfig::mv_values.
     const MV_KEYS: [&str; 8] = ["mv0", "mv1", "mv2", "mv3", "mv4", "mv5", "mv6", "mv7Plus"];
-    const MV_DEFAULTS: [f64; 8] = [0.85, 0.8, 0.75, 0.6, 0.45, 0.4, 0.35, 0.3];
+    // mv4+ capped at 0.2: mana value 4+ is worth meaningfully less to see in an opening hand.
+    const MV_DEFAULTS: [f64; 8] = [0.85, 0.8, 0.75, 0.6, 0.2, 0.2, 0.2, 0.2];
     let mv_values: [f32; 8] = std::array::from_fn(|i| {
         card_values[MV_KEYS[i]].as_f64().unwrap_or(MV_DEFAULTS[i]) as f32
     });
@@ -1365,12 +1366,16 @@ fn encode_deck_input(input: &serde_json::Value) -> anyhow::Result<(Vec<u8>, Vec<
         let is_artifact = card["type_line"].as_str().map(|t| t.contains("Artifact")).unwrap_or(false);
         let is_mana = card["is_manaproducing"].as_bool().unwrap_or(false) || is_land;
         let is_cmd = is_commander[i];
+        // Mulligan-scoring only (see MulliganConfig::score in mamo-sim) — never affects `cmc`
+        // below, which stays the real mana value used for everything else.
+        let is_x_cost = card["mana_cost"].as_str().map(|s| s.contains('X')).unwrap_or(false);
 
         let flags: u8 = (is_land as u8)
             | ((is_creature as u8) << 1)
             | ((is_artifact as u8) << 2)
             | ((is_mana as u8) << 3)
-            | ((is_cmd as u8) << 4);
+            | ((is_cmd as u8) << 4)
+            | ((is_x_cost as u8) << 5);
 
         let cmc = card["cmc"].as_f64().unwrap_or(0.0) as u8;
         let power = parse_pt(card["power"].as_str().unwrap_or("0"));
@@ -1922,6 +1927,40 @@ mod tests {
     }
 
     #[test]
+    fn test_encode_deck_input_sets_x_cost_flag_bit() {
+        let input = serde_json::json!({
+            "mainCards": [
+                {
+                    "oracle_id": "fireball",
+                    "amount_in_deck": 1,
+                    "type_line": "Sorcery",
+                    "cmc": 1.0,
+                    "mana_cost": "{X}{R}",
+                },
+                {
+                    "oracle_id": "shock",
+                    "amount_in_deck": 1,
+                    "type_line": "Instant",
+                    "cmc": 1.0,
+                    "mana_cost": "{R}",
+                },
+            ],
+            "commanders": [],
+            "mechanicGroups": [],
+        });
+
+        let (buf, _mech_keys) = encode_deck_input(&input).expect("encode should succeed");
+
+        // No mulliganConfig -> default header (8 + 40, no thresholds), cards start right after.
+        let card_base = 8 + 40;
+        let x_cost_flags = buf[card_base];
+        let plain_flags = buf[card_base + 16];
+
+        assert_ne!(x_cost_flags & 0x20, 0, "Fireball ({{X}}{{R}}) should set the X-cost bit");
+        assert_eq!(plain_flags & 0x20, 0, "Shock ({{R}}) should not set the X-cost bit");
+    }
+
+    #[test]
     fn test_encode_deck_input_writes_custom_mulligan_header() {
         let input = minimal_deck_input(Some(serde_json::json!({
             "card_values": {
@@ -1978,10 +2017,10 @@ mod tests {
         assert_eq!(f(16), 0.8); // mv1 default
         assert_eq!(f(20), 0.75); // mv2 default
         assert_eq!(f(24), 0.6); // mv3 default
-        assert_eq!(f(28), 0.45); // mv4 default
-        assert_eq!(f(32), 0.4); // mv5 default
-        assert_eq!(f(36), 0.35); // mv6 default
-        assert_eq!(f(40), 0.3); // mv7Plus default
+        assert_eq!(f(28), 0.2); // mv4 default (capped)
+        assert_eq!(f(32), 0.2); // mv5 default (capped)
+        assert_eq!(f(36), 0.2); // mv6 default (capped)
+        assert_eq!(f(40), 0.2); // mv7Plus default (capped)
         assert_eq!(buf[44], 0); // threshold_count
     }
 
