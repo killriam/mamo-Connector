@@ -1280,8 +1280,9 @@ async fn handle_simulate_ai(deeplink: &Deeplink, log_collector: Option<SharedLog
 }
 
 /// Encode backend deck-input JSON into the binary wire format expected by mamo-sim.
-/// Wire layout matches codec.ts exactly:
+/// Wire layout matches codec.ts and mamo-sim's codec.rs exactly:
 ///   [4 bytes card_count] [4 bytes mechanic_count]
+///   [mulligan header: land + mv curve + mana_base_min/_max + threshold_count/padding/thresholds]
 ///   [card_count × 16 bytes] [mechanic_count × 12 bytes]
 fn encode_deck_input(input: &serde_json::Value) -> anyhow::Result<(Vec<u8>, Vec<String>)> {
     let main_cards   = input["mainCards"].as_array().ok_or_else(|| anyhow::anyhow!("missing mainCards"))?;
@@ -1343,8 +1344,13 @@ fn encode_deck_input(input: &serde_json::Value) -> anyhow::Result<(Vec<u8>, Vec<
                 .collect()
         })
         .unwrap_or_default();
+    // Fixed Mana Base band — mirrors MaMoFrontend's MulliganConfig.mana_base_min/_max and
+    // mamo-sim's own field of the same name. This is the actual AI hand-draw criteria
+    // mamo-sim's run_game redraws against, not the legacy thresholds above.
+    let mana_base_min = mulligan["mana_base_min"].as_f64().unwrap_or(3.0) as f32;
+    let mana_base_max = mulligan["mana_base_max"].as_f64().unwrap_or(4.0) as f32;
 
-    let header_len = 8 + 40 + thresholds.len() * 5;
+    let header_len = 8 + 48 + thresholds.len() * 5;
     let mut buf = Vec::with_capacity(header_len + card_count as usize * 16 + mechanic_count as usize * 12);
     buf.extend_from_slice(&card_count.to_le_bytes());
     buf.extend_from_slice(&mechanic_count.to_le_bytes());
@@ -1352,6 +1358,8 @@ fn encode_deck_input(input: &serde_json::Value) -> anyhow::Result<(Vec<u8>, Vec<
     for v in &mv_values {
         buf.extend_from_slice(&v.to_le_bytes());
     }
+    buf.extend_from_slice(&mana_base_min.to_le_bytes());
+    buf.extend_from_slice(&mana_base_max.to_le_bytes());
     buf.push(thresholds.len().min(255) as u8);
     buf.extend_from_slice(&[0u8; 3]); // reserved padding
     for &(round, min_value) in &thresholds {
@@ -1369,13 +1377,22 @@ fn encode_deck_input(input: &serde_json::Value) -> anyhow::Result<(Vec<u8>, Vec<
         // Mulligan-scoring only (see MulliganConfig::score in mamo-sim) — never affects `cmc`
         // below, which stays the real mana value used for everything else.
         let is_x_cost = card["mana_cost"].as_str().map(|s| s.contains('X')).unwrap_or(false);
+        // Mana Base scoring only (see mana_base_value in mamo-sim). "Basic" is read straight off
+        // the existing type_line field; "enters tapped or conditional" needs the card's oracle
+        // text, which the backend's deck-input endpoint may not always include yet — absent
+        // text defaults to false (not tapped), same as any other missing-field fallback here.
+        let is_basic_land = is_land && card["type_line"].as_str().map(|t| t.contains("Basic")).unwrap_or(false);
+        let is_tapped_or_conditional = is_land
+            && card["oracle_text"].as_str().map(enters_tapped_or_conditional).unwrap_or(false);
 
         let flags: u8 = (is_land as u8)
             | ((is_creature as u8) << 1)
             | ((is_artifact as u8) << 2)
             | ((is_mana as u8) << 3)
             | ((is_cmd as u8) << 4)
-            | ((is_x_cost as u8) << 5);
+            | ((is_x_cost as u8) << 5)
+            | ((is_basic_land as u8) << 6)
+            | ((is_tapped_or_conditional as u8) << 7);
 
         let cmc = card["cmc"].as_f64().unwrap_or(0.0) as u8;
         let power = parse_pt(card["power"].as_str().unwrap_or("0"));
@@ -1455,6 +1472,23 @@ fn encode_deck_input(input: &serde_json::Value) -> anyhow::Result<(Vec<u8>, Vec<
 
 fn parse_pt(s: &str) -> u8 {
     s.parse::<f32>().map(|v| v as u8).unwrap_or(0)
+}
+
+/// Whether a land's rules text says it enters tapped, or enters tapped unless some condition is
+/// met — either way, not a guaranteed-clean untapped land. Mirrors MaMoFrontend's
+/// `entersTappedOrConditional` (`landStats.ts`), which ports the same two patterns already used
+/// by the Workshop's Mana Base search table
+/// (`new-backend/iac/TransformEnrichDB.bigquery.sql`'s `enters_tapped`/`enters_conditional`).
+fn enters_tapped_or_conditional(oracle_text: &str) -> bool {
+    let lower = oracle_text.to_lowercase();
+    let conditional = regex::Regex::new(r"enters tapped unless|unless you|you may pay.*\{")
+        .expect("valid regex");
+    if conditional.is_match(&lower) {
+        return true;
+    }
+    let tapped = regex::Regex::new(r"enters tapped|enters the battlefield tapped")
+        .expect("valid regex");
+    tapped.is_match(&lower)
 }
 
 fn color_mask_from_identity(identity: Option<&Vec<serde_json::Value>>) -> u8 {
@@ -1951,13 +1985,64 @@ mod tests {
 
         let (buf, _mech_keys) = encode_deck_input(&input).expect("encode should succeed");
 
-        // No mulliganConfig -> default header (8 + 40, no thresholds), cards start right after.
-        let card_base = 8 + 40;
+        // No mulliganConfig -> default header (8 + 48, no thresholds), cards start right after.
+        let card_base = 8 + 48;
         let x_cost_flags = buf[card_base];
         let plain_flags = buf[card_base + 16];
 
         assert_ne!(x_cost_flags & 0x20, 0, "Fireball ({{X}}{{R}}) should set the X-cost bit");
         assert_eq!(plain_flags & 0x20, 0, "Shock ({{R}}) should not set the X-cost bit");
+    }
+
+    #[test]
+    fn test_encode_deck_input_sets_basic_land_and_tapped_flag_bits() {
+        let input = serde_json::json!({
+            "mainCards": [
+                {
+                    "oracle_id": "forest",
+                    "amount_in_deck": 1,
+                    "type_line": "Basic Land — Forest",
+                    "cmc": 0.0,
+                },
+                {
+                    "oracle_id": "tapped-land",
+                    "amount_in_deck": 1,
+                    "type_line": "Land",
+                    "cmc": 0.0,
+                    "oracle_text": "This land enters tapped.",
+                },
+                {
+                    "oracle_id": "untapped-land",
+                    "amount_in_deck": 1,
+                    "type_line": "Land",
+                    "cmc": 0.0,
+                },
+            ],
+            "commanders": [],
+            "mechanicGroups": [],
+        });
+
+        let (buf, _mech_keys) = encode_deck_input(&input).expect("encode should succeed");
+
+        let card_base = 8 + 48;
+        let basic_flags = buf[card_base];
+        let tapped_flags = buf[card_base + 16];
+        let untapped_flags = buf[card_base + 32];
+
+        assert_ne!(basic_flags & 0x40, 0, "a basic land should set the isBasicLand bit");
+        assert_eq!(basic_flags & 0x80, 0, "a basic land should never set entersTappedOrConditional");
+
+        assert_eq!(tapped_flags & 0x40, 0, "a nonbasic land should not set isBasicLand");
+        assert_ne!(
+            tapped_flags & 0x80, 0,
+            "a land whose oracle text says it enters tapped should set entersTappedOrConditional"
+        );
+
+        assert_eq!(untapped_flags & 0x40, 0);
+        assert_eq!(
+            untapped_flags & 0x80, 0,
+            "a land with no oracle text should default to not tapped/conditional"
+        );
     }
 
     #[test]
@@ -1971,12 +2056,14 @@ mod tests {
                 { "round": 0, "min_value": 4.0 },
                 { "round": 1, "min_value": 3.5 },
             ],
+            "mana_base_min": 2.5,
+            "mana_base_max": 5.0,
         })));
 
         let (buf, _mech_keys) = encode_deck_input(&input).expect("encode should succeed");
 
         // 0 cards, 0 mechanics — header is the entire buffer.
-        assert_eq!(buf.len(), 8 + 40 + 2 * 5);
+        assert_eq!(buf.len(), 8 + 48 + 2 * 5);
 
         let card_count = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
         let mechanic_count = u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]);
@@ -1993,12 +2080,14 @@ mod tests {
         assert_eq!(f(32), 0.5); // mv5
         assert_eq!(f(36), 0.4); // mv6
         assert_eq!(f(40), 0.1); // mv7Plus
-        assert_eq!(buf[44], 2); // threshold_count
+        assert_eq!(f(44), 2.5); // mana_base_min
+        assert_eq!(f(48), 5.0); // mana_base_max
+        assert_eq!(buf[52], 2); // threshold_count
 
-        assert_eq!(buf[48], 0); // round 0
-        assert_eq!(f(49), 4.0);
-        assert_eq!(buf[53], 1); // round 1
-        assert_eq!(f(54), 3.5);
+        assert_eq!(buf[56], 0); // round 0
+        assert_eq!(f(57), 4.0);
+        assert_eq!(buf[61], 1); // round 1
+        assert_eq!(f(62), 3.5);
     }
 
     #[test]
@@ -2010,7 +2099,7 @@ mod tests {
 
         let (buf, _mech_keys) = encode_deck_input(&input).expect("encode should succeed");
 
-        assert_eq!(buf.len(), 8 + 40); // no thresholds
+        assert_eq!(buf.len(), 8 + 48); // no thresholds
         let f = |o: usize| f32::from_le_bytes([buf[o], buf[o + 1], buf[o + 2], buf[o + 3]]);
         assert_eq!(f(8), 1.0); // land default
         assert_eq!(f(12), 0.85); // mv0 default
@@ -2021,7 +2110,9 @@ mod tests {
         assert_eq!(f(32), 0.2); // mv5 default (capped)
         assert_eq!(f(36), 0.2); // mv6 default (capped)
         assert_eq!(f(40), 0.2); // mv7Plus default (capped)
-        assert_eq!(buf[44], 0); // threshold_count
+        assert_eq!(f(44), 3.0); // mana_base_min default
+        assert_eq!(f(48), 4.0); // mana_base_max default
+        assert_eq!(buf[52], 0); // threshold_count
     }
 
     #[test]
@@ -2034,6 +2125,8 @@ mod tests {
                 "mv4": 0.5, "mv5": 0.4, "mv6": 0.3, "mv7Plus": 0.2,
             },
             "thresholds": [{ "round": 0, "min_value": 5.0 }],
+            "mana_base_min": 2.0,
+            "mana_base_max": 6.0,
         })));
         let (buf, _mech_keys) = encode_deck_input(&input).expect("encode should succeed");
 
@@ -2041,5 +2134,7 @@ mod tests {
         assert_eq!(mulligan.land_value, 1.5);
         assert_eq!(mulligan.mv_values, [0.9, 0.8, 0.7, 0.6, 0.5, 0.4, 0.3, 0.2]);
         assert_eq!(mulligan.min_value_for_round(0), 5.0);
+        assert_eq!(mulligan.mana_base_min, 2.0);
+        assert_eq!(mulligan.mana_base_max, 6.0);
     }
 }
