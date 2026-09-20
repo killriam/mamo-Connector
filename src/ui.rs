@@ -36,14 +36,14 @@ mod colors {
     pub const NEUTRAL: Color32 = Color32::from_rgb(100, 100, 100);
 }
 
-/// Named `ui.add_space(...)` gaps, so the 13 distinct values already in use across this file are
+/// Named `ui.add_space(...)` gaps, so the distinct values in use across this file are
 /// discoverable and tunable from one place instead of scattered bare literals. These intentionally
-/// preserve every existing value rather than collapsing them onto a tighter scale: 3 of the 4 tabs
-/// (Get Decks, Setup, Settings) couldn't be visually verified in the environment this was written
-/// in — see the critique write-up — so changing actual pixel values here would be an unverified
-/// layout change, not a same-output rename. Collapsing SPACE_3→SPACE_4 and SPACE_15→SPACE_16 (the
-/// two closest near-duplicate pairs) is a reasonable next step once someone can eyeball all four
-/// tabs after the change.
+/// preserve every existing value rather than collapsing them onto a tighter scale: the Get Decks
+/// and Setup tabs couldn't be visually verified in the environment this was written in — see the
+/// critique write-up — so changing actual pixel values here would be an unverified layout change,
+/// not a same-output rename. Collapsing SPACE_3→SPACE_4 (the closest remaining near-duplicate
+/// pair; the Setup/Settings tab merge already retired the other, SPACE_15→SPACE_16) is a
+/// reasonable next step once someone can eyeball both tabs after the change.
 mod spacing {
     pub const SPACE_2: f32 = 2.0;
     pub const SPACE_3: f32 = 3.0;
@@ -54,7 +54,6 @@ mod spacing {
     pub const SPACE_10: f32 = 10.0;
     pub const SPACE_12: f32 = 12.0;
     pub const SPACE_14: f32 = 14.0;
-    pub const SPACE_15: f32 = 15.0;
     pub const SPACE_16: f32 = 16.0;
     pub const SPACE_20: f32 = 20.0;
     pub const SPACE_24: f32 = 24.0;
@@ -65,7 +64,6 @@ enum Tab {
     Play,
     Decks,
     Setup,
-    Settings,
 }
 
 /// Detected URL type for auto-detection
@@ -299,6 +297,10 @@ impl ScanSlot {
 enum WizardStep {
     #[default]
     Welcome,
+    /// Offers connecting the MaMo account before Forge setup. Skippable — the account can also
+    /// be connected later from the Setup tab, which shares this step's UI via
+    /// `render_mamo_account_section`.
+    ConnectAccount,
     DownloadForge,
     ConfigureForge,
     Done,
@@ -1256,6 +1258,17 @@ pub fn launch(
     Ok(())
 }
 
+/// A transient notification shown over whichever tab is active, for background deeplink
+/// completions the user might otherwise miss — the bottom Activity panel is always present, but
+/// a floating toast draws the eye regardless of which tab someone's looking at.
+struct Toast {
+    text: String,
+    is_error: bool,
+    shown_at: Instant,
+}
+
+const TOAST_DURATION: std::time::Duration = std::time::Duration::from_secs(4);
+
 struct LauncherApp {
     state: AppState,
     /// Shared handle into the app's single tokio runtime (owned by `#[tokio::main] async fn
@@ -1341,6 +1354,9 @@ struct LauncherApp {
     scan_slot: ScanSlot,
     /// Pending pre-launch Forge update check or prompt dialog (None = no dialog active)
     prelaunch_update_dialog: Option<PreLaunchUpdateDialog>,
+    /// Active toasts, newest last — see `Toast` doc comment. Written from the deeplink
+    /// background thread, so it's behind a mutex like `activity_log`.
+    toasts: Arc<Mutex<Vec<Toast>>>,
 }
 
 impl LauncherApp {
@@ -1600,6 +1616,7 @@ impl LauncherApp {
             play_session: Arc::new(Mutex::new(PlaySession::default())),
             scan_slot: ScanSlot::default(),
             prelaunch_update_dialog: None,
+            toasts: Arc::new(Mutex::new(Vec::new())),
         }
     }
 }
@@ -1636,6 +1653,8 @@ impl eframe::App for LauncherApp {
             self.forge_local_decks_refresh_requested.store(false, Ordering::Relaxed);
             self.forge_local_decks = list_forge_decks();
         }
+
+        self.render_toasts(ctx);
 
         // Poll wizard test-launch result from background thread
         let wizard_test_done = if let Some(ref chan) = self.wizard.pending_test_result {
@@ -2159,9 +2178,11 @@ impl eframe::App for LauncherApp {
                     ui.add_space(spacing::SPACE_2);
                 }
 
-                // Tab bar — 4 tabs, one per core journey: Play (start decks, launch Forge, watch
+                // Tab bar — 3 tabs, one per core journey: Play (start decks, launch Forge, watch
                 // an active session), Get Decks (pull someone else's list in), Setup (MaMo
-                // account + Forge + Connector updates), Settings (the rarer technical knobs).
+                // account + Forge + Connector updates + the rarer technical knobs, formerly
+                // split into a separate Settings tab whose own copy admitted the split wasn't
+                // obvious — see render_setup_tab).
                 ui.horizontal(|ui| {
                     if ui.selectable_label(self.current_tab == Tab::Play, "▶ Play").clicked() {
                         self.current_tab = Tab::Play;
@@ -2171,9 +2192,6 @@ impl eframe::App for LauncherApp {
                     }
                     if ui.selectable_label(self.current_tab == Tab::Setup, "🔧 Setup").clicked() {
                         self.current_tab = Tab::Setup;
-                    }
-                    if ui.selectable_label(self.current_tab == Tab::Settings, "⚙ Settings").clicked() {
-                        self.current_tab = Tab::Settings;
                     }
                 });
                 ui.separator();
@@ -2207,7 +2225,6 @@ impl eframe::App for LauncherApp {
                     Tab::Play => self.render_play_tab(ui, ctx),
                     Tab::Decks => self.render_decks_tab(ui, ctx),
                     Tab::Setup => self.render_setup_tab(ui, ctx),
-                    Tab::Settings => self.render_settings_tab(ui, ctx),
                 }
             });
     }
@@ -2263,6 +2280,13 @@ impl LauncherApp {
         if deeplink_starts_play_session(&deeplink.action) {
             *self.play_session.lock().unwrap() = PlaySession::Launching;
         }
+
+        // Snapshot which tab the user was on when this kicked off, so the background thread
+        // can decide on completion whether a toast is worth showing (the bottom Activity panel
+        // is always visible, but only Play shows the richer step-by-step timeline — from any
+        // other tab a background deeplink's result is otherwise easy to miss).
+        let originating_tab_was_play = self.current_tab == Tab::Play;
+        let toasts = Arc::clone(&self.toasts);
 
         // Handle the command in a background thread
         let settings = self.settings.clone();
@@ -2456,10 +2480,20 @@ impl LauncherApp {
                 decks_fetch_requested.store(true, Ordering::Relaxed);
             }
 
+            if !originating_tab_was_play {
+                if let Ok(mut toasts) = toasts.lock() {
+                    toasts.push(Toast {
+                        text: result.get_message(),
+                        is_error: !result.is_success(),
+                        shown_at: Instant::now(),
+                    });
+                }
+            }
+
             ctx_clone.request_repaint();
         });
     }
-    
+
     /// Check if secondary instances sent a command via pending_command.txt
     fn check_pending_commands(&mut self, ctx: &egui::Context) {
         let pending_path = crate::get_pending_command_path();
@@ -2474,6 +2508,56 @@ impl LauncherApp {
                 }
             }
         }
+    }
+
+    // ==================== Toasts ====================
+
+    /// Drops expired toasts and paints whatever's left, stacked bottom-right above every other
+    /// panel. See the `Toast` doc comment for why this exists alongside the always-visible
+    /// Activity panel.
+    fn render_toasts(&mut self, ctx: &egui::Context) {
+        let active: Vec<(usize, String, bool)> = {
+            let mut toasts = self.toasts.lock().unwrap();
+            toasts.retain(|t| t.shown_at.elapsed() < TOAST_DURATION);
+            toasts.iter().enumerate()
+                .map(|(i, t)| (i, t.text.clone(), t.is_error))
+                .collect()
+        };
+
+        if active.is_empty() {
+            return;
+        }
+
+        // Still-live toasts age out on their own next frame; keep repainting so that happens
+        // without waiting for unrelated input.
+        ctx.request_repaint_after(std::time::Duration::from_millis(200));
+
+        egui::Area::new(egui::Id::new("toast_area"))
+            .anchor(egui::Align2::RIGHT_BOTTOM, egui::vec2(-16.0, -40.0))
+            .order(egui::Order::Foreground)
+            .show(ctx, |ui| {
+                ui.vertical(|ui| {
+                    for (i, text, is_error) in &active {
+                        let (fill, stroke) = if *is_error {
+                            (egui::Color32::from_rgb(253, 232, 232), colors::ERROR)
+                        } else {
+                            (egui::Color32::from_rgb(220, 245, 225), colors::SUCCESS)
+                        };
+                        egui::Frame::default()
+                            .fill(fill)
+                            .stroke(egui::Stroke::new(1.0, stroke))
+                            .inner_margin(egui::Margin::symmetric(spacing::SPACE_10, spacing::SPACE_8))
+                            .rounding(spacing::SPACE_6)
+                            .show(ui, |ui| {
+                                ui.set_max_width(320.0);
+                                ui.label(egui::RichText::new(text).color(stroke));
+                            });
+                        if *i != active.len() - 1 {
+                            ui.add_space(spacing::SPACE_5);
+                        }
+                    }
+                });
+            });
     }
 
     // ==================== Activity Bottom Panel ====================
@@ -3595,6 +3679,33 @@ impl LauncherApp {
                     if ui.add(egui::Button::new(
                         egui::RichText::new("Get Started →").size(16.0)
                     ).min_size(egui::vec2(160.0, 36.0))).clicked() {
+                        self.wizard.step = WizardStep::ConnectAccount;
+                    }
+                }
+
+                // ── Step 1a: Connect MaMo account ────────────────────────────
+                WizardStep::ConnectAccount => {
+                    ui.set_max_width(420.0);
+                    ui.label(egui::RichText::new("🔗").size(40.0));
+                    ui.add_space(spacing::SPACE_8);
+                    ui.label(egui::RichText::new("Connect your MaMo account").size(20.0).strong());
+                    ui.add_space(spacing::SPACE_8);
+                    ui.label(
+                        egui::RichText::new(
+                            "So your game logs upload automatically and your MaMo decks show \
+                             up in Play. You can also do this later from the Setup tab."
+                        )
+                        .color(colors::NEUTRAL),
+                    );
+                    ui.add_space(spacing::SPACE_16);
+
+                    self.render_mamo_account_section(ui, ctx);
+
+                    ui.add_space(spacing::SPACE_16);
+                    let has_token = !self.settings_state.lock().unwrap().auth_token_input.is_empty();
+                    if ui.add(egui::Button::new(
+                        egui::RichText::new(if has_token { "Continue →" } else { "Continue without connecting →" }).size(15.0)
+                    ).min_size(egui::vec2(160.0, 32.0))).clicked() {
                         self.wizard.step = WizardStep::DownloadForge;
                         // Combine setup into one flow: start fetching MaMo Forge immediately
                         // instead of waiting for a second, separate button click — unless it's
@@ -3891,17 +4002,30 @@ impl LauncherApp {
 
                 // ── Step 3: Done ─────────────────────────────────────────────
                 WizardStep::Done => {
+                    let has_token = !self.settings_state.lock().unwrap().auth_token_input.is_empty();
                     ui.label(egui::RichText::new("✅").size(48.0));
                     ui.add_space(spacing::SPACE_8);
-                    ui.label(egui::RichText::new("You're all set!").size(22.0).strong());
+                    ui.label(egui::RichText::new(if has_token { "You're all set!" } else { "Forge is ready!" }).size(22.0).strong());
                     ui.add_space(spacing::SPACE_12);
-                    ui.label(
-                        egui::RichText::new(
-                            "Forge is configured. Click any playtest button in MaMo\n\
-                             to launch Forge with your deck loaded."
-                        )
-                        .color(colors::NEUTRAL),
-                    );
+                    if has_token {
+                        ui.label(
+                            egui::RichText::new(
+                                "Forge is configured. Click any playtest button in MaMo\n\
+                                 to launch Forge with your deck loaded."
+                            )
+                            .color(colors::NEUTRAL),
+                        );
+                    } else {
+                        ui.label(
+                            egui::RichText::new(
+                                "Click any playtest button in MaMo to launch Forge with your\n\
+                                 deck loaded. You're not connected to your MaMo account yet, so\n\
+                                 game log uploads and the account deck picker won't work until\n\
+                                 you connect from the Setup tab."
+                            )
+                            .color(colors::WARNING),
+                        );
+                    }
                     ui.add_space(spacing::SPACE_24);
                     if ui.add(egui::Button::new(
                         egui::RichText::new("Close").size(15.0)
@@ -4366,7 +4490,7 @@ impl LauncherApp {
                     ui.horizontal(|ui| {
                         ui.label(egui::RichText::new("⚠ Game log folder not configured").color(colors::WARNING));
                         if ui.small_button("Configure →").clicked() {
-                            self.current_tab = Tab::Settings;
+                            self.current_tab = Tab::Setup;
                         }
                     });
                     ui.label(egui::RichText::new("Uploads (and the Activity below) can't work until this is set.").small().color(egui::Color32::GRAY));
@@ -6294,71 +6418,81 @@ impl LauncherApp {
     // Connector itself up to date. Everything here is account/install management — the rarer,
     // "set it up once and mostly forget it" side of things, as opposed to Play's day-to-day use.
 
-    fn render_setup_tab(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
-        egui::ScrollArea::vertical().show(ui, |ui| {
-            let (forge_path_input, forge_path_valid, has_token, status_message) = {
-                let s = self.settings_state.lock().unwrap();
-                (s.forge_path_input.clone(), s.forge_path_valid, !s.auth_token_input.is_empty(), s.status_message.clone())
-            };
+    /// The "MaMo account" connect/disconnect/token-paste block — shared by the Setup tab and
+    /// the first-run wizard's `ConnectAccount` step, so there's one implementation instead of
+    /// the two the Setup tab used to be the only home for (the wizard never asked for account
+    /// connection at all before).
+    fn render_mamo_account_section(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        let has_token = !self.settings_state.lock().unwrap().auth_token_input.is_empty();
 
-            // ── MaMo account ──────────────────────────────────────────────
-            ui.group(|ui| {
-                ui.horizontal(|ui| {
-                    ui.label(egui::RichText::new("MaMo account").strong());
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if has_token {
-                            render_status_pill(ui, "Connected", PillStatus::Success);
-                        } else {
-                            render_status_pill(ui, "Not connected", PillStatus::Error);
-                        }
-                    });
-                });
-                ui.add_space(spacing::SPACE_6);
-
-                if has_token {
-                    ui.label("Game logs upload automatically, and your MaMo decks show up in Play.");
-                    ui.label(egui::RichText::new("Seeing an auth error? Your token may have been revoked — reconnect below.").small().weak());
-                    ui.add_space(spacing::SPACE_5);
-                    if ui.button("Disconnect").clicked() {
-                        {
-                            let mut state = self.settings_state.lock().unwrap();
-                            state.auth_token_input.clear();
-                        }
-                        self.save_auth_token();
-                    }
-                    ui.add_space(spacing::SPACE_8);
-                } else {
-                    ui.label("On the MaMo website, click the profile icon (top-right), then \"Connect Connector\".");
-                }
-
-                if ui.button(if has_token { "🌐 Reconnect via MaMo Website" } else { "🌐 Open MaMo Website" })
-                    .on_hover_text("Opens MaMo in your browser to retrieve a fresh API token")
-                    .clicked()
-                {
-                    ctx.output_mut(|o| o.open_url = Some(egui::OpenUrl::new_tab(MAMO_WEBSITE_URL)));
-                }
-                ui.add_space(spacing::SPACE_8);
-                ui.label(egui::RichText::new("Or paste a token directly:").small().weak());
-                ui.horizontal(|ui| {
-                    let mut token_input = {
-                        let state = self.settings_state.lock().unwrap();
-                        state.auth_token_input.clone()
-                    };
-                    let response = ui.add(
-                        egui::TextEdit::singleline(&mut token_input)
-                            .desired_width(320.0)
-                            .password(true)
-                            .hint_text("Paste token here"),
-                    );
-                    if response.changed() {
-                        let mut state = self.settings_state.lock().unwrap();
-                        state.auth_token_input = token_input;
-                    }
-                    if ui.button("Save").clicked() {
-                        self.save_auth_token();
+        ui.group(|ui| {
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new("MaMo account").strong());
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if has_token {
+                        render_status_pill(ui, "Connected", PillStatus::Success);
+                    } else {
+                        render_status_pill(ui, "Not connected", PillStatus::Error);
                     }
                 });
             });
+            ui.add_space(spacing::SPACE_6);
+
+            if has_token {
+                ui.label("Game logs upload automatically, and your MaMo decks show up in Play.");
+                ui.label(egui::RichText::new("Seeing an auth error? Your token may have been revoked — reconnect below.").small().weak());
+                ui.add_space(spacing::SPACE_5);
+                if ui.button("Disconnect").clicked() {
+                    {
+                        let mut state = self.settings_state.lock().unwrap();
+                        state.auth_token_input.clear();
+                    }
+                    self.save_auth_token();
+                }
+                ui.add_space(spacing::SPACE_8);
+            } else {
+                ui.label("On the MaMo website, click the profile icon (top-right), then \"Connect Connector\".");
+            }
+
+            if ui.button(if has_token { "🌐 Reconnect via MaMo Website" } else { "🌐 Open MaMo Website" })
+                .on_hover_text("Opens MaMo in your browser to retrieve a fresh API token")
+                .clicked()
+            {
+                ctx.output_mut(|o| o.open_url = Some(egui::OpenUrl::new_tab(MAMO_WEBSITE_URL)));
+            }
+            ui.add_space(spacing::SPACE_8);
+            ui.label(egui::RichText::new("Or paste a token directly:").small().weak());
+            ui.horizontal(|ui| {
+                let mut token_input = {
+                    let state = self.settings_state.lock().unwrap();
+                    state.auth_token_input.clone()
+                };
+                let response = ui.add(
+                    egui::TextEdit::singleline(&mut token_input)
+                        .desired_width(320.0)
+                        .password(true)
+                        .hint_text("Paste token here"),
+                );
+                if response.changed() {
+                    let mut state = self.settings_state.lock().unwrap();
+                    state.auth_token_input = token_input;
+                }
+                if ui.button("Save").clicked() {
+                    self.save_auth_token();
+                }
+            });
+        });
+    }
+
+    fn render_setup_tab(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        egui::ScrollArea::vertical().show(ui, |ui| {
+            let (forge_path_input, forge_path_valid, status_message) = {
+                let s = self.settings_state.lock().unwrap();
+                (s.forge_path_input.clone(), s.forge_path_valid, s.status_message.clone())
+            };
+
+            // ── MaMo account ──────────────────────────────────────────────
+            self.render_mamo_account_section(ui, ctx);
 
             ui.add_space(spacing::SPACE_12);
 
@@ -6547,6 +6681,103 @@ impl LauncherApp {
 
             ui.add_space(spacing::SPACE_12);
 
+            // ── Game log folder (formerly the Settings tab) ─────────────────
+            {
+                let (directory_input, directory_valid, file_count) = {
+                    let state = self.gamelog_state.lock().unwrap();
+                    (state.directory_input.clone(), state.directory_valid, state.file_count)
+                };
+
+                ui.group(|ui| {
+                    ui.label(egui::RichText::new("📁 Game log folder").strong());
+                    ui.label(egui::RichText::new("Where Forge writes game logs — Connector watches this while Forge is running.").small().weak());
+                    ui.add_space(spacing::SPACE_5);
+
+                    ui.horizontal(|ui| {
+                        ui.label("Watch Directory:");
+                        let response = ui.add(
+                            egui::TextEdit::singleline(&mut self.gamelog_state.lock().unwrap().directory_input)
+                                .desired_width(400.0)
+                                .hint_text("Path to Forge game logs directory")
+                        );
+
+                        if response.changed() {
+                            let new_path = self.gamelog_state.lock().unwrap().directory_input.clone();
+                            let valid = validate_directory(&new_path).unwrap_or(false);
+                            let mut state = self.gamelog_state.lock().unwrap();
+                            state.directory_valid = valid;
+                            state.file_count = None;
+                        }
+
+                        if ui.button("Browse...").clicked() {
+                            if let Some(folder) = rfd::FileDialog::new()
+                                .set_title("Select Forge Game Log Directory")
+                                .pick_folder()
+                            {
+                                let folder_str = folder.to_string_lossy().to_string();
+                                let valid = validate_directory(&folder_str).unwrap_or(false);
+                                let mut state = self.gamelog_state.lock().unwrap();
+                                state.directory_input = folder_str;
+                                state.directory_valid = valid;
+                                state.file_count = None;
+                            }
+                        }
+                    });
+
+                    ui.horizontal(|ui| {
+                        if ui.button("Use Default").clicked() {
+                            let default_dir = get_default_forge_log_directory();
+                            let valid = validate_directory(&default_dir).unwrap_or(false);
+                            let mut state = self.gamelog_state.lock().unwrap();
+                            state.directory_input = default_dir;
+                            state.directory_valid = valid;
+                            state.file_count = None;
+                        }
+
+                        if ui.button("Save").clicked() {
+                            self.save_gamelog_directory();
+                        }
+
+                        if directory_valid {
+                            ui.label(egui::RichText::new("✓ Valid").color(colors::SUCCESS));
+                            if let Some(count) = file_count {
+                                ui.label(format!("({} log files)", count));
+                            }
+                        } else if !directory_input.is_empty() {
+                            ui.label(egui::RichText::new("✗ Invalid or inaccessible").color(colors::ERROR));
+                        }
+                    });
+
+                    ui.add_space(spacing::SPACE_5);
+
+                    // Processed files info
+                    let processed_count = {
+                        let state = self.gamelog_state.lock().unwrap();
+                        state.processed_files.len()
+                    };
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new(format!("Total files processed: {}", processed_count)).small().weak());
+                        if ui.small_button("Clear History").clicked() {
+                            self.clear_processed_history();
+                        }
+                    });
+                });
+            }
+
+            ui.add_space(spacing::SPACE_12);
+
+            // Deck Mapping (formerly the Settings tab)
+            self.render_deck_mapping_section(ui, ctx);
+
+            ui.add_space(spacing::SPACE_12);
+            ui.label(
+                egui::RichText::new("Full list of mamoConnector:// links the website can open: see the project docs.")
+                    .small()
+                    .weak(),
+            );
+
+            ui.add_space(spacing::SPACE_12);
+
             // ── MaMo Connector itself ────────────────────────────────────
             ui.group(|ui| {
                 let (update_ver, staged_path, is_downloading, is_busy, dismissed, update_err) = {
@@ -6665,6 +6896,54 @@ impl LauncherApp {
                     }
                     ui.label(egui::RichText::new("Remove MaMo Connector from this machine").weak().small());
                 });
+
+                ui.add_space(spacing::SPACE_8);
+                let forge_scripts_path_input = self.settings_state.lock().unwrap().forge_scripts_path_input.clone();
+                ui.group(|ui| {
+                    ui.label(egui::RichText::new("Simulation scripts").strong());
+                    ui.label(egui::RichText::new("Optional — only needed for local AI simulation. Path to the folder containing run_commander_simulation.ps1 and analyze_commander_stats.py.").small().weak());
+                    ui.add_space(spacing::SPACE_8);
+
+                    ui.horizontal(|ui| {
+                        ui.label("Scripts folder:");
+                        let mut scripts_input = forge_scripts_path_input.clone();
+                        let response = ui.add(
+                            egui::TextEdit::singleline(&mut scripts_input)
+                                .desired_width(360.0)
+                                .hint_text("Path to folder with .ps1 and .py scripts"),
+                        );
+                        if response.changed() {
+                            let mut state = self.settings_state.lock().unwrap();
+                            state.forge_scripts_path_input = scripts_input.clone();
+                        }
+
+                        let scripts_valid = !forge_scripts_path_input.is_empty()
+                            && std::path::Path::new(&forge_scripts_path_input)
+                                .join("run_commander_simulation.ps1")
+                                .exists();
+                        if !forge_scripts_path_input.is_empty() {
+                            if scripts_valid {
+                                ui.label(egui::RichText::new("✓").color(colors::SUCCESS));
+                            } else {
+                                ui.label(egui::RichText::new("✗ ps1 not found").color(colors::ERROR));
+                            }
+                        }
+                    });
+
+                    ui.add_space(spacing::SPACE_5);
+                    ui.horizontal(|ui| {
+                        if ui.button("📂 Browse…").clicked() {
+                            if let Some(folder) = rfd::FileDialog::new().pick_folder() {
+                                let path_str = folder.to_string_lossy().to_string();
+                                let mut state = self.settings_state.lock().unwrap();
+                                state.forge_scripts_path_input = path_str;
+                            }
+                        }
+                        if ui.button("💾 Save").clicked() {
+                            self.save_forge_scripts_path();
+                        }
+                    });
+                });
             });
 
             if let Some(msg) = status_message {
@@ -6681,181 +6960,6 @@ impl LauncherApp {
         });
     }
 
-    // ==================== Settings Tab ====================
-
-    fn render_settings_tab(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
-        egui::ScrollArea::vertical().show(ui, |ui| {
-        ui.label(egui::RichText::new("⚙ Settings").strong());
-        ui.label(egui::RichText::new("MaMo account and Forge configuration moved to the Setup tab — this is everything else.").small().weak());
-        ui.add_space(spacing::SPACE_10);
-
-        // Get current state
-        let (forge_scripts_path_input, status_message) = {
-            let state = self.settings_state.lock().unwrap();
-            (state.forge_scripts_path_input.clone(), state.status_message.clone())
-        };
-
-        // Game Logs directory section (moved from GameLogs tab)
-        {
-            let (directory_input, directory_valid, file_count) = {
-                let state = self.gamelog_state.lock().unwrap();
-                (state.directory_input.clone(), state.directory_valid, state.file_count)
-            };
-
-            ui.group(|ui| {
-                ui.label(egui::RichText::new("📁 Game log folder").strong());
-                ui.label(egui::RichText::new("Where Forge writes game logs — Connector watches this while Forge is running.").small().weak());
-                ui.add_space(spacing::SPACE_5);
-
-                ui.horizontal(|ui| {
-                    ui.label("Watch Directory:");
-                    let response = ui.add(
-                        egui::TextEdit::singleline(&mut self.gamelog_state.lock().unwrap().directory_input)
-                            .desired_width(400.0)
-                            .hint_text("Path to Forge game logs directory")
-                    );
-
-                    if response.changed() {
-                        let new_path = self.gamelog_state.lock().unwrap().directory_input.clone();
-                        let valid = validate_directory(&new_path).unwrap_or(false);
-                        let mut state = self.gamelog_state.lock().unwrap();
-                        state.directory_valid = valid;
-                        state.file_count = None;
-                    }
-
-                    if ui.button("Browse...").clicked() {
-                        if let Some(folder) = rfd::FileDialog::new()
-                            .set_title("Select Forge Game Log Directory")
-                            .pick_folder()
-                        {
-                            let folder_str = folder.to_string_lossy().to_string();
-                            let valid = validate_directory(&folder_str).unwrap_or(false);
-                            let mut state = self.gamelog_state.lock().unwrap();
-                            state.directory_input = folder_str;
-                            state.directory_valid = valid;
-                            state.file_count = None;
-                        }
-                    }
-                });
-
-                ui.horizontal(|ui| {
-                    if ui.button("Use Default").clicked() {
-                        let default_dir = get_default_forge_log_directory();
-                        let valid = validate_directory(&default_dir).unwrap_or(false);
-                        let mut state = self.gamelog_state.lock().unwrap();
-                        state.directory_input = default_dir;
-                        state.directory_valid = valid;
-                        state.file_count = None;
-                    }
-
-                    if ui.button("Save").clicked() {
-                        self.save_gamelog_directory();
-                    }
-
-                    if directory_valid {
-                        ui.label(egui::RichText::new("✓ Valid").color(colors::SUCCESS));
-                        if let Some(count) = file_count {
-                            ui.label(format!("({} log files)", count));
-                        }
-                    } else if !directory_input.is_empty() {
-                        ui.label(egui::RichText::new("✗ Invalid or inaccessible").color(colors::ERROR));
-                    }
-                });
-
-                ui.add_space(spacing::SPACE_5);
-
-                // Processed files info
-                let processed_count = {
-                    let state = self.gamelog_state.lock().unwrap();
-                    state.processed_files.len()
-                };
-                ui.horizontal(|ui| {
-                    ui.label(egui::RichText::new(format!("Total files processed: {}", processed_count)).small().weak());
-                    if ui.small_button("Clear History").clicked() {
-                        self.clear_processed_history();
-                    }
-                });
-            });
-        }
-
-        ui.add_space(spacing::SPACE_15);
-
-        // Deck Mapping section (moved from GameLogs tab)
-        self.render_deck_mapping_section(ui, ctx);
-
-        ui.add_space(spacing::SPACE_15);
-        ui.label(
-            egui::RichText::new("Full list of mamoConnector:// links the website can open: see the project docs.")
-                .small()
-                .weak(),
-        );
-
-        // Status message
-        if let Some(msg) = status_message {
-            ui.add_space(spacing::SPACE_10);
-            let color = if msg.contains("failed") || msg.contains("Could not") || msg.contains("Error") {
-                colors::ERROR
-            } else if msg.contains("Found") || msg.contains("Saved") || msg.contains("success") {
-                colors::SUCCESS
-            } else {
-                colors::NEUTRAL
-            };
-            ui.label(egui::RichText::new(msg).color(color));
-        }
-
-        ui.add_space(spacing::SPACE_20);
-
-        // ── Advanced (rare/technical knobs) ────────────────────────────────
-        ui.collapsing("Advanced", |ui| {
-            ui.group(|ui| {
-                ui.label(egui::RichText::new("Simulation scripts").strong());
-                ui.label(egui::RichText::new("Optional — only needed for local AI simulation. Path to the folder containing run_commander_simulation.ps1 and analyze_commander_stats.py.").small().weak());
-                ui.add_space(spacing::SPACE_8);
-
-                ui.horizontal(|ui| {
-                    ui.label("Scripts folder:");
-                    let mut scripts_input = forge_scripts_path_input.clone();
-                    let response = ui.add(
-                        egui::TextEdit::singleline(&mut scripts_input)
-                            .desired_width(360.0)
-                            .hint_text("Path to folder with .ps1 and .py scripts"),
-                    );
-                    if response.changed() {
-                        let mut state = self.settings_state.lock().unwrap();
-                        state.forge_scripts_path_input = scripts_input.clone();
-                    }
-
-                    let scripts_valid = !forge_scripts_path_input.is_empty()
-                        && std::path::Path::new(&forge_scripts_path_input)
-                            .join("run_commander_simulation.ps1")
-                            .exists();
-                    if !forge_scripts_path_input.is_empty() {
-                        if scripts_valid {
-                            ui.label(egui::RichText::new("✓").color(colors::SUCCESS));
-                        } else {
-                            ui.label(egui::RichText::new("✗ ps1 not found").color(colors::ERROR));
-                        }
-                    }
-                });
-
-                ui.add_space(spacing::SPACE_5);
-                ui.horizontal(|ui| {
-                    if ui.button("📂 Browse…").clicked() {
-                        if let Some(folder) = rfd::FileDialog::new().pick_folder() {
-                            let path_str = folder.to_string_lossy().to_string();
-                            let mut state = self.settings_state.lock().unwrap();
-                            state.forge_scripts_path_input = path_str;
-                        }
-                    }
-                    if ui.button("💾 Save").clicked() {
-                        self.save_forge_scripts_path();
-                    }
-                });
-            });
-        });
-
-        }); // end ScrollArea
-    }
 
     fn save_forge_settings(&mut self) {
         let (forge_path, auto_launch) = {
