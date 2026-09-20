@@ -36,6 +36,21 @@ mod colors {
     pub const NEUTRAL: Color32 = Color32::from_rgb(100, 100, 100);
 }
 
+/// Named font-size roles for `egui::TextStyle` — see the doc comment where these are applied
+/// (in `launch`, alongside `eframe::run_native`) for why the values themselves are unchanged
+/// from what this file already used, apart from the new `SUBHEADING` role.
+mod type_scale {
+    pub const CAPTION: f32 = 14.0;
+    pub const BODY: f32 = 18.0;
+    pub const MONOSPACE: f32 = 16.0;
+    /// New: a step between `BODY` and `HEADING` for section titles that don't warrant a full
+    /// heading. Not wired into `egui::TextStyle` (egui only has one Heading style) — used
+    /// directly via `egui::RichText::size(type_scale::SUBHEADING)` where a group/section title
+    /// wants to read as more than bold body text without competing with an actual `ui.heading()`.
+    pub const SUBHEADING: f32 = 22.0;
+    pub const HEADING: f32 = 28.0;
+}
+
 /// Named `ui.add_space(...)` gaps, so the distinct values in use across this file are
 /// discoverable and tunable from one place instead of scattered bare literals. These intentionally
 /// preserve every existing value rather than collapsing them onto a tighter scale: the Get Decks
@@ -1204,6 +1219,22 @@ struct AppState {
     command_result: Option<CommandResult>,
 }
 
+/// Decodes the bundled window/taskbar icon (`res/app-icon.png`, this repo's own copy — not a
+/// build-time dependency on the MaMoFrontend logo it was copied from). Falls back to egui's
+/// blank default rather than panicking on a decode failure, per this repo's no-`unwrap`-in-
+/// production-paths convention — a bad bundled asset would surface immediately on the very
+/// first local `cargo run`, so this is a soft fallback for defense in depth, not the primary
+/// way such a bug would be caught.
+fn app_icon() -> egui::IconData {
+    match eframe::icon_data::from_png_bytes(include_bytes!("../res/app-icon.png")) {
+        Ok(icon) => icon,
+        Err(e) => {
+            log::warn!("Failed to decode bundled app icon: {e}");
+            egui::IconData::default()
+        }
+    }
+}
+
 pub fn launch(
     registration: RegistrationOutcome,
     args: Vec<String>,
@@ -1227,7 +1258,8 @@ pub fn launch(
     let native_options = NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([800.0, 600.0])
-            .with_min_inner_size([600.0, 400.0]),
+            .with_min_inner_size([600.0, 400.0])
+            .with_icon(app_icon()),
         ..Default::default()
     };
     
@@ -1235,19 +1267,36 @@ pub fn launch(
         "MaMo Connector",
         native_options,
         Box::new(move |cc| {
-            // Force light theme with explicit text colors
+            // ponytail: light theme is forced regardless of OS setting, and the ~40 inline
+            // Color32::from_rgb(...) fills/strokes scattered through this file's panels
+            // (status pills, banners, group frames) are light-tuned literals, not roles drawn
+            // from `colors`. A real dark theme needs both: (1) a light/dark role pair here and
+            // wherever CentralPanel/Frame hardcode white — see the redundant-looking
+            // `ui.visuals_mut().panel_fill = WHITE` reassertion a few dozen lines into
+            // `update()`, which is left alone here specifically because it's untested whether
+            // egui resets it independently of this context-level call — and (2) migrating those
+            // ~40 literals onto the role pair so dark mode doesn't leave light-colored panels on
+            // a dark canvas. Scoped out of this pass; flip `egui::Visuals::light()` below to
+            // `dark()` only after both are done, not before.
             let mut visuals = egui::Visuals::light();
             visuals.override_text_color = Some(egui::Color32::BLACK);
             cc.egui_ctx.set_visuals(visuals);
-            
-            // Ensure default fonts are loaded with larger sizes
+
+            // Type scale, named by role instead of 5 independent literals. Keeps every existing
+            // pixel value as-is (Caption/Small 14, Body/Button 18, Monospace 16, Heading 28) —
+            // this app's sizes were already deliberately bumped up from egui's tiny defaults for
+            // readability, and resizing them again isn't safe to do blind, without a way to
+            // visually verify the result in this environment. The one real addition is
+            // Subheading (22px): today there's nothing between Body and Heading, so anything
+            // wanting a section title one step down from a full heading has had to reuse Body
+            // and rely on `.strong()` alone to carry the hierarchy.
             let mut style = (*cc.egui_ctx.style()).clone();
             style.text_styles = [
-                (egui::TextStyle::Heading, egui::FontId::new(28.0, egui::FontFamily::Proportional)),
-                (egui::TextStyle::Body, egui::FontId::new(18.0, egui::FontFamily::Proportional)),
-                (egui::TextStyle::Monospace, egui::FontId::new(16.0, egui::FontFamily::Monospace)),
-                (egui::TextStyle::Button, egui::FontId::new(18.0, egui::FontFamily::Proportional)),
-                (egui::TextStyle::Small, egui::FontId::new(14.0, egui::FontFamily::Proportional)),
+                (egui::TextStyle::Small, egui::FontId::new(type_scale::CAPTION, egui::FontFamily::Proportional)),
+                (egui::TextStyle::Body, egui::FontId::new(type_scale::BODY, egui::FontFamily::Proportional)),
+                (egui::TextStyle::Button, egui::FontId::new(type_scale::BODY, egui::FontFamily::Proportional)),
+                (egui::TextStyle::Monospace, egui::FontId::new(type_scale::MONOSPACE, egui::FontFamily::Monospace)),
+                (egui::TextStyle::Heading, egui::FontId::new(type_scale::HEADING, egui::FontFamily::Proportional)),
             ].into();
             cc.egui_ctx.set_style(style);
             
@@ -2514,13 +2563,25 @@ impl LauncherApp {
 
     /// Drops expired toasts and paints whatever's left, stacked bottom-right above every other
     /// panel. See the `Toast` doc comment for why this exists alongside the always-visible
-    /// Activity panel.
+    /// Activity panel. Each toast fades in over its first 200ms and fades out over its last
+    /// 300ms — motion here is cheap to get right (nothing else depends on toast timing) unlike
+    /// animating the tab switch or Activity log, so this is the one place this pass adds it.
     fn render_toasts(&mut self, ctx: &egui::Context) {
-        let active: Vec<(usize, String, bool)> = {
+        const FADE_IN: std::time::Duration = std::time::Duration::from_millis(200);
+        const FADE_OUT: std::time::Duration = std::time::Duration::from_millis(300);
+
+        let active: Vec<(usize, String, bool, f32)> = {
             let mut toasts = self.toasts.lock().unwrap();
             toasts.retain(|t| t.shown_at.elapsed() < TOAST_DURATION);
             toasts.iter().enumerate()
-                .map(|(i, t)| (i, t.text.clone(), t.is_error))
+                .map(|(i, t)| {
+                    let elapsed = t.shown_at.elapsed();
+                    let remaining = TOAST_DURATION.saturating_sub(elapsed);
+                    let fade_in = (elapsed.as_secs_f32() / FADE_IN.as_secs_f32()).min(1.0);
+                    let fade_out = (remaining.as_secs_f32() / FADE_OUT.as_secs_f32()).min(1.0);
+                    let opacity = fade_in.min(fade_out).clamp(0.0, 1.0);
+                    (i, t.text.clone(), t.is_error, opacity)
+                })
                 .collect()
         };
 
@@ -2528,30 +2589,33 @@ impl LauncherApp {
             return;
         }
 
-        // Still-live toasts age out on their own next frame; keep repainting so that happens
-        // without waiting for unrelated input.
-        ctx.request_repaint_after(std::time::Duration::from_millis(200));
+        // Still-live toasts fade and age out on their own next frame; keep repainting so that
+        // happens smoothly without waiting for unrelated input.
+        ctx.request_repaint();
 
         egui::Area::new(egui::Id::new("toast_area"))
             .anchor(egui::Align2::RIGHT_BOTTOM, egui::vec2(-16.0, -40.0))
             .order(egui::Order::Foreground)
             .show(ctx, |ui| {
                 ui.vertical(|ui| {
-                    for (i, text, is_error) in &active {
+                    for (i, text, is_error, opacity) in &active {
                         let (fill, stroke) = if *is_error {
                             (egui::Color32::from_rgb(253, 232, 232), colors::ERROR)
                         } else {
                             (egui::Color32::from_rgb(220, 245, 225), colors::SUCCESS)
                         };
-                        egui::Frame::default()
-                            .fill(fill)
-                            .stroke(egui::Stroke::new(1.0, stroke))
-                            .inner_margin(egui::Margin::symmetric(spacing::SPACE_10, spacing::SPACE_8))
-                            .rounding(spacing::SPACE_6)
-                            .show(ui, |ui| {
-                                ui.set_max_width(320.0);
-                                ui.label(egui::RichText::new(text).color(stroke));
-                            });
+                        ui.scope(|ui| {
+                            ui.set_opacity(*opacity);
+                            egui::Frame::default()
+                                .fill(fill)
+                                .stroke(egui::Stroke::new(1.0, stroke))
+                                .inner_margin(egui::Margin::symmetric(spacing::SPACE_10, spacing::SPACE_8))
+                                .rounding(spacing::SPACE_6)
+                                .show(ui, |ui| {
+                                    ui.set_max_width(320.0);
+                                    ui.label(egui::RichText::new(text).color(stroke));
+                                });
+                        });
                         if *i != active.len() - 1 {
                             ui.add_space(spacing::SPACE_5);
                         }
@@ -6427,7 +6491,7 @@ impl LauncherApp {
 
         ui.group(|ui| {
             ui.horizontal(|ui| {
-                ui.label(egui::RichText::new("MaMo account").strong());
+                ui.label(egui::RichText::new("MaMo account").strong().size(type_scale::SUBHEADING));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if has_token {
                         render_status_pill(ui, "Connected", PillStatus::Success);
@@ -6499,7 +6563,7 @@ impl LauncherApp {
             // ── Forge ──────────────────────────────────────────────────────
             ui.group(|ui| {
                 ui.horizontal(|ui| {
-                    ui.label(egui::RichText::new("Forge").strong());
+                    ui.label(egui::RichText::new("Forge").strong().size(type_scale::SUBHEADING));
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if forge_path_valid {
                             let (forge_busy, forge_active) = {
@@ -6792,7 +6856,7 @@ impl LauncherApp {
                     )
                 };
                 ui.horizontal(|ui| {
-                    ui.label(egui::RichText::new("MaMo Connector").strong());
+                    ui.label(egui::RichText::new("MaMo Connector").strong().size(type_scale::SUBHEADING));
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if staged_path.is_some() {
                             render_status_pill(ui, "Ready to restart", PillStatus::Success);
