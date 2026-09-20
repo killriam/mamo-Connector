@@ -9,6 +9,7 @@ mod registration;
 mod settings;
 mod simulation;
 mod ui;
+mod user_decks;
 
 use anyhow::Result;
 use deeplink::parse_deeplink;

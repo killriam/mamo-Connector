@@ -1,7 +1,8 @@
 use log::{error, info, warn};
 use std::sync::{Arc, Mutex};
 use crate::deeplink::Deeplink;
-use crate::deck::{create_deck_from_id, create_deck_from_moxfield, create_deck_from_mamo, create_deck_from_mamo_with_progress, create_deck_and_scenario_for_forge, get_deck_directory, DeckCreationResult, DeckSyncResult, SyncStatus, sync_moxfield_deck_with_mamo_id, parse_moxfield_url, UserDecksImportResult, import_user_decks, list_moxfield_user_decks, MoxfieldDeckEntry, ProgressCallback};
+use crate::deck::{create_deck_from_id, create_deck_from_moxfield, create_deck_from_mamo, create_deck_from_mamo_with_progress, create_deck_and_scenario_for_forge, get_deck_directory, DeckCreationResult, DeckSyncResult, SyncStatus, sync_moxfield_deck_with_mamo_id, parse_moxfield_url, UserDecksImportResult, ProgressCallback};
+use crate::user_decks::{self, RemoteDeck, UserDeckSource};
 use crate::forge::{launch_forge_from_settings, launch_forge_replay, ForgeLaunchResult};
 use crate::gamelog::{download_replay_content, save_replay_to_forge_dir, ScenarioSyncResult, sync_forge_scenario_file, sync_all_scenario_files};
 use crate::settings::Settings;
@@ -29,7 +30,7 @@ pub enum CommandResult {
     ReplayGameLaunched(ForgeLaunchResult),
     ReplayVerified(ReplayVerificationResult),
     UserDecksImported(UserDecksImportResult),
-    UserDecksList(Vec<MoxfieldDeckEntry>),
+    UserDecksList(Vec<RemoteDeck>),
     AuthTokenSaved(String),  // Success message
     SimulationCompleted(SimulationResult),
     ScenarioSynced(Vec<ScenarioSyncResult>),
@@ -1037,7 +1038,9 @@ async fn handle_import_user_decks(deeplink: &Deeplink) -> CommandResult {
 
     info!("Importing decks for user: {} from API: {}", username, api_base_url);
 
-    match import_user_decks(&username, &api_base_url).await {
+    let settings = crate::settings::Settings::load().unwrap_or_default();
+    let source = UserDeckSource::MoxfieldProfile(username);
+    match user_decks::import_all(&source, &api_base_url, &settings).await {
         Ok(result) => CommandResult::UserDecksImported(result),
         Err(err) => {
             error!("Failed to import user decks: {:?}", err);
@@ -1068,7 +1071,9 @@ async fn handle_list_user_decks(deeplink: &Deeplink) -> CommandResult {
 
     info!("Listing decks for Moxfield user: {} via API: {}", username, api_base_url);
 
-    match list_moxfield_user_decks(&username, &api_base_url).await {
+    let settings = crate::settings::Settings::load().unwrap_or_default();
+    let source = UserDeckSource::MoxfieldProfile(username.clone());
+    match user_decks::fetch(&source, &api_base_url, &settings).await {
         Ok(decks) => {
             info!("Found {} decks for user '{}'", decks.len(), username);
             CommandResult::UserDecksList(decks)

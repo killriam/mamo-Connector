@@ -745,99 +745,9 @@ pub async fn fetch_user_decks_via_backend(username: &str, api_base_url: &str) ->
     Ok(decks)
 }
 
-/// Import all decks from a Moxfield user profile
-/// First tries the backend API, falls back to direct Moxfield API if backend fails
-pub async fn import_user_decks(username: &str, api_base_url: &str) -> Result<UserDecksImportResult> {
-    info!("Importing all decks for Moxfield user: {} via API: {}", username, api_base_url);
-    
-    // Try backend API first, then fall back to direct Moxfield API
-    let decks = match fetch_user_decks_via_backend(username, api_base_url).await {
-        Ok(d) => {
-            info!("Successfully fetched deck list via backend");
-            d
-        }
-        Err(backend_err) => {
-            warn!("Backend API failed ({}), trying direct Moxfield API...", backend_err);
-            match fetch_moxfield_user_decks(username).await {
-                Ok(d) => d,
-                Err(moxfield_err) => {
-                    return Ok(UserDecksImportResult::failed(
-                        username.to_string(),
-                        format!("Backend: {} | Moxfield: {}", backend_err, moxfield_err)
-                    ));
-                }
-            }
-        }
-    };
-    
-    if decks.is_empty() {
-        return Ok(UserDecksImportResult::failed(
-            username.to_string(),
-            "No public decks found for this user".to_string()
-        ));
-    }
-    
-    info!("Found {} decks for user '{}', starting import...", decks.len(), username);
-    
-    let mut imported = Vec::new();
-    let mut failed = Vec::new();
-    
-    for deck in decks {
-        info!("Importing deck: {} (ID: {})", deck.name, deck.public_id);
-        
-        match create_deck_from_id(&deck.public_id, api_base_url).await {
-            Ok(result) => {
-                if result.success {
-                    info!("Successfully imported: {}", deck.name);
-                } else {
-                    warn!("Deck import reported failure: {}", result.message);
-                }
-                imported.push(result);
-            }
-            Err(e) => {
-                warn!("Failed to import deck '{}': {}", deck.name, e);
-                failed.push((deck.name.clone(), e.to_string()));
-            }
-        }
-    }
-    
-    Ok(UserDecksImportResult::success(username.to_string(), imported, failed))
-}
-/// Fetch the list of decks for a user (without importing them)
-/// Uses backend proxy to avoid Cloudflare blocking
-pub async fn list_moxfield_user_decks(username: &str, api_base_url: &str) -> Result<Vec<MoxfieldDeckEntry>> {
-    // Use backend proxy to avoid Cloudflare blocking
-    fetch_user_decks_via_backend(username, api_base_url).await
-}
-
-/// Import selected decks from a list of deck IDs
-#[allow(dead_code)]
-pub async fn import_selected_decks(
-    deck_ids: &[String], 
-    api_base_url: &str,
-    username: &str,
-) -> Result<UserDecksImportResult> {
-    info!("Importing {} selected decks via API: {}", deck_ids.len(), api_base_url);
-    
-    let mut imported = Vec::new();
-    let mut failed = Vec::new();
-    
-    for deck_id in deck_ids {
-        info!("Importing deck ID: {}", deck_id);
-        
-        match create_deck_from_id(deck_id, api_base_url).await {
-            Ok(result) => {
-                imported.push(result);
-            }
-            Err(e) => {
-                warn!("Failed to import deck '{}': {}", deck_id, e);
-                failed.push((deck_id.clone(), e.to_string()));
-            }
-        }
-    }
-    
-    Ok(UserDecksImportResult::success(username.to_string(), imported, failed))
-}
+// "Import all decks from a user profile" and "list a user's decks without importing" now live
+// in `user_decks::import_all` / `user_decks::fetch`, which also cover the MaMo-profile and
+// MaMo-mine sources this file's Moxfield-only versions never did. See that module for why.
 
 // ==================== Helper Functions ====================
 
@@ -3879,32 +3789,6 @@ Name=Example Commander Deck
             }
             Err(e) => {
                 panic!("Failed to fetch user decks: {}. Check network connectivity.", e);
-            }
-        }
-    }
-
-    /// Integration test for listing user decks via the public function
-    #[tokio::test]
-    #[ignore]
-    async fn test_integration_list_moxfield_user_decks() {
-        let username = "IceMagma";
-        let api_base_url = "https://mamo-magic.vercel.app";
-        
-        let result = list_moxfield_user_decks(username, api_base_url).await;
-        
-        match result {
-            Ok(decks) => {
-                println!("Listed {} decks for user '{}'", decks.len(), username);
-                
-                // Verify we get the expected structure
-                for deck in decks.iter().take(3) {
-                    assert!(!deck.public_id.is_empty());
-                    assert!(!deck.name.is_empty());
-                    println!("  - {} ({})", deck.name, deck.public_id);
-                }
-            }
-            Err(e) => {
-                println!("Could not list decks (network may be unavailable): {}", e);
             }
         }
     }
