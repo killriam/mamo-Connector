@@ -488,12 +488,110 @@ fn deeplink_has_deck_reference(deeplink: &Deeplink) -> bool {
         || crate::commands::get_parameter(&deeplink.params, "deck_path").is_some()
 }
 
-/// If `deck` has already been downloaded into the Forge deck directory (matched by the same
-/// sanitized-name convention used at download time), return its file stem. Pure and testable
-/// without touching egui/tokio state.
-fn find_local_deck_path(deck: &crate::gamelog::UserDeck, local_decks: &[String]) -> Option<String> {
-    let target = crate::deck::sanitize_filename(&deck.deck_name).to_lowercase();
-    local_decks.iter().find(|stem| stem.to_lowercase() == target).cloned()
+/// Helper to extract date tag (e.g. "2026-09-20") from a deck file stem if present
+fn extract_date_from_stem(stem: &str) -> Option<&str> {
+    let paren_pos = stem.rfind(" (")?;
+    let after = &stem[paren_pos + 2..];
+    if after.len() == 11 && after.ends_with(')') {
+        Some(&after[..10])
+    } else {
+        None
+    }
+}
+
+/// Checks whether a local deck file stem matches a given deck name, accounting for:
+/// - Exact match: "Exilent Timing" == "Exilent Timing"
+/// - Date suffix: "Exilent Timing (2026-09-20)" matches "Exilent Timing"
+/// - Author prefix + date: "killriam - Exilent Timing (2026-09-20)" matches "Exilent Timing"
+/// - Author prefix only: "killriam - Exilent Timing" matches "Exilent Timing"
+fn stem_matches_deck_name(stem: &str, deck_name: &str) -> bool {
+    let target = crate::deck::sanitize_filename(deck_name).to_lowercase();
+    let stem_lower = stem.to_lowercase();
+
+    if stem_lower == target {
+        return true;
+    }
+
+    let without_date = if let Some(paren_pos) = stem_lower.rfind(" (") {
+        let after = &stem_lower[paren_pos + 2..];
+        if after.len() == 11 && after.ends_with(')') {
+            &stem_lower[..paren_pos]
+        } else {
+            &stem_lower[..]
+        }
+    } else {
+        &stem_lower[..]
+    };
+
+    if without_date == target {
+        return true;
+    }
+
+    if let Some(dash_pos) = without_date.find(" - ") {
+        let after_dash = &without_date[dash_pos + 3..];
+        if after_dash == target {
+            return true;
+        }
+    }
+
+    if without_date.ends_with(&format!(" - {}", target)) {
+        return true;
+    }
+
+    false
+}
+
+/// If `deck` has already been downloaded into the Forge deck directory, return its file stem.
+///
+/// Looks up known deck mappings (by `deck_id`) first, then falls back to sanitized filename
+/// matching that handles `<author> - <deck_name> (<date>)` conventions, prioritizing newer
+/// dates. Pure and testable without touching egui/tokio state.
+fn find_local_deck_path(
+    deck: &crate::gamelog::UserDeck,
+    local_decks: &[String],
+    mappings: Option<&crate::gamelog::DeckMappings>,
+) -> Option<String> {
+    // 1. Direct lookup in deck_mappings (strongest signal)
+    if let Some(m) = mappings {
+        let mut mapped_matches: Vec<&String> = local_decks
+            .iter()
+            .filter(|stem| m.get_mapping(stem.as_str()) == Some(&deck.deck_id))
+            .collect();
+
+        if !mapped_matches.is_empty() {
+            mapped_matches.sort_by(|a, b| {
+                let date_a = extract_date_from_stem(a).unwrap_or("");
+                let date_b = extract_date_from_stem(b).unwrap_or("");
+                date_b.cmp(date_a).then_with(|| b.cmp(a))
+            });
+            return Some(mapped_matches[0].clone());
+        }
+    }
+
+    // 2. Pattern-based stem matching fallback
+    let mut candidates: Vec<&String> = local_decks
+        .iter()
+        .filter(|stem| stem_matches_deck_name(stem, &deck.deck_name))
+        .collect();
+
+    if candidates.is_empty() {
+        return None;
+    }
+
+    // Rank candidates: prefer ones with author prefix + date, then newest date, then exact match
+    candidates.sort_by(|a, b| {
+        let date_a = extract_date_from_stem(a).unwrap_or("");
+        let date_b = extract_date_from_stem(b).unwrap_or("");
+        let has_author_a = a.contains(" - ");
+        let has_author_b = b.contains(" - ");
+
+        (has_author_b && !date_b.is_empty())
+            .cmp(&(has_author_a && !date_a.is_empty()))
+            .then_with(|| date_b.cmp(date_a))
+            .then_with(|| b.cmp(a))
+    });
+
+    Some(candidates[0].clone())
 }
 
 /// Resolves an opponent deck to pass as Forge's `--deck2` for a standalone (non-deeplink) Play
@@ -4140,12 +4238,15 @@ impl LauncherApp {
                                 None => {
                                     self.confirm_action = Some(ConfirmAction::LaunchWithoutDeck);
                                 }
-                                Some(deck) => match find_local_deck_path(&deck, &self.forge_local_decks) {
-                                    Some(local_stem) => {
-                                        self.request_forge_launch(PendingForgeLaunch::LocalDeckWithCuratedOpponent { local_stem }, ctx);
+                                Some(deck) => {
+                                    let mappings = self.gamelog_state.lock().unwrap().deck_mappings.clone();
+                                    match find_local_deck_path(&deck, &self.forge_local_decks, Some(&mappings)) {
+                                        Some(local_stem) => {
+                                            self.request_forge_launch(PendingForgeLaunch::LocalDeckWithCuratedOpponent { local_stem }, ctx);
+                                        }
+                                        None => self.request_forge_launch(PendingForgeLaunch::AccountDeck(deck), ctx),
                                     }
-                                    None => self.request_forge_launch(PendingForgeLaunch::AccountDeck(deck), ctx),
-                                },
+                                }
                             }
                         }
                     } else {
@@ -4199,8 +4300,9 @@ impl LauncherApp {
                         ui.label(egui::RichText::new("Deck:").small());
                         let decks_snapshot = self.account_decks();
                         let local_decks = self.forge_local_decks.clone();
+                        let mappings_snapshot = self.gamelog_state.lock().unwrap().deck_mappings.clone();
                         let label_for = |deck: &crate::gamelog::UserDeck| {
-                            if find_local_deck_path(deck, &local_decks).is_some() {
+                            if find_local_deck_path(deck, &local_decks, Some(&mappings_snapshot)).is_some() {
                                 deck.deck_name.clone()
                             } else {
                                 format!("{} (download)", deck.deck_name)
@@ -6894,7 +6996,7 @@ mod deck_picker_tests {
         let deck = make_deck("My Commander Deck");
         let local = vec!["Some Other Deck".to_string(), "my commander deck".to_string()];
         assert_eq!(
-            find_local_deck_path(&deck, &local),
+            find_local_deck_path(&deck, &local, None),
             Some("my commander deck".to_string())
         );
     }
@@ -6903,7 +7005,49 @@ mod deck_picker_tests {
     fn find_local_deck_path_none_when_not_downloaded() {
         let deck = make_deck("Never Downloaded Deck");
         let local = vec!["Some Other Deck".to_string()];
-        assert_eq!(find_local_deck_path(&deck, &local), None);
+        assert_eq!(find_local_deck_path(&deck, &local, None), None);
+    }
+
+    #[test]
+    fn find_local_deck_path_matches_author_and_date_stem() {
+        let deck = make_deck("Exilent Timing");
+        let local = vec![
+            "Some Other Deck".to_string(),
+            "killriam - Exilent Timing (2026-09-20)".to_string(),
+        ];
+        assert_eq!(
+            find_local_deck_path(&deck, &local, None),
+            Some("killriam - Exilent Timing (2026-09-20)".to_string())
+        );
+    }
+
+    #[test]
+    fn find_local_deck_path_prefers_mapped_deck_over_stale_stem() {
+        let deck = make_deck("Exilent Timing");
+        let local = vec![
+            "Exilent Timing".to_string(),
+            "killriam - Exilent Timing (2026-09-20)".to_string(),
+        ];
+        let mut mappings = crate::gamelog::DeckMappings::default();
+        mappings.set_mapping("killriam - Exilent Timing (2026-09-20)", "deck-uuid-1");
+
+        assert_eq!(
+            find_local_deck_path(&deck, &local, Some(&mappings)),
+            Some("killriam - Exilent Timing (2026-09-20)".to_string())
+        );
+    }
+
+    #[test]
+    fn find_local_deck_path_prefers_author_date_over_bare_stale_without_mappings() {
+        let deck = make_deck("Exilent Timing");
+        let local = vec![
+            "Exilent Timing".to_string(),
+            "killriam - Exilent Timing (2026-09-20)".to_string(),
+        ];
+        assert_eq!(
+            find_local_deck_path(&deck, &local, None),
+            Some("killriam - Exilent Timing (2026-09-20)".to_string())
+        );
     }
 
     #[test]

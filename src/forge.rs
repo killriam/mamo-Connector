@@ -945,10 +945,31 @@ pub fn launch_forge_replay(replay_path: &str) -> Result<ForgeLaunchResult> {
 /// Helper to read a .dck file and extract the internal deck Name from its metadata header.
 /// This is crucial because Windows filenames are sanitized (e.g., replacing colons with underscores),
 /// but Forge matches the CLI --deck parameter against the internal "Name=" metadata.
+///
+/// Resolves `path_str` as a direct file path, or looks inside Forge's commander deck directory
+/// matching `<stem>` or `<stem>.dck`.
 fn extract_deck_name_from_file(path_str: &str) -> Option<String> {
     let path = PathBuf::from(path_str);
-    if path.exists() && path.is_file() {
-        if let Ok(content) = std::fs::read_to_string(&path) {
+    let resolved = if path.is_file() {
+        Some(path)
+    } else if let Some(dir) = get_forge_deck_directory() {
+        let direct = dir.join(path_str);
+        if direct.is_file() {
+            Some(direct)
+        } else {
+            let with_ext = dir.join(format!("{}.dck", path_str));
+            if with_ext.is_file() {
+                Some(with_ext)
+            } else {
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    if let Some(p) = resolved {
+        if let Ok(content) = std::fs::read_to_string(&p) {
             for line in content.lines() {
                 if line.starts_with("Name=") {
                     return Some(line["Name=".len()..].trim().to_string());
@@ -1260,5 +1281,23 @@ mod tests {
         assert_eq!(resolved_v2, v2_jar);
 
         let _ = std::fs::remove_dir_all(&dest);
+    }
+
+    #[test]
+    fn extract_deck_name_from_file_reads_direct_path() {
+        let temp_dir = std::env::temp_dir().join("mamo-connector-extract-deck-test");
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        std::fs::create_dir_all(&temp_dir).unwrap();
+
+        let deck_file = temp_dir.join("test_deck.dck");
+        std::fs::write(&deck_file, "[metadata]\nName=My Awesome Deck\n\n[Main]\n1 Sol Ring\n").unwrap();
+
+        let extracted = extract_deck_name_from_file(&deck_file.to_string_lossy());
+        assert_eq!(extracted, Some("My Awesome Deck".to_string()));
+
+        let nonexistent = extract_deck_name_from_file(&temp_dir.join("nonexistent.dck").to_string_lossy());
+        assert_eq!(nonexistent, None);
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
     }
 }
