@@ -12,7 +12,7 @@ use crate::user_decks::{DeckOrigin, RemoteDeck, UserDeckSource};
 use rfd::FileDialog;
 use crate::deeplink::Deeplink;
 use crate::forge::{get_default_forge_path, resolve_latest_forge_jar, validate_forge_path, launch_forge_from_settings, list_forge_decks, ForgeLaunchResult};
-use crate::gamelog::{GameLogConfig, GameLogProcessResult, ScanSummary, get_default_forge_log_directory, validate_directory, scan_directory, load_processed_files, save_processed_files, DeckMappings, fetch_my_decks, suggest_deck_matches, load_cached_decks, save_cached_decks, process_new_logs_with_filter, GameLogFilterOptions, FilePreviewInfo};
+use crate::gamelog::{GameLogConfig, GameLogProcessResult, GameLogStats, ScanSummary, get_default_forge_log_directory, validate_directory, scan_directory, load_processed_files, save_processed_files, DeckMappings, fetch_my_decks, suggest_deck_matches, load_cached_decks, save_cached_decks, process_new_logs_with_filter, GameLogFilterOptions, FilePreviewInfo};
 use crate::registration::{RegistrationOutcome, RegistrationStatus};
 use crate::settings::{Settings, SavedLink, SavedLinkType};
 
@@ -195,8 +195,12 @@ enum PlaySession {
     /// A found game log is being sent to MaMo.
     Uploading,
     /// Upload succeeded — `deck_id` (if the log matched a known deck) lets the UI link
-    /// straight to that deck's analysis instead of just reporting a filename.
-    Uploaded { deck_id: Option<String>, filename: String },
+    /// straight to that deck's analysis instead of just reporting a filename. `deck_name` and
+    /// `stats` (turns/cards played/actions, see `GameLogStats`) give the status strip and the
+    /// Activity card something to say about what actually happened in the game, rather than
+    /// just the raw filename — both are best-effort and may be `None`/default if the log
+    /// didn't carry that data.
+    Uploaded { deck_id: Option<String>, deck_name: Option<String>, filename: String, stats: GameLogStats },
     /// Upload attempted but failed, or the scan itself errored. `auth_expired` is set when
     /// the failure was specifically a 401 (see `gamelog::upload_game_log`'s AUTH_EXPIRED
     /// sentinel) so the UI can offer a one-click Reconnect instead of just printing the error.
@@ -243,10 +247,18 @@ fn play_session_strip(ps: &PlaySession) -> (String, bool) {
         ),
         PlaySession::Scanning => ("Scanning for your game log…".to_string(), true),
         PlaySession::Uploading => ("Uploading…".to_string(), true),
-        PlaySession::Uploaded { filename, .. } => (
-            format!("Uploaded {filename} — back to watching for your next game"),
-            false,
-        ),
+        PlaySession::Uploaded { deck_name, filename, stats, .. } => {
+            let subject = deck_name.clone().unwrap_or_else(|| filename.clone());
+            let detail = match (stats.turns, stats.cards_played) {
+                (Some(turns), Some(cards)) => format!(" ({turns} turns, {cards} cards played)"),
+                (Some(turns), None) => format!(" ({turns} turns)"),
+                (None, _) => String::new(),
+            };
+            (
+                format!("Uploaded {subject}{detail} — back to watching for your next game"),
+                false,
+            )
+        }
         PlaySession::UploadIssue { message, auth_expired } => (
             if *auth_expired {
                 "Upload issue — your MaMo connection expired, reconnect in Setup".to_string()
@@ -4642,8 +4654,24 @@ impl LauncherApp {
                                     }
                                 }
                             } else if i == 5 {
-                                if let PlaySession::Uploaded { ref deck_id, ref filename } = ps {
-                                    ui.label(egui::RichText::new(filename).small().color(text_color));
+                                if let PlaySession::Uploaded { ref deck_id, ref deck_name, ref filename, ref stats } = ps {
+                                    if let Some(name) = deck_name {
+                                        ui.label(egui::RichText::new(name).small().strong().color(text_color));
+                                    }
+                                    let mut detail_parts = Vec::new();
+                                    if let Some(turns) = stats.turns {
+                                        detail_parts.push(format!("{turns} turns"));
+                                    }
+                                    if let Some(cards) = stats.cards_played {
+                                        detail_parts.push(format!("{cards} cards played"));
+                                    }
+                                    if let Some(actions) = stats.actions {
+                                        detail_parts.push(format!("{actions} actions"));
+                                    }
+                                    if !detail_parts.is_empty() {
+                                        ui.label(egui::RichText::new(detail_parts.join(" · ")).small().color(text_color));
+                                    }
+                                    ui.label(egui::RichText::new(filename).small().color(egui::Color32::GRAY));
                                     if let Some(id) = deck_id {
                                         if ui.small_button("View analysis on MaMo").clicked() {
                                             let url = format!(
@@ -5889,7 +5917,9 @@ impl LauncherApp {
                             {
                                 PlaySession::Uploaded {
                                     deck_id: uploaded.resolved_deck_id.clone(),
+                                    deck_name: uploaded.deck_identifier.clone(),
                                     filename: uploaded.filename.clone(),
+                                    stats: uploaded.stats.clone(),
                                 }
                             } else if let Some(failed) = summary.results.iter().find(|r| !r.success) {
                                 PlaySession::upload_issue(failed.message.clone())
@@ -6098,7 +6128,9 @@ impl LauncherApp {
                             {
                                 PlaySession::Uploaded {
                                     deck_id: uploaded.resolved_deck_id.clone(),
+                                    deck_name: uploaded.deck_identifier.clone(),
                                     filename: uploaded.filename.clone(),
+                                    stats: uploaded.stats.clone(),
                                 }
                             } else if let Some(failed) = summary.results.iter().find(|r| !r.success) {
                                 PlaySession::upload_issue(failed.message.clone())
@@ -7254,7 +7286,12 @@ mod deck_picker_tests {
         assert_eq!(play_session_step_index(&PlaySession::Scanning), 3);
         assert_eq!(play_session_step_index(&PlaySession::Uploading), 4);
         assert_eq!(
-            play_session_step_index(&PlaySession::Uploaded { deck_id: None, filename: "a.json".to_string() }),
+            play_session_step_index(&PlaySession::Uploaded {
+                deck_id: None,
+                deck_name: None,
+                filename: "a.json".to_string(),
+                stats: GameLogStats::default(),
+            }),
             5
         );
     }
@@ -7300,7 +7337,12 @@ mod deck_picker_tests {
             PlaySession::Playing,
             PlaySession::Scanning,
             PlaySession::Uploading,
-            PlaySession::Uploaded { deck_id: Some("deck-1".to_string()), filename: "a.json".to_string() },
+            PlaySession::Uploaded {
+                deck_id: Some("deck-1".to_string()),
+                deck_name: Some("Atraxa Superfriends".to_string()),
+                filename: "a.json".to_string(),
+                stats: GameLogStats { turns: Some(8), cards_played: Some(15), actions: Some(22) },
+            },
             PlaySession::UploadIssue { message: "oops".to_string(), auth_expired: false },
         ];
         for ps in &sessions {
@@ -7310,13 +7352,44 @@ mod deck_picker_tests {
     }
 
     #[test]
+    fn play_session_strip_uploaded_names_the_deck_and_turn_count_when_known() {
+        let ps = PlaySession::Uploaded {
+            deck_id: Some("deck-1".to_string()),
+            deck_name: Some("Atraxa Superfriends".to_string()),
+            filename: "replay_Constructed_2026-09-22_04-49-21.json".to_string(),
+            stats: GameLogStats { turns: Some(8), cards_played: Some(15), actions: Some(22) },
+        };
+        let (text, _) = play_session_strip(&ps);
+        assert!(text.contains("Atraxa Superfriends"));
+        assert!(text.contains("8 turns"));
+        assert!(text.contains("15 cards played"));
+    }
+
+    #[test]
+    fn play_session_strip_uploaded_falls_back_to_filename_without_deck_name() {
+        let ps = PlaySession::Uploaded {
+            deck_id: None,
+            deck_name: None,
+            filename: "a.json".to_string(),
+            stats: GameLogStats::default(),
+        };
+        let (text, _) = play_session_strip(&ps);
+        assert!(text.contains("a.json"));
+    }
+
+    #[test]
     fn play_session_strip_is_active_only_while_something_is_actually_happening() {
         assert!(!play_session_strip(&PlaySession::Watching).1);
         assert!(play_session_strip(&PlaySession::Launching).1);
         assert!(play_session_strip(&PlaySession::Playing).1);
         assert!(play_session_strip(&PlaySession::Scanning).1);
         assert!(play_session_strip(&PlaySession::Uploading).1);
-        assert!(!play_session_strip(&PlaySession::Uploaded { deck_id: None, filename: "a.json".to_string() }).1);
+        assert!(!play_session_strip(&PlaySession::Uploaded {
+            deck_id: None,
+            deck_name: None,
+            filename: "a.json".to_string(),
+            stats: GameLogStats::default(),
+        }).1);
         assert!(!play_session_strip(&PlaySession::UploadIssue { message: "oops".to_string(), auth_expired: false }).1);
     }
 

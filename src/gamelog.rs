@@ -41,6 +41,17 @@ pub enum WatcherStatus {
     Error(String),
 }
 
+/// Turn/action counts pulled from a parsed game log, so the Play tab's Uploaded card can say
+/// something about what actually happened in the game instead of just naming the file.
+/// Counts are for the whole game (both players), not just the human seat — the per-player
+/// breakdown already lives on the analysis page this card links to.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct GameLogStats {
+    pub turns: Option<u32>,
+    pub cards_played: Option<u32>,
+    pub actions: Option<u32>,
+}
+
 /// Result of processing a single game log file
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GameLogProcessResult {
@@ -58,6 +69,10 @@ pub struct GameLogProcessResult {
     /// deck's game analysis instead of just reporting an upload happened.
     #[serde(default)]
     pub resolved_deck_id: Option<String>,
+    /// Turn/card-play/action tallies from `extract_game_stats`, for display alongside the deck
+    /// name — `None` fields when the log didn't parse as valid JSON or lacked an events array.
+    #[serde(default)]
+    pub stats: GameLogStats,
 }
 
 impl GameLogProcessResult {
@@ -67,6 +82,7 @@ impl GameLogProcessResult {
         server_id: Option<String>,
         deck_identifier: Option<String>,
         resolved_deck_id: Option<String>,
+        stats: GameLogStats,
     ) -> Self {
         Self {
             filename,
@@ -77,6 +93,7 @@ impl GameLogProcessResult {
             server_id,
             deck_identifier,
             resolved_deck_id,
+            stats,
         }
     }
 
@@ -90,6 +107,7 @@ impl GameLogProcessResult {
             server_id: None,
             deck_identifier: None,
             resolved_deck_id: None,
+            stats: GameLogStats::default(),
         }
     }
 }
@@ -571,8 +589,50 @@ fn extract_deck_identifier(filename: &str, content: &str) -> Option<String> {
     if let Some(deck_name) = extract_deck_from_filename(filename) {
         return Some(deck_name);
     }
-    
+
     None
+}
+
+/// Extracts `meta.turns` plus tallies of "cards played" (`CAST`/`PLAY_LAND` events — spells
+/// cast and lands played) and "actions" (all player-decision event types per the MTG Replay
+/// Notation spec's ยง7.2 table, minus `PASS_PRIORITY`/`MULLIGAN`/`LEARNING_MARKER`, which are
+/// bookkeeping rather than plays) from a game log's JSON content. Returns all-`None` if the
+/// content isn't valid JSON; individual fields are `None` if their source data is missing.
+fn extract_game_stats(content: &str) -> GameLogStats {
+    let Ok(json) = serde_json::from_str::<serde_json::Value>(content) else {
+        return GameLogStats::default();
+    };
+
+    let turns = json
+        .get("meta")
+        .and_then(|m| m.get("turns"))
+        .and_then(|v| v.as_u64())
+        .map(|v| v as u32);
+
+    let events = json.get("events").and_then(|v| v.as_array());
+    let stats = events.map(|events| {
+        let mut cards_played = 0u32;
+        let mut actions = 0u32;
+        for event in events {
+            match event.get("type").and_then(|v| v.as_str()) {
+                Some("CAST") | Some("PLAY_LAND") => {
+                    cards_played += 1;
+                    actions += 1;
+                }
+                Some("ACTIVATE") | Some("DECLARE_ATTACKERS") | Some("DECLARE_BLOCKERS") | Some("DISCARD") | Some("CHOOSE") => {
+                    actions += 1;
+                }
+                _ => {}
+            }
+        }
+        (cards_played, actions)
+    });
+
+    GameLogStats {
+        turns,
+        cards_played: stats.map(|(cards_played, _)| cards_played),
+        actions: stats.map(|(_, actions)| actions),
+    }
 }
 
 /// Extract deck name from JSON game log content
@@ -1009,12 +1069,14 @@ pub async fn process_new_logs_with_filter(
                     let resolved_deck_id = deck_identifier.as_deref().and_then(|name| {
                         DeckMappings::load().ok().and_then(|m| m.get_mapping(name).cloned())
                     });
+                    let stats = extract_game_stats(&log_content.content);
                     summary.results.push(GameLogProcessResult::success(
                         filename.clone(),
                         log_content.file_size,
                         response.id,
                         deck_identifier,
                         resolved_deck_id,
+                        stats,
                     ));
                     
                     // Mark as processed
@@ -1608,6 +1670,7 @@ mod tests {
             Some("id123".to_string()),
             Some("MyDeck".to_string()),
             Some("deck-uuid-456".to_string()),
+            GameLogStats { turns: Some(6), cards_played: Some(12), actions: Some(20) },
         );
         assert!(success.success);
         assert_eq!(success.filename, "test.json");
@@ -1615,6 +1678,9 @@ mod tests {
         assert_eq!(success.server_id, Some("id123".to_string()));
         assert_eq!(success.deck_identifier, Some("MyDeck".to_string()));
         assert_eq!(success.resolved_deck_id, Some("deck-uuid-456".to_string()));
+        assert_eq!(success.stats.turns, Some(6));
+        assert_eq!(success.stats.cards_played, Some(12));
+        assert_eq!(success.stats.actions, Some(20));
 
         let failed = GameLogProcessResult::failed(
             "test.json".to_string(),
@@ -1622,6 +1688,36 @@ mod tests {
         );
         assert!(!failed.success);
         assert_eq!(failed.message, "Error message");
+    }
+
+    #[test]
+    fn test_extract_game_stats_counts_cards_played_and_actions() {
+        let content = r#"{
+            "meta": { "turns": 6 },
+            "events": [
+                { "i": 0, "type": "GAME_START" },
+                { "i": 1, "type": "PLAY_LAND" },
+                { "i": 2, "type": "CAST" },
+                { "i": 3, "type": "PUT_ON_STACK" },
+                { "i": 4, "type": "DECLARE_ATTACKERS" },
+                { "i": 5, "type": "PASS_PRIORITY" },
+                { "i": 6, "type": "CAST" }
+            ]
+        }"#;
+        let stats = extract_game_stats(content);
+        assert_eq!(stats.turns, Some(6));
+        // PLAY_LAND + 2x CAST
+        assert_eq!(stats.cards_played, Some(3));
+        // the above + DECLARE_ATTACKERS; GAME_START/PUT_ON_STACK/PASS_PRIORITY don't count
+        assert_eq!(stats.actions, Some(4));
+    }
+
+    #[test]
+    fn test_extract_game_stats_invalid_json_returns_all_none() {
+        let stats = extract_game_stats("not json");
+        assert_eq!(stats.turns, None);
+        assert_eq!(stats.cards_played, None);
+        assert_eq!(stats.actions, None);
     }
 
     #[test]
