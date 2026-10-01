@@ -1339,6 +1339,9 @@ struct LauncherApp {
     runtime_handle: tokio::runtime::Handle,
     url_input: String,
     current_tab: Tab,
+    /// Set when something (e.g. the Play tab's "Reconnect" button) deep-links to the Setup tab's
+    /// MaMo account section; the Setup scroll area jumps back to the top (where it lives) once.
+    setup_scroll_to_account: bool,
     import_state: Arc<Mutex<ImportState>>,
     sync_state: Arc<Mutex<SyncState>>,
     gamelog_state: Arc<Mutex<GameLogState>>,
@@ -1641,6 +1644,7 @@ impl LauncherApp {
             runtime_handle,
             url_input: String::new(),
             current_tab: initial_tab,
+            setup_scroll_to_account: false,
             import_state: Arc::new(Mutex::new(ImportState::default())),
             sync_state: Arc::new(Mutex::new(SyncState::default())),
             gamelog_state: Arc::new(Mutex::new(gamelog_state)),
@@ -4646,10 +4650,8 @@ impl LauncherApp {
                                     if auth_expired {
                                         ui.add_space(spacing::SPACE_4);
                                         if ui.button("🔗 Reconnect MaMo account").clicked() {
-                                            let _ = std::process::Command::new("cmd")
-                                                .args(["/c", "start", MAMO_WEBSITE_URL])
-                                                .spawn();
                                             self.current_tab = Tab::Setup;
+                                            self.setup_scroll_to_account = true;
                                         }
                                     }
                                 }
@@ -6581,7 +6583,11 @@ impl LauncherApp {
     }
 
     fn render_setup_tab(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
-        egui::ScrollArea::vertical().show(ui, |ui| {
+        let mut scroll = egui::ScrollArea::vertical();
+        if std::mem::take(&mut self.setup_scroll_to_account) {
+            scroll = scroll.vertical_scroll_offset(0.0);
+        }
+        scroll.show(ui, |ui| {
             let (forge_path_input, forge_path_valid, status_message) = {
                 let s = self.settings_state.lock().unwrap();
                 (s.forge_path_input.clone(), s.forge_path_valid, s.status_message.clone())
