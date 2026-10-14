@@ -2133,7 +2133,7 @@ fn archive_deck_with_prefix(deck_path: &std::path::Path) -> Result<PathBuf> {
 // ==================== MaMo Reference Deck Sync ====================
 
 /// Card payload for MaMo reference deck synchronization
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SyncReferenceCard {
     pub name: String,
     pub amount: u32,
@@ -2769,6 +2769,208 @@ pub fn get_deck_directory_display() -> String {
         Ok(path) => path.to_string_lossy().to_string(),
         Err(_) => "Unknown".to_string(),
     }
+}
+
+// ==================== Local Deck Files -> MaMo Reference Decks ====================
+
+/// A Forge `.dck` file reduced to what `POST /api/decks/sync-external-reference` needs.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct ParsedForgeDeck {
+    pub name: String,
+    pub commanders: Vec<SyncReferenceCard>,
+    pub maincards: Vec<SyncReferenceCard>,
+}
+
+/// Parses the `[metadata]` name and the `[Commander]` / `[Main]` sections of a Forge `.dck`
+/// file. Card lines look like `1 Sol Ring|C21|12` (set and collector number are optional and
+/// dropped: MaMo resolves card names to Oracle IDs server-side). Returns `None` when the file
+/// has no name or no main-deck cards.
+pub(crate) fn parse_forge_dck(content: &str) -> Option<ParsedForgeDeck> {
+    let mut name: Option<String> = None;
+    let mut section = String::new();
+    let mut commanders = Vec::new();
+    let mut maincards = Vec::new();
+
+    for line in content.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if line.starts_with('[') && line.ends_with(']') {
+            section = line[1..line.len() - 1].trim().to_lowercase();
+            continue;
+        }
+        match section.as_str() {
+            "metadata" => {
+                if let Some((key, value)) = line.split_once('=') {
+                    if key.trim().eq_ignore_ascii_case("name") && !value.trim().is_empty() {
+                        name = Some(value.trim().to_string());
+                    }
+                }
+            }
+            "commander" | "main" => {
+                let Some((qty, rest)) = line.split_once(' ') else { continue };
+                let Ok(amount) = qty.trim().parse::<u32>() else { continue };
+                let card_name = rest.split('|').next().unwrap_or("").trim();
+                if card_name.is_empty() || amount == 0 {
+                    continue;
+                }
+                let card = SyncReferenceCard {
+                    name: card_name.to_string(),
+                    amount,
+                    oracle_id: None,
+                };
+                if section == "commander" {
+                    commanders.push(card);
+                } else {
+                    maincards.push(card);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    if maincards.is_empty() {
+        return None;
+    }
+    Some(ParsedForgeDeck {
+        name: name?,
+        commanders,
+        maincards,
+    })
+}
+
+/// Reduces a Forge deck name like `Author - Deck Name (2026-04-09)` to `Deck Name`, which is
+/// how the deck is named in MaMo.
+fn strip_deck_name_decoration(name: &str) -> String {
+    let mut n = name.trim();
+    if n.ends_with(')') {
+        if let Some(idx) = n.rfind(" (") {
+            let inner = &n[idx + 2..n.len() - 1];
+            if inner.len() == 10 && inner.chars().all(|c| c.is_ascii_digit() || c == '-') {
+                n = &n[..idx];
+            }
+        }
+    }
+    if let Some((_, rest)) = n.split_once(" - ") {
+        n = rest;
+    }
+    n.trim().to_string()
+}
+
+/// Outcome of pushing local deck files to MaMo as reference decks.
+#[derive(Debug, Clone, Default)]
+pub struct LocalDeckPushSummary {
+    /// Names of decks that were registered (or updated) in MaMo.
+    pub pushed: Vec<String>,
+    /// Files left alone: already in MaMo, synced from a site under its own URL, or unreadable.
+    pub skipped: usize,
+    /// `(deck name, error)` for decks the backend rejected.
+    pub failed: Vec<(String, String)>,
+}
+
+impl LocalDeckPushSummary {
+    pub fn message(&self) -> String {
+        format!(
+            "Local decks: {} pushed to MaMo as reference, {} skipped, {} failed",
+            self.pushed.len(),
+            self.skipped,
+            self.failed.len()
+        )
+    }
+}
+
+/// Pushes every `.dck` file in the Forge deck folder that MaMo does not know yet to the MaMo
+/// account as a reference deck, so it can be picked as an archenemy / playtest opponent.
+///
+/// Skipped: the bundled dummy defender, files synced from Moxfield/Archidekt/Deckstats (those
+/// are registered under their site URL by the regular sync), and files whose deck name already
+/// exists in the account (own or reference) so downloaded MaMo decks are not duplicated.
+///
+/// ponytail: de-duplication is by deck name (`fetch_my_decks`), so a local edit of a deck that
+/// is already in MaMo is not re-pushed. Upgrade path: send a content hash and let the backend
+/// create a revision when it changed.
+pub async fn push_local_decks_as_reference() -> Result<LocalDeckPushSummary> {
+    let settings = Settings::load()?;
+    let token = settings
+        .auth_token
+        .clone()
+        .or_else(|| settings.gamelog_config.auth_token.clone())
+        .ok_or_else(|| anyhow::anyhow!("Not signed in to MaMo - connect your account first"))?;
+    let api_url = if settings.gamelog_config.api_url.is_empty() {
+        MAMO_API_URL.to_string()
+    } else {
+        settings.gamelog_config.api_url.clone()
+    };
+
+    let known_names: std::collections::HashSet<String> =
+        crate::gamelog::fetch_my_decks(&settings.gamelog_config)
+            .await
+            .context("Could not load your MaMo decks to avoid duplicates")?
+            .into_iter()
+            .map(|d| d.deck_name.trim().to_lowercase())
+            .collect();
+
+    let deck_dir = get_deck_directory()?;
+    let mut summary = LocalDeckPushSummary::default();
+    let entries = match fs::read_dir(&deck_dir) {
+        Ok(entries) => entries,
+        Err(_) => return Ok(summary), // no deck folder yet: nothing to push
+    };
+
+    let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let is_dck = path.is_file()
+            && path
+                .extension()
+                .map(|e| e.eq_ignore_ascii_case("dck"))
+                .unwrap_or(false);
+        if !is_dck {
+            continue;
+        }
+        let stem = path.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
+        let from_site = ["Moxfield - ", "Archidekt - ", "Deckstats - "]
+            .iter()
+            .any(|p| stem.starts_with(p));
+        if stem == DUMMY_DEFENDER_DECK_NAME || from_site {
+            summary.skipped += 1;
+            continue;
+        }
+        let Some(parsed) = fs::read_to_string(&path).ok().and_then(|c| parse_forge_dck(&c)) else {
+            summary.skipped += 1;
+            continue;
+        };
+        let deck_name = strip_deck_name_decoration(&parsed.name);
+        if deck_name.is_empty()
+            || known_names.contains(&deck_name.to_lowercase())
+            || known_names.contains(&parsed.name.trim().to_lowercase())
+        {
+            summary.skipped += 1;
+            continue;
+        }
+
+        let payload = SyncReferenceDeckPayload {
+            deck_id: None,
+            name: deck_name.clone(),
+            // The backend keys reference decks on (user, source_url); a stable per-file URL
+            // keeps a repeated push from creating a second deck.
+            source_url: Some(format!("forge-file://{}", stem)),
+            source_type: Some("file".to_string()),
+            source_date: Some(today.clone()),
+            commanders: parsed.commanders,
+            maincards: parsed.maincards,
+        };
+        match sync_deck_to_mamo_as_reference(&payload, &token, &api_url).await {
+            Ok(_) => summary.pushed.push(deck_name),
+            Err(e) => {
+                warn!("Failed to push local deck '{}' to MaMo: {}", deck_name, e);
+                summary.failed.push((deck_name, e.to_string()));
+            }
+        }
+    }
+
+    Ok(summary)
 }
 
 /// Name (stem, without .dck) of the bundled standard AI opponent deck.
@@ -3934,6 +4136,20 @@ Name=Example Commander Deck
         assert!(res1.is_ok(), "Food for Thought sync failed: {:?}", res1.err());
         let res2 = sync_moxfield_deck_with_mamo_id("oR2h0X7tREyhBBW3AlC8tw", None).await;
         assert!(res2.is_ok(), "Yuna's Grand Journey sync failed: {:?}", res2.err());
+    }
+
+    #[test]
+    fn parse_forge_dck_reads_name_commander_and_main() {
+        let dck = "[metadata]\nName=Me - Wall Deck (2026-04-09)\n\n[Commander]\n1 Arcades, the Strategist|M19\n\n[Main]\n1 Sol Ring|C21|12\n3 Plains\n\n[Sideboard]\n1 Ignored Card\n";
+        let parsed = parse_forge_dck(dck).expect("deck should parse");
+        assert_eq!(parsed.name, "Me - Wall Deck (2026-04-09)");
+        assert_eq!(parsed.commanders.len(), 1);
+        assert_eq!(parsed.commanders[0].name, "Arcades, the Strategist");
+        assert_eq!(parsed.maincards.len(), 2);
+        assert_eq!(parsed.maincards[0].name, "Sol Ring");
+        assert_eq!(parsed.maincards[1].amount, 3);
+        assert_eq!(strip_deck_name_decoration(&parsed.name), "Wall Deck");
+        assert!(parse_forge_dck("[metadata]\nName=Empty\n").is_none());
     }
 }
 

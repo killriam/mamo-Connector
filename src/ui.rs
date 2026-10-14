@@ -5386,6 +5386,14 @@ impl LauncherApp {
             settings.sync_as_reference_decks = sync_as_ref;
             let _ = settings.save();
         }
+
+        if ui
+            .add_enabled(!is_syncing, egui::Button::new("📤 Push local decks to MaMo as Reference"))
+            .on_hover_text("Registers .dck files from your Forge deck folder that MaMo does not know yet as Reference Decks, so they can be picked as an archenemy / playtest opponent")
+            .clicked()
+        {
+            self.push_local_decks(ctx);
+        }
         
         // Add dialog
         if show_add_dialog {
@@ -5710,6 +5718,28 @@ impl LauncherApp {
         }
     }
 
+    fn push_local_decks(&mut self, ctx: &egui::Context) {
+        let sync_state_clone = Arc::clone(&self.sync_state);
+        let ctx_clone = ctx.clone();
+        {
+            let mut state = self.sync_state.lock().unwrap();
+            state.is_syncing = true;
+            state.sync_message = Some("Pushing local decks to MaMo...".to_string());
+        }
+        tokio::spawn(async move {
+            let message = match crate::deck::push_local_decks_as_reference().await {
+                Ok(summary) => summary.message(),
+                Err(e) => format!("Push failed: {}", e),
+            };
+            {
+                let mut state = sync_state_clone.lock().unwrap();
+                state.is_syncing = false;
+                state.sync_message = Some(message);
+            }
+            ctx_clone.request_repaint();
+        });
+    }
+
     fn sync_all_decks(&mut self, ctx: &egui::Context) {
         let settings_clone = Arc::clone(&self.settings);
         let sync_state_clone = Arc::clone(&self.sync_state);
@@ -5785,14 +5815,24 @@ impl LauncherApp {
             let updated = all_results.iter().filter(|r| r.status == SyncStatus::Updated).count();
             let new = all_results.iter().filter(|r| r.status == SyncStatus::NewDownloaded).count();
             let failed = all_results.iter().filter(|r| r.status == SyncStatus::Failed).count();
+
+            let push_local = settings_clone.lock().unwrap().sync_as_reference_decks;
+            let local_note = if push_local {
+                match crate::deck::push_local_decks_as_reference().await {
+                    Ok(summary) => format!(" | {}", summary.message()),
+                    Err(e) => format!(" | Local deck push failed: {}", e),
+                }
+            } else {
+                String::new()
+            };
             
             {
                 let mut state = sync_state_clone.lock().unwrap();
                 state.is_syncing = false;
                 state.sync_results = all_results;
                 state.sync_message = Some(format!(
-                    "Sync complete: {} updated, {} new, {} failed",
-                    updated, new, failed
+                    "Sync complete: {} updated, {} new, {} failed{}",
+                    updated, new, failed, local_note
                 ));
             }
             
