@@ -515,6 +515,17 @@ fn force_constructed_view_in_preferences() {
 }
 
 fn forge_launch_args(deck_name: Option<&str>, deck2_name: Option<&str>) -> Vec<String> {
+    forge_launch_args_with_options(deck_name, deck2_name, false)
+}
+
+/// Same as `forge_launch_args`, plus Forge's `--guarantee-cards-under-test` flag. The flag only
+/// affects Player 1 and only decks that carry CardsUnderTest, so it is only sent together with
+/// a `--deck`.
+fn forge_launch_args_with_options(
+    deck_name: Option<&str>,
+    deck2_name: Option<&str>,
+    guarantee_cards_under_test: bool,
+) -> Vec<String> {
     let mut args = vec!["gui".to_string(), "--format".to_string(), "commander".to_string()];
     if let Some(deck) = deck_name {
         args.push("--deck".to_string());
@@ -523,6 +534,9 @@ fn forge_launch_args(deck_name: Option<&str>, deck2_name: Option<&str>) -> Vec<S
     if let Some(deck2) = deck2_name {
         args.push("--deck2".to_string());
         args.push(deck2.to_string());
+    }
+    if guarantee_cards_under_test && deck_name.is_some() {
+        args.push("--guarantee-cards-under-test".to_string());
     }
     args
 }
@@ -606,6 +620,17 @@ fn spawn_and_verify(
 /// For JAR builds the command becomes:
 ///   java ... -jar <forge.jar> gui --format commander [--deck <name>] [--deck2 <name2>]
 pub fn launch_forge(forge_path: &str, deck_name: Option<&str>, deck2_name: Option<&str>) -> Result<ForgeLaunchResult> {
+    launch_forge_with_options(forge_path, deck_name, deck2_name, false)
+}
+
+/// `launch_forge` plus `guarantee_cards_under_test`: passes `--guarantee-cards-under-test` so
+/// Forge starts with the deck's tagged cards-under-test guaranteed in the opening hand.
+pub fn launch_forge_with_options(
+    forge_path: &str,
+    deck_name: Option<&str>,
+    deck2_name: Option<&str>,
+    guarantee_cards_under_test: bool,
+) -> Result<ForgeLaunchResult> {
     let forge_path_buf = PathBuf::from(forge_path);
     debug!("[launch_forge] Input forge_path: {}", forge_path);
     debug!("[launch_forge] Input deck_name: {:?}", deck_name);
@@ -697,7 +722,7 @@ pub fn launch_forge(forge_path: &str, deck_name: Option<&str>, deck2_name: Optio
                 debug!("[launch_forge] Setting working directory: {}", dir.display());
                 cmd.current_dir(dir);
             }
-            cmd.args(forge_launch_args(deck_name, deck2_name));
+            cmd.args(forge_launch_args_with_options(deck_name, deck2_name, guarantee_cards_under_test));
             cmd
         }
         "exe" | "cmd" | "bat" => {
@@ -717,7 +742,7 @@ pub fn launch_forge(forge_path: &str, deck_name: Option<&str>, deck2_name: Optio
                 // line — so it needs the same args as every other launch path. This branch
                 // previously passed none at all, which is why a specific deck never got
                 // pre-selected when Forge was installed as an .exe.
-                cmd.args(forge_launch_args(deck_name, deck2_name));
+                cmd.args(forge_launch_args_with_options(deck_name, deck2_name, guarantee_cards_under_test));
                 cmd.creation_flags(DETACHED_PROCESS);
                 debug!("[launch_forge] Using DETACHED_PROCESS flag");
                 cmd
@@ -738,6 +763,9 @@ pub fn launch_forge(forge_path: &str, deck_name: Option<&str>, deck2_name: Optio
                     debug!("[launch_forge] Adding --deck2 argument: {}", deck2);
                     cmd.arg("--deck2").arg(deck2);
                 }
+                if guarantee_cards_under_test && deck_name.is_some() {
+                    cmd.arg("--guarantee-cards-under-test");
+                }
                 cmd
             }
         }
@@ -754,6 +782,9 @@ pub fn launch_forge(forge_path: &str, deck_name: Option<&str>, deck2_name: Optio
                 if let Some(deck2) = deck2_name {
                     debug!("[launch_forge] Adding --deck2 argument for macOS: {}", deck2);
                     cmd.arg("--deck2").arg(deck2);
+                }
+                if guarantee_cards_under_test && deck_name.is_some() {
+                    cmd.arg("--guarantee-cards-under-test");
                 }
             }
             cmd
@@ -773,6 +804,9 @@ pub fn launch_forge(forge_path: &str, deck_name: Option<&str>, deck2_name: Optio
                 debug!("[launch_forge] Adding --deck2 argument: {}", deck2);
                 cmd.arg("--deck2").arg(deck2);
             }
+            if guarantee_cards_under_test && deck_name.is_some() {
+                cmd.arg("--guarantee-cards-under-test");
+            }
             cmd
         }
         _ => {
@@ -789,6 +823,9 @@ pub fn launch_forge(forge_path: &str, deck_name: Option<&str>, deck2_name: Optio
             if let Some(deck2) = deck2_name {
                 debug!("[launch_forge] Adding --deck2 argument: {}", deck2);
                 cmd.arg("--deck2").arg(deck2);
+            }
+            if guarantee_cards_under_test && deck_name.is_some() {
+                cmd.arg("--guarantee-cards-under-test");
             }
             cmd
         }
@@ -986,6 +1023,15 @@ fn extract_deck_name_from_file(path_str: &str) -> Option<String> {
 /// or plain deck names. The internal deck name is extracted from the .dck file header if possible,
 /// falling back to the file stem, and passed to Forge as `--deck` / `--deck2`.
 pub fn launch_forge_from_settings(deck_path: Option<&str>, deck2_path: Option<&str>) -> Result<ForgeLaunchResult> {
+    launch_forge_from_settings_with_options(deck_path, deck2_path, false)
+}
+
+/// `launch_forge_from_settings` plus Forge's `--guarantee-cards-under-test` flag.
+pub fn launch_forge_from_settings_with_options(
+    deck_path: Option<&str>,
+    deck2_path: Option<&str>,
+    guarantee_cards_under_test: bool,
+) -> Result<ForgeLaunchResult> {
     // Log if Forge is already running, but do not skip launch
     if is_forge_window_open() {
         info!("Forge is already running (window detected), but will attempt to launch again.");
@@ -1025,7 +1071,12 @@ pub fn launch_forge_from_settings(deck_path: Option<&str>, deck2_path: Option<&s
         })
     });
 
-    launch_forge(&forge_path, deck_name.as_deref(), deck2_name.as_deref())
+    launch_forge_with_options(
+        &forge_path,
+        deck_name.as_deref(),
+        deck2_name.as_deref(),
+        guarantee_cards_under_test,
+    )
 }
 
 /// Get the Forge deck directory (where decks should be saved).
@@ -1201,6 +1252,31 @@ mod tests {
     fn forge_launch_args_one_deck() {
         assert_eq!(
             forge_launch_args(Some("Aggro"), None),
+            vec!["gui", "--format", "commander", "--deck", "Aggro"]
+        );
+    }
+
+    #[test]
+    fn forge_launch_args_guarantee_flag_needs_a_deck() {
+        assert_eq!(
+            forge_launch_args_with_options(Some("Aggro"), Some("Control"), true),
+            vec![
+                "gui",
+                "--format",
+                "commander",
+                "--deck",
+                "Aggro",
+                "--deck2",
+                "Control",
+                "--guarantee-cards-under-test"
+            ]
+        );
+        assert_eq!(
+            forge_launch_args_with_options(None, None, true),
+            vec!["gui", "--format", "commander"]
+        );
+        assert_eq!(
+            forge_launch_args_with_options(Some("Aggro"), None, false),
             vec!["gui", "--format", "commander", "--deck", "Aggro"]
         );
     }

@@ -3,7 +3,7 @@ use std::sync::{Arc, Mutex};
 use crate::deeplink::Deeplink;
 use crate::deck::{create_deck_from_id, create_deck_from_moxfield, create_deck_from_mamo, create_deck_from_mamo_with_progress, create_deck_and_scenario_for_forge, get_deck_directory, DeckCreationResult, DeckSyncResult, SyncStatus, sync_moxfield_deck_with_mamo_id, parse_moxfield_url, UserDecksImportResult, ProgressCallback};
 use crate::user_decks::{self, RemoteDeck, UserDeckSource};
-use crate::forge::{launch_forge_from_settings, launch_forge_replay, ForgeLaunchResult};
+use crate::forge::{launch_forge_from_settings, launch_forge_from_settings_with_options, launch_forge_replay, ForgeLaunchResult};
 use crate::gamelog::{download_replay_content, save_replay_to_forge_dir, ScenarioSyncResult, sync_forge_scenario_file, sync_all_scenario_files};
 use crate::settings::Settings;
 use crate::simulation::{run_simulation_for_deck, run_replay_verification, post_simulation_report, SimulationResult, ReplayVerificationResult};
@@ -582,6 +582,12 @@ async fn handle_launch_forge_with_logger(deeplink: &Deeplink, log_collector: Opt
 
     log(&format!("Launch Forge command - deck_id: {:?}", deck_id));
 
+    // "Mark cards to test" playtests ask Forge to guarantee the deck's cards under test.
+    let guarantee_cards_under_test = get_parameter(&deeplink.params, "guaranteeCardsUnderTest")
+        .or_else(|| get_parameter(&deeplink.params, "guarantee_cards_under_test"))
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+
     // Resolve deck2 path: an explicit name/id from the deeplink wins; otherwise fall back to
     // this deck's configured archenemy deck, then a random pick from the curated opponent-deck
     // pool, so "just press Play" never requires manually configuring an opponent inside Forge's
@@ -620,7 +626,11 @@ async fn handle_launch_forge_with_logger(deeplink: &Deeplink, log_collector: Opt
                             .map(|p| p.to_string_lossy().to_string());
 
                         log("Launching Forge with deck...");
-                        let forge_result = launch_forge_from_settings(deck_path_str.as_deref(), deck2_path.as_deref());
+                        let forge_result = launch_forge_from_settings_with_options(
+                            deck_path_str.as_deref(),
+                            deck2_path.as_deref(),
+                            guarantee_cards_under_test,
+                        );
                         match forge_result {
                             Ok(forge_res) => {
                                 if forge_res.success {
@@ -681,7 +691,11 @@ async fn handle_launch_forge_with_logger(deeplink: &Deeplink, log_collector: Opt
 
     // Launch Forge (without deck download, or deck already exists)
     log("Launching Forge...");
-    match launch_forge_from_settings(deck_path.as_deref(), deck2_path.as_deref()) {
+    match launch_forge_from_settings_with_options(
+        deck_path.as_deref(),
+        deck2_path.as_deref(),
+        guarantee_cards_under_test,
+    ) {
         Ok(result) => {
             if result.success {
                 log("Forge launched successfully!");
