@@ -342,7 +342,11 @@ async fn handle_playtest_with_scenario(deeplink: &Deeplink, log_collector: Optio
 
     let deck_path_str = result.deck_path.as_ref().map(|p| p.to_string_lossy().to_string());
     log("Launching Forge with scenario deck...");
-    let deck2_path = resolve_opponent_deck_path(Some(&deck_id), None, None, &log).await;
+    // An explicit opponent from the deeplink (the Playtest dialog's Opponent deck selector)
+    // wins; otherwise the deck's archenemy, then the curated pool.
+    let deck2_id = get_parameter(&deeplink.params, "deck2Id")
+        .or_else(|| get_parameter(&deeplink.params, "deck2_id"));
+    let deck2_path = resolve_opponent_deck_path(Some(&deck_id), deck2_id, None, &log).await;
     match launch_forge_from_settings(deck_path_str.as_deref(), deck2_path.as_deref()) {
         Ok(forge_res) => CommandResult::DeckCreatedAndLaunched(result, forge_res),
         Err(e) => {
