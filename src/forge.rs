@@ -514,6 +514,7 @@ fn force_constructed_view_in_preferences() {
     }
 }
 
+#[allow(dead_code)] // kept as the plain form of forge_launch_args_with_options (used by tests)
 fn forge_launch_args(deck_name: Option<&str>, deck2_name: Option<&str>) -> Vec<String> {
     forge_launch_args_with_options(deck_name, deck2_name, false)
 }
@@ -619,6 +620,7 @@ fn spawn_and_verify(
 ///
 /// For JAR builds the command becomes:
 ///   java ... -jar <forge.jar> gui --format commander [--deck <name>] [--deck2 <name2>]
+#[allow(dead_code)] // plain form of launch_forge_with_options
 pub fn launch_forge(forge_path: &str, deck_name: Option<&str>, deck2_name: Option<&str>) -> Result<ForgeLaunchResult> {
     launch_forge_with_options(forge_path, deck_name, deck2_name, false)
 }

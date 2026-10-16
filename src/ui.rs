@@ -1347,6 +1347,10 @@ struct LauncherApp {
     gamelog_state: Arc<Mutex<GameLogState>>,
     settings_state: Arc<Mutex<SettingsState>>,
     activity_log: Arc<Mutex<ActivityLogState>>,
+    /// Result of the last bulk deck import (e.g. "Sync All via Connector" for a creator) as
+    /// `(message, success)`. Shown as a card above the Play tab's Activity timeline until
+    /// dismissed, so the outcome is visible without opening the log at the bottom.
+    deck_sync_notice: Arc<Mutex<Option<(String, bool)>>>,
     settings: Arc<Mutex<Settings>>,
     last_pending_check: Instant,
     /// Whether we have a pending initial deeplink to process (set once, consumed on first update)
@@ -1650,6 +1654,7 @@ impl LauncherApp {
             gamelog_state: Arc::new(Mutex::new(gamelog_state)),
             settings_state: Arc::new(Mutex::new(settings_state)),
             activity_log: Arc::new(Mutex::new(activity_log)),
+            deck_sync_notice: Arc::new(Mutex::new(None)),
             settings: Arc::new(Mutex::new(settings)),
             last_pending_check: Instant::now(),
             pending_initial_deeplink,
@@ -2358,6 +2363,7 @@ impl LauncherApp {
         let settings_state = self.settings_state.clone();
         let activity_log = self.activity_log.clone();
         let activity_log_for_polling = self.activity_log.clone();
+        let deck_sync_notice = Arc::clone(&self.deck_sync_notice);
         let forge_pid = self.forge_pid.clone();
         let forge_monitoring_since = self.forge_monitoring_since.clone();
         let play_session = Arc::clone(&self.play_session);
@@ -2451,6 +2457,9 @@ impl LauncherApp {
                     }
                     commands::CommandResult::UserDecksImported(result) => {
                         log.log_info(&result.message);
+                        if let Ok(mut notice) = deck_sync_notice.lock() {
+                            *notice = Some((result.message.clone(), result.success));
+                        }
                     }
                     commands::CommandResult::UserDecksList(decks) => {
                         log.log_info(format!("Found {} decks", decks.len()));
@@ -4583,6 +4592,28 @@ impl LauncherApp {
             // what's happening right now is highlighted, earlier ones are marked done, later
             // ones stay pending. This is the same story whether the session was started here or
             // from the MaMo website.
+            let deck_sync_notice = self.deck_sync_notice.lock().unwrap().clone();
+            if let Some((message, success)) = deck_sync_notice {
+                let (fill, stroke, text_color) = if success {
+                    (egui::Color32::from_rgb(227, 247, 236), egui::Color32::from_rgb(23, 145, 90), egui::Color32::from_rgb(15, 90, 60))
+                } else {
+                    (egui::Color32::from_rgb(255, 243, 224), egui::Color32::from_rgb(230, 126, 34), egui::Color32::from_rgb(120, 66, 18))
+                };
+                egui::Frame::default()
+                    .fill(fill)
+                    .stroke(egui::Stroke::new(1.0, stroke))
+                    .inner_margin(egui::Margin::same(spacing::SPACE_10))
+                    .rounding(spacing::SPACE_6)
+                    .show(ui, |ui| {
+                        ui.label(egui::RichText::new("Deck sync finished").strong().color(text_color));
+                        ui.label(egui::RichText::new(&message).small().color(text_color));
+                        if ui.small_button("Dismiss").clicked() {
+                            *self.deck_sync_notice.lock().unwrap() = None;
+                        }
+                    });
+                ui.add_space(spacing::SPACE_6);
+            }
+
             ui.group(|ui| {
                 ui.label(egui::RichText::new("Activity").strong());
                 ui.label(

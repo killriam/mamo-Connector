@@ -413,10 +413,14 @@ pub async fn create_deck_from_moxfield(deck_id: &str) -> Result<DeckCreationResu
     let (deck_path, _archived) = write_deck_file(&full_name, &forge_content).await
         .context("Failed to create deck file")?;
     
-    Ok(DeckCreationResult::success(
-        format!("Successfully created deck '{}' at {:?}", full_name, deck_path),
-        deck_path,
-    ))
+    // Imports used to stop at the Forge file, so decks imported in bulk (e.g. "Sync All via
+    // Connector" for a creator) never showed up in MaMo. Register them like a regular sync does.
+    let mamo_note = register_moxfield_reference(&deck, deck_id, None).await;
+    let message = match mamo_note {
+        Some(note) => format!("Successfully created deck '{}' at {:?} [{}]", full_name, deck_path, note),
+        None => format!("Successfully created deck '{}' at {:?}", full_name, deck_path),
+    };
+    Ok(DeckCreationResult::success(message, deck_path))
 }
 
 /// Fetch user decks directly from Moxfield using curl (bypasses Cloudflare)
@@ -2307,6 +2311,71 @@ fn with_mamo_note(mut result: DeckSyncResult, note: Option<String>) -> DeckSyncR
     result
 }
 
+/// Marker text of a successful reference registration; `count_reference_registrations` looks
+/// for it in the per-deck result messages.
+const REFERENCE_CREATED_NOTE: &str = "Imported to MaMo as reference deck";
+const REFERENCE_UPDATED_PREFIX: &str = "MaMo reference updated";
+
+/// How many of `results` were registered (or updated) as MaMo reference decks.
+pub fn count_reference_registrations(results: &[DeckCreationResult]) -> usize {
+    results
+        .iter()
+        .filter(|r| r.message.contains(REFERENCE_CREATED_NOTE) || r.message.contains(REFERENCE_UPDATED_PREFIX))
+        .count()
+}
+
+/// Registers a Moxfield deck in MaMo as a reference deck (keyed on its Moxfield URL, so a later
+/// sync updates it instead of duplicating) when "Import & update synced decks as Reference
+/// Decks" is on and the account is connected. Best-effort: returns a short note on success and
+/// `None` when disabled, signed out, or the backend refused.
+async fn register_moxfield_reference(
+    deck: &MoxfieldFullDeck,
+    deck_id: &str,
+    mamo_deck_id: Option<&str>,
+) -> Option<String> {
+    let settings = Settings::load().ok()?;
+    if !settings.sync_as_reference_decks {
+        return None;
+    }
+    let token = settings.auth_token.as_ref().or(settings.gamelog_config.auth_token.as_ref())?;
+    let api_url = if settings.gamelog_config.api_url.is_empty() {
+        MAMO_API_URL
+    } else {
+        &settings.gamelog_config.api_url
+    };
+
+    let payload = SyncReferenceDeckPayload {
+        deck_id: mamo_deck_id.map(|s| s.to_string()),
+        name: deck.name.clone(),
+        source_url: Some(format!("https://www.moxfield.com/decks/{}", deck_id)),
+        source_type: Some("moxfield".to_string()),
+        source_date: deck.last_updated_at_utc.clone(),
+        commanders: extract_moxfield_cards(deck.get_commanders_value()),
+        maincards: extract_moxfield_cards(deck.get_mainboard_value()),
+    };
+
+    match sync_deck_to_mamo_as_reference(&payload, token, api_url).await {
+        Ok(resp) => {
+            info!(
+                "MaMo reference deck sync for '{}': action={:?}, revision={:?}",
+                deck.name, resp.action, resp.revision
+            );
+            match resp.action.as_deref() {
+                Some("created") => Some(REFERENCE_CREATED_NOTE.to_string()),
+                Some("updated") => {
+                    let rev = resp.revision.map(|r| format!("Rev {}", r)).unwrap_or_else(|| "new rev".to_string());
+                    Some(format!("{} ({})", REFERENCE_UPDATED_PREFIX, rev))
+                }
+                _ => None,
+            }
+        }
+        Err(e) => {
+            warn!("Failed to sync reference deck to MaMo for '{}': {}", deck.name, e);
+            None
+        }
+    }
+}
+
 /// Sync a single Moxfield deck - check if newer and update if needed
 pub async fn sync_moxfield_deck(deck_id: &str) -> Result<DeckSyncResult> {
     sync_moxfield_deck_with_mamo_id(deck_id, None).await
@@ -2327,57 +2396,7 @@ pub async fn sync_moxfield_deck_with_mamo_id(
         .with_context(|| "Failed to parse Moxfield deck response")?;
     
     // Optional reference deck sync to MaMo
-    let mut mamo_sync_note: Option<String> = None;
-    if let Ok(settings) = Settings::load() {
-        if settings.sync_as_reference_decks {
-            let token = settings.auth_token.as_ref().or(settings.gamelog_config.auth_token.as_ref());
-            if let Some(token) = token {
-                let api_url = if settings.gamelog_config.api_url.is_empty() {
-                    MAMO_API_URL
-                } else {
-                    &settings.gamelog_config.api_url
-                };
-
-                let commanders = extract_moxfield_cards(deck.get_commanders_value());
-                let maincards = extract_moxfield_cards(deck.get_mainboard_value());
-                let source_url = format!("https://www.moxfield.com/decks/{}", deck_id);
-
-                let payload = SyncReferenceDeckPayload {
-                    deck_id: mamo_deck_id.map(|s| s.to_string()),
-                    name: deck.name.clone(),
-                    source_url: Some(source_url),
-                    source_type: Some("moxfield".to_string()),
-                    source_date: deck.last_updated_at_utc.clone(),
-                    commanders,
-                    maincards,
-                };
-
-                match sync_deck_to_mamo_as_reference(&payload, token, api_url).await {
-                    Ok(resp) => {
-                        info!(
-                            "MaMo reference deck sync for '{}': action={:?}, revision={:?}",
-                            deck.name, resp.action, resp.revision
-                        );
-                        if let Some(action) = resp.action {
-                            match action.as_str() {
-                                "created" => {
-                                    mamo_sync_note = Some("Imported to MaMo as reference deck".to_string());
-                                }
-                                "updated" => {
-                                    let rev = resp.revision.map(|r| format!("Rev {}", r)).unwrap_or_else(|| "new rev".to_string());
-                                    mamo_sync_note = Some(format!("MaMo reference updated ({})", rev));
-                                }
-                                _ => {}
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        warn!("Failed to sync reference deck to MaMo for '{}': {}", deck.name, e);
-                    }
-                }
-            }
-        }
-    }
+    let mamo_sync_note = register_moxfield_reference(&deck, deck_id, mamo_deck_id).await;
 
     // Build the expected filename
     let author = deck.created_by_user.as_ref()
@@ -4150,6 +4169,21 @@ Name=Example Commander Deck
         assert_eq!(parsed.maincards[1].amount, 3);
         assert_eq!(strip_deck_name_decoration(&parsed.name), "Wall Deck");
         assert!(parse_forge_dck("[metadata]\nName=Empty\n").is_none());
+    }
+
+    #[test]
+    fn count_reference_registrations_counts_created_and_updated_only() {
+        let path = PathBuf::from("x.dck");
+        let created = DeckCreationResult::success(
+            format!("Successfully created deck 'A' at \"x.dck\" [{}]", REFERENCE_CREATED_NOTE),
+            path.clone(),
+        );
+        let updated = DeckCreationResult::success(
+            format!("Successfully created deck 'B' [{} (Rev 2)]", REFERENCE_UPDATED_PREFIX),
+            path.clone(),
+        );
+        let local_only = DeckCreationResult::success("Successfully created deck 'C'".to_string(), path);
+        assert_eq!(count_reference_registrations(&[created, updated, local_only]), 2);
     }
 }
 

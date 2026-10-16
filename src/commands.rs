@@ -1059,7 +1059,21 @@ async fn handle_import_user_decks(deeplink: &Deeplink) -> CommandResult {
     let settings = crate::settings::Settings::load().unwrap_or_default();
     let source = UserDeckSource::MoxfieldProfile(username);
     match user_decks::import_all(&source, &api_base_url, &settings).await {
-        Ok(result) => CommandResult::UserDecksImported(result),
+        Ok(mut result) => {
+            // Say what happened in MaMo too, not just in Forge's deck folder.
+            if matches!(source, UserDeckSource::MoxfieldProfile(_)) && !result.imported_decks.is_empty() {
+                let registered = crate::deck::count_reference_registrations(&result.imported_decks);
+                let note = if registered > 0 {
+                    format!("{} registered as reference decks in MaMo", registered)
+                } else if !settings.sync_as_reference_decks {
+                    "not added to MaMo: turn on 'Import & update synced decks as Reference Decks' in the Sync tab".to_string()
+                } else {
+                    "not added to MaMo: sign in to your MaMo account in the Setup tab".to_string()
+                };
+                result.message = format!("{} - {}", result.message, note);
+            }
+            CommandResult::UserDecksImported(result)
+        }
         Err(err) => {
             error!("Failed to import user decks: {:?}", err);
             CommandResult::Error(format!("Failed to import user decks: {}", err))
