@@ -2315,6 +2315,7 @@ fn with_mamo_note(mut result: DeckSyncResult, note: Option<String>) -> DeckSyncR
 /// for it in the per-deck result messages.
 const REFERENCE_CREATED_NOTE: &str = "Imported to MaMo as reference deck";
 const REFERENCE_UPDATED_PREFIX: &str = "MaMo reference updated";
+const REFERENCE_FAILED_PREFIX: &str = "MaMo registration failed";
 
 /// How many of `results` were registered (or updated) as MaMo reference decks.
 pub fn count_reference_registrations(results: &[DeckCreationResult]) -> usize {
@@ -2324,10 +2325,26 @@ pub fn count_reference_registrations(results: &[DeckCreationResult]) -> usize {
         .count()
 }
 
+/// The error text of the first deck whose MaMo registration failed (the backend's own reason,
+/// e.g. an expired login), so the import result can say why instead of guessing.
+pub fn first_reference_failure(results: &[DeckCreationResult]) -> Option<String> {
+    results.iter().find_map(|r| {
+        let start = r.message.find(REFERENCE_FAILED_PREFIX)?;
+        let tail = &r.message[start + REFERENCE_FAILED_PREFIX.len()..];
+        Some(tail.trim_start_matches(':').trim().trim_end_matches(']').trim().to_string())
+    })
+}
+
+/// How many of `results` failed to register in MaMo (token present, backend refused).
+pub fn count_reference_failures(results: &[DeckCreationResult]) -> usize {
+    results.iter().filter(|r| r.message.contains(REFERENCE_FAILED_PREFIX)).count()
+}
+
 /// Registers a Moxfield deck in MaMo as a reference deck (keyed on its Moxfield URL, so a later
 /// sync updates it instead of duplicating) when "Import & update synced decks as Reference
 /// Decks" is on and the account is connected. Best-effort: returns a short note on success and
-/// `None` when disabled, signed out, or the backend refused.
+/// `None` when disabled or signed out; a failed registration returns a note starting with
+/// `REFERENCE_FAILED_PREFIX` so callers can report the backend's reason.
 async fn register_moxfield_reference(
     deck: &MoxfieldFullDeck,
     deck_id: &str,
@@ -2371,7 +2388,7 @@ async fn register_moxfield_reference(
         }
         Err(e) => {
             warn!("Failed to sync reference deck to MaMo for '{}': {}", deck.name, e);
-            None
+            Some(format!("{}: {}", REFERENCE_FAILED_PREFIX, e))
         }
     }
 }
@@ -4184,6 +4201,21 @@ Name=Example Commander Deck
         );
         let local_only = DeckCreationResult::success("Successfully created deck 'C'".to_string(), path);
         assert_eq!(count_reference_registrations(&[created, updated, local_only]), 2);
+    }
+
+    #[test]
+    fn reference_failures_are_counted_and_explained() {
+        let path = PathBuf::from("x.dck");
+        let failed = DeckCreationResult::success(
+            format!("Successfully created deck 'A' [{}: Backend returned status 401]", REFERENCE_FAILED_PREFIX),
+            path.clone(),
+        );
+        let ok = DeckCreationResult::success("Successfully created deck 'B'".to_string(), path);
+        assert_eq!(count_reference_failures(&[failed.clone(), ok.clone()]), 1);
+        assert_eq!(
+            first_reference_failure(&[ok, failed]).as_deref(),
+            Some("Backend returned status 401")
+        );
     }
 }
 

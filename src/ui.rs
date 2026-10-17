@@ -2043,6 +2043,9 @@ impl eframe::App for LauncherApp {
             self.render_prelaunch_update_dialog(ctx);
         }
 
+        // Result of a bulk deck import (stays until dismissed)
+        self.render_deck_sync_dialog(ctx);
+
         // Bottom panel: Activity Log (rendered BEFORE CentralPanel per egui rules)
         self.render_activity_panel(ctx);
         
@@ -3375,6 +3378,51 @@ impl LauncherApp {
 
     // ==================== Home Tab ====================
 
+    /// Modal shown after a bulk deck import (e.g. "Sync All via Connector"): says what happened
+    /// and that the user should switch back to the MaMo website. It stays open on every tab until
+    /// dismissed, so a sync that finishes while the window is minimized is not missed.
+    fn render_deck_sync_dialog(&mut self, ctx: &egui::Context) {
+        let notice = self.deck_sync_notice.lock().unwrap().clone();
+        let Some((message, success)) = notice else { return };
+
+        let mut dismiss = false;
+        let mut open_website = false;
+        egui::Window::new(if success { "✅ Deck sync finished" } else { "⚠ Deck sync finished with problems" })
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                ui.set_min_width(420.0);
+                ui.label(egui::RichText::new(&message).small());
+                ui.add_space(spacing::SPACE_10);
+                ui.label(
+                    egui::RichText::new(
+                        "Switch back to the MaMo website to see your decks. The page reloads its \
+                         deck list when you return to it (or use Refresh there).",
+                    )
+                    .strong(),
+                );
+                ui.add_space(spacing::SPACE_14);
+                ui.horizontal(|ui| {
+                    if ui.button("Open MaMo website").clicked() {
+                        open_website = true;
+                    }
+                    if ui.button("Dismiss").clicked() {
+                        dismiss = true;
+                    }
+                });
+            });
+
+        if open_website {
+            let url = format!("{}/ListOfDecks", MAMO_WEBSITE_URL);
+            let _ = std::process::Command::new("cmd").args(["/c", "start", &url]).spawn();
+            dismiss = true;
+        }
+        if dismiss {
+            *self.deck_sync_notice.lock().unwrap() = None;
+        }
+    }
+
     fn render_confirm_dialog(&mut self, ctx: &egui::Context) {
         let action = match &self.confirm_action {
             Some(a) => a.clone(),
@@ -4592,28 +4640,6 @@ impl LauncherApp {
             // what's happening right now is highlighted, earlier ones are marked done, later
             // ones stay pending. This is the same story whether the session was started here or
             // from the MaMo website.
-            let deck_sync_notice = self.deck_sync_notice.lock().unwrap().clone();
-            if let Some((message, success)) = deck_sync_notice {
-                let (fill, stroke, text_color) = if success {
-                    (egui::Color32::from_rgb(227, 247, 236), egui::Color32::from_rgb(23, 145, 90), egui::Color32::from_rgb(15, 90, 60))
-                } else {
-                    (egui::Color32::from_rgb(255, 243, 224), egui::Color32::from_rgb(230, 126, 34), egui::Color32::from_rgb(120, 66, 18))
-                };
-                egui::Frame::default()
-                    .fill(fill)
-                    .stroke(egui::Stroke::new(1.0, stroke))
-                    .inner_margin(egui::Margin::same(spacing::SPACE_10))
-                    .rounding(spacing::SPACE_6)
-                    .show(ui, |ui| {
-                        ui.label(egui::RichText::new("Deck sync finished").strong().color(text_color));
-                        ui.label(egui::RichText::new(&message).small().color(text_color));
-                        if ui.small_button("Dismiss").clicked() {
-                            *self.deck_sync_notice.lock().unwrap() = None;
-                        }
-                    });
-                ui.add_space(spacing::SPACE_6);
-            }
-
             ui.group(|ui| {
                 ui.label(egui::RichText::new("Activity").strong());
                 ui.label(

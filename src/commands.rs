@@ -1063,12 +1063,19 @@ async fn handle_import_user_decks(deeplink: &Deeplink) -> CommandResult {
             // Say what happened in MaMo too, not just in Forge's deck folder.
             if matches!(source, UserDeckSource::MoxfieldProfile(_)) && !result.imported_decks.is_empty() {
                 let registered = crate::deck::count_reference_registrations(&result.imported_decks);
-                let note = if registered > 0 {
+                let failed = crate::deck::count_reference_failures(&result.imported_decks);
+                let signed_in = settings.auth_token.is_some() || settings.gamelog_config.auth_token.is_some();
+                let note = if failed > 0 {
+                    let reason = crate::deck::first_reference_failure(&result.imported_decks).unwrap_or_default();
+                    format!("{} registered in MaMo, {} failed: {}", registered, failed, reason)
+                } else if registered > 0 {
                     format!("{} registered as reference decks in MaMo", registered)
                 } else if !settings.sync_as_reference_decks {
                     "not added to MaMo: turn on 'Import & update synced decks as Reference Decks' in the Sync tab".to_string()
-                } else {
+                } else if !signed_in {
                     "not added to MaMo: sign in to your MaMo account in the Setup tab".to_string()
+                } else {
+                    "not added to MaMo (no reference decks were created; see the activity log)".to_string()
                 };
                 result.message = format!("{} - {}", result.message, note);
             }
