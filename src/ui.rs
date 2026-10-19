@@ -1091,6 +1091,10 @@ struct GameLogState {
     /// scan interval so a sustained outage doesn't retry every 5 minutes forever;
     /// reset to 0 as soon as a scan uploads something or has zero failures.
     consecutive_auto_scan_failures: u32,
+    /// The Activity log already carries the "MaMo connection expired" hint, so repeated
+    /// auto-scans (which keep failing the same way until the user reconnects) don't append
+    /// the same red line every cycle. Cleared as soon as a scan no longer fails with it.
+    auth_expired_logged: bool,
     /// Processed files set
     processed_files: HashSet<String>,
     /// User's decks from backend (for deck mapping)
@@ -6168,6 +6172,12 @@ impl LauncherApp {
                         let _ = save_processed_files(&new_processed);
                         
                         // Log to activity
+                        let auth_expired = summary
+                            .results
+                            .iter()
+                            .any(|r| !r.success && friendly_upload_error(&r.message).1);
+                        let already_logged = state.auth_expired_logged;
+                        state.auth_expired_logged = auth_expired;
                         if summary.auth_missing {
                             // Not connected — gentle hint, not a red error
                             if summary.new_files > 0 {
@@ -6180,7 +6190,16 @@ impl LauncherApp {
                             }
                         } else if summary.new_files > 0 || summary.failed_uploads > 0 {
                             if let Ok(mut log) = activity_log.lock() {
-                                if summary.failed_uploads > 0 && summary.successfully_uploaded == 0 {
+                                if auth_expired {
+                                    // Plain sentence + next step instead of the raw sentinel; once
+                                    // per expiry, not once per scan cycle.
+                                    if !already_logged {
+                                        log.log_error(format!(
+                                            "\u{1F511} Your MaMo connection expired — {} game log(s) are waiting. Open Setup and click Reconnect to upload them.",
+                                            summary.failed_uploads.max(summary.new_files)
+                                        ));
+                                    }
+                                } else if summary.failed_uploads > 0 && summary.successfully_uploaded == 0 {
                                     // All failed — find first distinct error message
                                     let first_error = summary.results.iter()
                                         .find(|r| !r.success)
