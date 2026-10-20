@@ -3020,7 +3020,24 @@ impl LauncherApp {
         let mut action_start_download = false;
         let mut action_apply_staged = false;
 
+        // Gentle ~1.3 Hz pulse (0..=1) so the update prompt draws the eye without strobing.
+        // Only the "update available/ready" prompt pulses; other states stay static.
+        let is_update_prompt = matches!(dialog.state, PreLaunchUpdateState::Prompt { .. });
+        let pulse = if is_update_prompt {
+            ctx.request_repaint_after(std::time::Duration::from_millis(33));
+            let t = ctx.input(|i| i.time) as f32;
+            (t * std::f32::consts::TAU * 1.3).sin() * 0.5 + 0.5
+        } else {
+            0.0
+        };
+        let mut frame = egui::Frame::window(&ctx.style());
+        if is_update_prompt {
+            let glow = colors::PRIMARY_ACTION.gamma_multiply(0.35 + 0.65 * pulse);
+            frame = frame.stroke(egui::Stroke::new(1.0 + 2.5 * pulse, glow));
+        }
+
         egui::Window::new(title)
+            .frame(frame)
             .collapsible(false)
             .resizable(false)
             .vscroll(true)
@@ -3141,9 +3158,10 @@ impl LauncherApp {
                             }
                             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                                 let btn_text = if is_staged { "Install & Launch" } else { "Update & Launch" };
+                                let btn_fill = colors::PRIMARY_ACTION.lerp_to_gamma(egui::Color32::from_rgb(90, 175, 255), pulse);
                                 if ui.add(
                                     egui::Button::new(egui::RichText::new(btn_text).color(egui::Color32::WHITE).strong())
-                                        .fill(colors::PRIMARY_ACTION),
+                                        .fill(btn_fill),
                                 ).clicked() {
                                     if is_staged {
                                         action_apply_staged = true;
