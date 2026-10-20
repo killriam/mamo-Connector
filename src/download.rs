@@ -293,6 +293,14 @@ pub fn read_res_meta_updated_at(dest_dir: &Path) -> Option<String> {
     read_meta_updated_at_from(&res_meta_path(dest_dir))
 }
 
+/// True when the jar's sidecar records the portable zip as its source asset.
+fn local_jar_sidecar_is_from_zip(jar_path: &Path) -> bool {
+    std::fs::read(asset_meta_path(jar_path))
+        .ok()
+        .and_then(|b| serde_json::from_slice::<ForgeAssetMeta>(&b).ok())
+        .is_some_and(|m| m.name.ends_with(".zip"))
+}
+
 /// True when `remote_updated_at` doesn't match whatever's recorded locally — i.e. a sidecar
 /// that's missing (`None`) is always treated as stale, never as "assume current".
 fn is_stale(local_updated_at: Option<&str>, remote_updated_at: &str) -> bool {
@@ -488,12 +496,8 @@ pub async fn download_forge_portable(
 
     let jar_path = crate::forge::resolve_latest_forge_jar(dest_dir)
         .context("Extracted MaMo Forge bundle but couldn't find a Forge jar inside it")?;
-    let jar_meta_asset = ForgeAsset {
-        download_url: asset.download_url.clone(),
-        name: jar_path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| asset.name.clone()),
-        updated_at: asset.updated_at.clone(),
-    };
-    write_asset_meta(&jar_path, &jar_meta_asset);
+    // Keep the zip's name so `local_jar_sidecar_is_from_zip` recognises where this jar came from.
+    write_asset_meta(&jar_path, &asset);
     // res/ was just extracted from this exact zip — record it as the freshness baseline so a
     // later check doesn't immediately think res/ is behind.
     write_res_meta(dest_dir, &asset);
@@ -532,6 +536,14 @@ pub async fn resolve_forge_update_needed(dest_dir: &Path) -> Result<Option<Forge
         return Ok(Some(remote_zip));
     }
 
+    // A jar installed from the portable zip carries the *zip's* `updated_at` in its sidecar (the
+    // zip and the bare jar are separate release assets whose timestamps differ by seconds). Since
+    // `res/` was just confirmed current against that same zip, such a jar is current too —
+    // comparing it against the bare jar's timestamp would look stale forever and re-download
+    // the whole bundle on every check.
+    if local_jar_sidecar_is_from_zip(&local_jar) {
+        return Ok(None);
+    }
     let local_jar_updated_at = read_asset_meta_updated_at(&local_jar);
     let remote_jar = resolve_forge_jar_url()
         .await
@@ -1135,6 +1147,27 @@ mod tests {
             Some("2026-08-14T08:55:25Z".to_string())
         );
 
+        let _ = std::fs::remove_dir_all(&dest);
+    }
+
+    #[test]
+    fn jar_sidecar_from_zip_is_recognised() {
+        let dest = std::env::temp_dir().join("mamo-connector-jar-sidecar-from-zip-test");
+        let _ = std::fs::remove_dir_all(&dest);
+        std::fs::create_dir_all(&dest).unwrap();
+        let jar = dest.join("forge-gui-desktop-x-jar-with-dependencies.jar");
+
+        assert!(!local_jar_sidecar_is_from_zip(&jar)); // no sidecar
+        let mut asset = ForgeAsset {
+            download_url: "https://example.com/x.jar".to_string(),
+            name: "forge-gui-desktop-x-jar-with-dependencies.jar".to_string(),
+            updated_at: "2026-10-20T17:13:11Z".to_string(),
+        };
+        write_asset_meta(&jar, &asset);
+        assert!(!local_jar_sidecar_is_from_zip(&jar));
+        asset.name = "MaMoForge-portable.zip".to_string();
+        write_asset_meta(&jar, &asset);
+        assert!(local_jar_sidecar_is_from_zip(&jar));
         let _ = std::fs::remove_dir_all(&dest);
     }
 
