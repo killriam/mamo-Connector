@@ -1996,10 +1996,15 @@ impl eframe::App for LauncherApp {
                 };
 
                 if should_scan && has_token {
-                    let consecutive_failures =
-                        self.gamelog_state.lock().unwrap().consecutive_auto_scan_failures;
+                    let (consecutive_failures, auth_expired_logged) = {
+                        let state = self.gamelog_state.lock().unwrap();
+                        (state.consecutive_auto_scan_failures, state.auth_expired_logged)
+                    };
                     if let Ok(mut log) = self.activity_log.lock() {
-                        if consecutive_failures > 0 {
+                        if auth_expired_logged {
+                            // The expiry notice already told the user to Reconnect; repeating
+                            // "retrying after N failed attempts" every cycle is just noise.
+                        } else if consecutive_failures > 0 {
                             log.log_info(format!(
                                 "\u{1F504} Auto gamelog scan (retrying after {} failed attempt(s), backed off to {}m)",
                                 consecutive_failures,
