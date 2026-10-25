@@ -2157,6 +2157,10 @@ pub struct SyncReferenceDeckPayload {
     pub source_type: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub source_date: Option<String>,
+    /// Original author on the source site (e.g. the Moxfield creator); the backend uses it to
+    /// name the reference deck's Forge export instead of the importing MaMo account.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_author: Option<String>,
     pub commanders: Vec<SyncReferenceCard>,
     pub maincards: Vec<SyncReferenceCard>,
 }
@@ -2367,6 +2371,7 @@ async fn register_moxfield_reference(
         source_url: Some(format!("https://www.moxfield.com/decks/{}", deck_id)),
         source_type: Some("moxfield".to_string()),
         source_date: deck.last_updated_at_utc.clone(),
+        source_author: deck.created_by_user.as_ref().map(|u| u.user_name.clone()),
         commanders: extract_moxfield_cards(deck.get_commanders_value()),
         maincards: extract_moxfield_cards(deck.get_mainboard_value()),
     };
@@ -2518,6 +2523,7 @@ pub async fn sync_archidekt_deck(deck_id: &str) -> Result<DeckSyncResult> {
                     source_url: Some(source_url),
                     source_type: Some("archidekt".to_string()),
                     source_date: deck.updated_at.clone(),
+                    source_author: deck.owner.as_ref().map(|o| o.username.clone()),
                     commanders,
                     maincards,
                 };
@@ -2627,6 +2633,7 @@ pub async fn sync_deckstats_deck(owner_id: &str, deck_id: &str) -> Result<DeckSy
                     source_url: Some(source_url),
                     source_type: Some("deckstats".to_string()),
                     source_date: Some(date.clone()),
+                    source_author: None,
                     commanders,
                     maincards,
                 };

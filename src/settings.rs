@@ -140,6 +140,10 @@ pub struct Settings {
     /// relaunch doesn't forget it. `None` for "— none —" explicitly picked, or never set.
     #[serde(default)]
     pub last_selected_deck_id: Option<String>,
+    /// Folder containing the proxy-printing tool (`proxy_gui.py`), used by the print-proxies
+    /// deeplink. `None` = look next to the Connector and in Documents\MaMo.
+    #[serde(default)]
+    pub proxy_printing_path: Option<String>,
 }
 
 impl Default for Settings {
@@ -157,6 +161,7 @@ impl Default for Settings {
             simulation_opponent_deck: default_simulation_opponent_deck(),
             sync_as_reference_decks: true,
             last_selected_deck_id: None,
+            proxy_printing_path: None,
         }
     }
 }

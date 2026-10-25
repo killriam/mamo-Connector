@@ -1564,6 +1564,13 @@ impl LauncherApp {
                 CommandResult::ScenarioSynced(results) => {
                     activity_log.log_success(format!("Synchronized {} scenario(s) to MaMo", results.len()));
                 }
+                CommandResult::ProxyPrint(result) => {
+                    if result.success {
+                        activity_log.log_success(&result.message);
+                    } else {
+                        activity_log.log_error(&result.message);
+                    }
+                }
                 CommandResult::DeckSynced(deck_result) => {
                     if deck_result.is_success() {
                         activity_log.log_success(&deck_result.message);
@@ -2502,6 +2509,13 @@ impl LauncherApp {
                     }
                     commands::CommandResult::ScenarioSynced(results) => {
                         log.log_success(format!("Synchronized {} scenario(s) to MaMo", results.len()));
+                    }
+                    commands::CommandResult::ProxyPrint(result) => {
+                        if result.success {
+                            log.log_success(&result.message);
+                        } else {
+                            log.log_error(&result.message);
+                        }
                     }
                     commands::CommandResult::DeckSynced(deck_result) => {
                         if deck_result.is_success() {

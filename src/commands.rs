@@ -5,6 +5,7 @@ use crate::deck::{create_deck_from_id, create_deck_from_moxfield, create_deck_fr
 use crate::user_decks::{self, RemoteDeck, UserDeckSource};
 use crate::forge::{launch_forge_from_settings, launch_forge_from_settings_with_options, launch_forge_replay, ForgeLaunchResult};
 use crate::gamelog::{download_replay_content, save_replay_to_forge_dir, ScenarioSyncResult, sync_forge_scenario_file, sync_all_scenario_files};
+use crate::proxy_print::{handle_print_proxies, ProxyPrintResult};
 use crate::settings::Settings;
 use crate::simulation::{run_simulation_for_deck, run_replay_verification, post_simulation_report, SimulationResult, ReplayVerificationResult};
 
@@ -34,6 +35,7 @@ pub enum CommandResult {
     AuthTokenSaved(String),  // Success message
     SimulationCompleted(SimulationResult),
     ScenarioSynced(Vec<ScenarioSyncResult>),
+    ProxyPrint(ProxyPrintResult),
     UnknownAction(String),
     MissingParameters(String),
     Error(String),
@@ -56,6 +58,7 @@ impl CommandResult {
             CommandResult::AuthTokenSaved(msg) => msg.clone(),
             CommandResult::SimulationCompleted(result) => result.message.clone(),
             CommandResult::ScenarioSynced(results) => format!("Synchronized {} scenario(s)", results.len()),
+            CommandResult::ProxyPrint(result) => result.message.clone(),
             CommandResult::UnknownAction(action) => format!("Unknown action: {}", action),
             CommandResult::MissingParameters(msg) => format!("Missing parameters: {}", msg),
             CommandResult::Error(msg) => format!("Error: {}", msg),
@@ -77,6 +80,7 @@ impl CommandResult {
             CommandResult::AuthTokenSaved(_) => true,
             CommandResult::SimulationCompleted(result) => result.success,
             CommandResult::ScenarioSynced(_) => true,
+            CommandResult::ProxyPrint(result) => result.success,
             _ => false,
         }
     }
@@ -138,6 +142,7 @@ pub async fn handle_command_with_logger(deeplink: &Deeplink, log_collector: Opti
         "launch-forge" | "launchforge" | "playtest" => handle_launch_forge_with_logger(deeplink, log_collector).await, // Launch Forge with deck
         "replay-game" | "replaygame" => handle_replay_game_with_logger(deeplink, log_collector).await, // Replay a game in Forge
         "verify-replay-game" | "verifyreplaygame" => handle_verify_replay_game_with_logger(deeplink, log_collector).await, // Headless: verify a replay reconstructs & plays without the GUI
+        "print-proxies" | "printproxies" => handle_print_proxies(deeplink).await, // Build proxy/marker XML via backend and open the print GUI
         "import-user-decks" | "importuserdecks" => handle_import_user_decks(deeplink).await,
         "list-user-decks" | "listuserdecks" => handle_list_user_decks(deeplink).await,
         "auth" | "authenticate" | "connect" => handle_auth(deeplink).await, // Auth token: mamoConnector://auth?token=xxx
