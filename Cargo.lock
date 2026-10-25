@@ -2453,7 +2453,7 @@ dependencies = [
 
 [[package]]
 name = "mamo-connector"
-version = "0.3.34"
+version = "0.3.35"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
