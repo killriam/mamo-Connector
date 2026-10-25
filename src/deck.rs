@@ -2344,6 +2344,40 @@ pub fn count_reference_failures(results: &[DeckCreationResult]) -> usize {
     results.iter().filter(|r| r.message.contains(REFERENCE_FAILED_PREFIX)).count()
 }
 
+/// Backend error code for an expired login JWT (see `authenticateToken` in new-backend).
+const TOKEN_EXPIRED_CODE: &str = "TOKEN_EXPIRED";
+
+/// True when every failed registration was rejected for an expired login, i.e. re-logging in on
+/// the website fixes all of them.
+pub fn reference_failures_are_expired_login(results: &[DeckCreationResult]) -> bool {
+    let mut failed = results.iter().filter(|r| r.message.contains(REFERENCE_FAILED_PREFIX)).peekable();
+    failed.peek().is_some() && failed.all(|r| r.message.contains(TOKEN_EXPIRED_CODE))
+}
+
+/// True when `token` is a JWT whose `exp` is in the past. Opaque tokens (e.g. personal access
+/// tokens) and unparseable ones return false: the backend stays the authority on those.
+pub fn jwt_is_expired(token: &str) -> bool {
+    use base64::Engine;
+    let Some(payload) = token.split('.').nth(1) else { return false };
+    let Ok(bytes) = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(payload.trim_end_matches('=')) else {
+        return false;
+    };
+    let Ok(json) = serde_json::from_slice::<serde_json::Value>(&bytes) else { return false };
+    json.get("exp")
+        .and_then(|e| e.as_i64())
+        .is_some_and(|exp| exp <= chrono::Utc::now().timestamp())
+}
+
+/// Set once a registration is rejected for an expired login, so the rest of the same bulk
+/// import skips the HTTP call instead of failing the same way for every deck.
+// ponytail: process-wide flag, fine while one bulk import runs at a time; a per-import context
+// would be needed for concurrent imports. Reset by `reset_login_expired` at the start of an import.
+static LOGIN_EXPIRED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn reset_login_expired() {
+    LOGIN_EXPIRED.store(false, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// Registers a Moxfield deck in MaMo as a reference deck (keyed on its Moxfield URL, so a later
 /// sync updates it instead of duplicating) when "Import & update synced decks as Reference
 /// Decks" is on and the account is connected. Best-effort: returns a short note on success and
@@ -2376,6 +2410,10 @@ async fn register_moxfield_reference(
         maincards: extract_moxfield_cards(deck.get_mainboard_value()),
     };
 
+    if LOGIN_EXPIRED.load(std::sync::atomic::Ordering::Relaxed) || jwt_is_expired(token) {
+        return Some(format!("{}: {} (login expired)", REFERENCE_FAILED_PREFIX, TOKEN_EXPIRED_CODE));
+    }
+
     match sync_deck_to_mamo_as_reference(&payload, token, api_url).await {
         Ok(resp) => {
             info!(
@@ -2393,6 +2431,9 @@ async fn register_moxfield_reference(
         }
         Err(e) => {
             warn!("Failed to sync reference deck to MaMo for '{}': {}", deck.name, e);
+            if e.to_string().contains(TOKEN_EXPIRED_CODE) {
+                LOGIN_EXPIRED.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
             Some(format!("{}: {}", REFERENCE_FAILED_PREFIX, e))
         }
     }
@@ -4225,5 +4266,27 @@ Name=Example Commander Deck
             Some("Backend returned status 401")
         );
     }
-}
 
+    #[test]
+    fn expired_login_is_detected_from_jwt_exp_and_failure_messages() {
+        use base64::Engine;
+        let jwt = |exp: i64| {
+            let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(format!("{{\"exp\":{}}}", exp));
+            format!("h.{}.s", payload)
+        };
+        let now = chrono::Utc::now().timestamp();
+        assert!(jwt_is_expired(&jwt(now - 60)));
+        assert!(!jwt_is_expired(&jwt(now + 3600)));
+        assert!(!jwt_is_expired("opaque-pat"));
+
+        let path = PathBuf::from("x.dck");
+        let expired = DeckCreationResult::success(
+            format!("A [{}: Backend returned status 401 Unauthorized: {{\"code\":\"TOKEN_EXPIRED\"}}]", REFERENCE_FAILED_PREFIX),
+            path.clone(),
+        );
+        let other = DeckCreationResult::success(format!("B [{}: status 500]", REFERENCE_FAILED_PREFIX), path);
+        assert!(reference_failures_are_expired_login(&[expired.clone()]));
+        assert!(!reference_failures_are_expired_login(&[expired, other]));
+        assert!(!reference_failures_are_expired_login(&[]));
+    }
+}

@@ -3454,10 +3454,13 @@ impl LauncherApp {
                 ui.label(egui::RichText::new(&message).small());
                 ui.add_space(spacing::SPACE_10);
                 ui.label(
-                    egui::RichText::new(
+                    egui::RichText::new(if success {
                         "Switch back to the MaMo website to see your decks. The page reloads its \
-                         deck list when you return to it (or use Refresh there).",
-                    )
+                         deck list when you return to it (or use Refresh there)."
+                    } else {
+                        "Some decks were not added to MaMo (see above). Fix that, then run the \
+                         sync again from the MaMo website."
+                    })
                     .strong(),
                 );
                 ui.add_space(spacing::SPACE_14);

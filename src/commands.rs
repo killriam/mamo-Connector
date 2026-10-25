@@ -1048,8 +1048,11 @@ async fn handle_import_user_decks(deeplink: &Deeplink) -> CommandResult {
         .unwrap_or_else(|| crate::deck::MAMO_API_URL.to_string());
 
     // Save auth token from deeplink if provided
+    // An already-expired token must not replace a stored one that may still work.
     if let Some(token) = get_parameter(&deeplink.params, "token") {
-        if !token.is_empty() {
+        if crate::deck::jwt_is_expired(&token) {
+            warn!("Ignoring expired auth token from import-user-decks deeplink");
+        } else if !token.is_empty() {
             if let Ok(mut settings) = crate::settings::Settings::load() {
                 if settings.auth_token.as_deref() != Some(&token) {
                     settings.auth_token = Some(token);
@@ -1060,6 +1063,7 @@ async fn handle_import_user_decks(deeplink: &Deeplink) -> CommandResult {
     }
 
     info!("Importing decks for user: {} from API: {}", username, api_base_url);
+    crate::deck::reset_login_expired();
 
     let settings = crate::settings::Settings::load().unwrap_or_default();
     let source = UserDeckSource::MoxfieldProfile(username);
@@ -1070,7 +1074,14 @@ async fn handle_import_user_decks(deeplink: &Deeplink) -> CommandResult {
                 let registered = crate::deck::count_reference_registrations(&result.imported_decks);
                 let failed = crate::deck::count_reference_failures(&result.imported_decks);
                 let signed_in = settings.auth_token.is_some() || settings.gamelog_config.auth_token.is_some();
-                let note = if failed > 0 {
+                let note = if failed > 0 && crate::deck::reference_failures_are_expired_login(&result.imported_decks) {
+                    result.success = false;
+                    format!(
+                        "0 registered in MaMo: your MaMo login has expired. Log in again on the MaMo website, then re-run the sync ({} decks were still saved locally)",
+                        failed
+                    )
+                } else if failed > 0 {
+                    result.success = false;
                     let reason = crate::deck::first_reference_failure(&result.imported_decks).unwrap_or_default();
                     format!("{} registered in MaMo, {} failed: {}", registered, failed, reason)
                 } else if registered > 0 {
