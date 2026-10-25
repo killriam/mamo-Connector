@@ -52,4 +52,62 @@ fn main() {
     println!("cargo:rustc-env=GIT_HASH={}{}", git_hash, dirty_suffix);
     println!("cargo:rustc-env=GIT_BRANCH={}", branch);
     println!("cargo:rustc-env=BUILD_TIME={}", build_time);
+
+    bundle_proxy_printing();
+}
+
+/// Embed the proxy-printing tool (sibling checkout `../proxy-printing`, top-level files only) so
+/// the Connector can install it locally without a network download. Generates
+/// `$OUT_DIR/proxy_printing_bundle.rs`; when the folder is missing the bundle is simply empty
+/// and the Setup tab reports "not bundled in this build".
+fn bundle_proxy_printing() {
+    use std::fmt::Write as _;
+
+    let src_dir = std::path::Path::new("..").join("proxy-printing");
+    println!("cargo:rerun-if-changed=../proxy-printing");
+
+    let mut entries: Vec<(String, std::path::PathBuf)> = Vec::new();
+    if let Ok(read_dir) = std::fs::read_dir(&src_dir) {
+        for entry in read_dir.flatten() {
+            let path = entry.path();
+            let name = entry.file_name().to_string_lossy().to_string();
+            let ext = path
+                .extension()
+                .map(|e| e.to_string_lossy().to_lowercase())
+                .unwrap_or_default();
+            if path.is_file() && !name.starts_with('.') && matches!(ext.as_str(), "py" | "bat" | "sla" | "txt" | "md") {
+                if let Ok(abs) = std::fs::canonicalize(&path) {
+                    println!("cargo:rerun-if-changed={}", path.display());
+                    entries.push((name, abs));
+                }
+            }
+        }
+    }
+    entries.sort();
+
+    // FNV-1a over names + contents: lets the Connector refresh an installed copy when it changes.
+    let mut hash: u64 = 0xcbf29ce484222325;
+    let mut feed = |bytes: &[u8]| {
+        for b in bytes {
+            hash ^= u64::from(*b);
+            hash = hash.wrapping_mul(0x100000001b3);
+        }
+    };
+    let mut code = String::from("pub static FILES: &[(&str, &[u8])] = &[
+");
+    for (name, abs) in &entries {
+        feed(name.as_bytes());
+        if let Ok(bytes) = std::fs::read(abs) {
+            feed(&bytes);
+        }
+        // `{:?}` escapes backslashes in the Windows path for the generated string literal.
+        let _ = writeln!(code, "    ({:?}, include_bytes!({:?})),", name, abs.to_string_lossy());
+    }
+    code.push_str("];
+");
+    let _ = writeln!(code, "pub const HASH: &str = \"{hash:016x}\";");
+
+    if let Ok(out_dir) = std::env::var("OUT_DIR") {
+        let _ = std::fs::write(std::path::Path::new(&out_dir).join("proxy_printing_bundle.rs"), code);
+    }
 }

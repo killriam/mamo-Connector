@@ -116,11 +116,8 @@ fn print_dir_candidates(settings: &Settings) -> Vec<PathBuf> {
             }
         }
     }
-    if let Some(docs) = dirs::document_dir() {
-        out.push(docs.join("MaMo").join("proxy-printing"));
-    }
-    if let Some(local) = dirs::data_local_dir() {
-        out.push(local.join("MaMo").join("proxy-printing"));
+    if let Some(dir) = crate::proxy_setup::default_install_dir() {
+        out.push(dir);
     }
     out
 }
@@ -133,6 +130,9 @@ fn launch_gui(print_dir: &Path, xml_files: &[PathBuf]) -> Result<()> {
     } else {
         &["python3", "python"]
     };
+    // Prefer the private venv created by the Connector's proxy-printing setup (has the packages).
+    let venv = crate::proxy_setup::venv_python(print_dir, true).map(|p| p.to_string_lossy().to_string());
+    let launchers: Vec<&str> = venv.iter().map(String::as_str).chain(launchers.iter().copied()).collect();
     let mut last_err = None;
     for launcher in launchers {
         let mut cmd = Command::new(launcher);
@@ -184,17 +184,25 @@ pub async fn handle_print_proxies(deeplink: &Deeplink) -> CommandResult {
     };
 
     // Fail early (before any network call) when there is nowhere to print from.
+    // The Connector's own copy is installed / refreshed on demand (no winget here — that is a
+    // Setup-tab action).
     let candidates = print_dir_candidates(&settings);
-    let Some(print_dir) = find_print_dir(&candidates) else {
-        return CommandResult::Error(format!(
-            "Print tool not found. Put the proxy-printing folder (with proxy_gui.py) next to the MaMo Connector, \
-             or set 'proxy_printing_path' in the Connector settings. Looked in: {}",
-            candidates
-                .iter()
-                .map(|p| p.display().to_string())
-                .collect::<Vec<_>>()
-                .join("; ")
-        ));
+    let mut print_dir = find_print_dir(&candidates);
+    let own_dir = crate::proxy_setup::default_install_dir();
+    if print_dir.is_none() || print_dir == own_dir {
+        match tokio::task::spawn_blocking(|| crate::proxy_setup::setup(&|m| info!("{m}"), false)).await {
+            Ok(Ok(outcome)) => print_dir = Some(outcome.dir),
+            Ok(Err(e)) if print_dir.is_none() => {
+                return CommandResult::Error(format!(
+                    "Proxy printing is not set up: {e:#}. Open the MaMo Connector → Setup → \"Set up proxy printing\"."
+                ));
+            }
+            Ok(Err(e)) => warn!("Could not refresh the bundled print tool: {e:#}"),
+            Err(e) => return CommandResult::Error(format!("Print tool setup crashed: {e}")),
+        }
+    }
+    let Some(print_dir) = print_dir else {
+        return CommandResult::Error("Print tool not found.".to_string());
     };
 
     let api_base = resolve_api_base(get_parameter(&deeplink.params, "api_url").as_deref());

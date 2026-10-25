@@ -133,6 +133,17 @@ struct UpdateCheckState {
     error: Option<String>,
 }
 
+/// State of the Setup tab's "Proxy printing" section (local print tool + Python environment).
+#[derive(Clone, Default)]
+struct PrintSetupState {
+    busy: bool,
+    /// Latest progress line while busy, or the success message afterwards.
+    message: Option<String>,
+    error: Option<String>,
+    /// Cached `proxy_setup::is_ready()` so the UI doesn't hit the disk every frame.
+    ready: bool,
+}
+
 /// A downloaded-but-not-yet-installed Forge update, waiting for Forge to not be running so it
 /// can be safely swapped into place (see the periodic check in `update()`).
 #[derive(Clone)]
@@ -1388,6 +1399,8 @@ struct LauncherApp {
     forge_local_decks: Vec<String>,
     /// Background version check result
     update_check: Arc<Mutex<UpdateCheckState>>,
+    /// Setup tab: local proxy-printing (print tool + Python venv) install state
+    print_setup: Arc<Mutex<PrintSetupState>>,
     /// Live progress while an in-place Connector update download is running
     connector_update_progress: Arc<Mutex<Option<DownloadProgress>>>,
     /// Set by the Connector update banner's Cancel button
@@ -1681,6 +1694,10 @@ impl LauncherApp {
             scenario_picker: Arc::new(Mutex::new(ScenarioPickerState::default())),
             forge_local_decks: Vec::new(),
             update_check,
+            print_setup: Arc::new(Mutex::new(PrintSetupState {
+                ready: crate::proxy_setup::is_ready(),
+                ..Default::default()
+            })),
             connector_update_progress,
             connector_update_cancelled,
             forge_update_check,
@@ -3555,6 +3572,10 @@ impl LauncherApp {
         if let Ok(dir) = get_settings_dir() {
             let _ = std::fs::remove_dir_all(&dir);
         }
+        // The locally installed print tool (scripts + Python venv) lives outside the settings dir.
+        if let Some(dir) = crate::proxy_setup::default_install_dir() {
+            let _ = std::fs::remove_dir_all(&dir);
+        }
 
         // Self-delete: spawn a script that waits for this process to exit, then deletes the exe
         #[cfg(windows)]
@@ -3745,6 +3766,50 @@ impl LauncherApp {
                 cancelled,
                 ctx,
             ));
+        });
+    }
+
+    /// "Set up proxy printing": installs the bundled print tool, a private Python venv and its
+    /// packages (and Python itself via winget when missing). Runs on a plain thread — it only
+    /// shells out and writes files, so no async runtime is needed.
+    fn trigger_print_setup(&mut self, ctx: &egui::Context) {
+        {
+            let mut s = self.print_setup.lock().unwrap();
+            if s.busy {
+                return;
+            }
+            s.busy = true;
+            s.error = None;
+            s.message = Some("Starting…".to_string());
+        }
+        let state = Arc::clone(&self.print_setup);
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let progress_state = Arc::clone(&state);
+            let progress_ctx = ctx.clone();
+            let progress = move |msg: &str| {
+                if let Ok(mut s) = progress_state.lock() {
+                    s.message = Some(msg.to_string());
+                }
+                progress_ctx.request_repaint();
+            };
+            let result = crate::proxy_setup::setup(&progress, true);
+            if let Ok(mut s) = state.lock() {
+                s.busy = false;
+                match result {
+                    Ok(outcome) => {
+                        s.ready = true;
+                        s.message = Some(outcome.message);
+                    }
+                    Err(e) => {
+                        log::error!("Proxy printing setup failed: {e:#}");
+                        s.ready = crate::proxy_setup::is_ready();
+                        s.message = None;
+                        s.error = Some(format!("{e:#}"));
+                    }
+                }
+            }
+            ctx.request_repaint();
         });
     }
 
@@ -7119,6 +7184,57 @@ impl LauncherApp {
                                 .spawn();
                         }
                     });
+                }
+            });
+
+            ui.add_space(spacing::SPACE_12);
+
+            // ── Proxy printing (local print tool) ─────────────────────────
+            ui.group(|ui| {
+                let (busy, message, error, ready) = {
+                    let s = self.print_setup.lock().unwrap();
+                    (s.busy, s.message.clone(), s.error.clone(), s.ready)
+                };
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new("Proxy printing").strong().size(type_scale::SUBHEADING));
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if busy {
+                            render_status_pill(ui, "Setting up…", PillStatus::Warning);
+                        } else if ready {
+                            render_status_pill(ui, "Ready", PillStatus::Success);
+                        } else if !crate::proxy_setup::bundle_available() {
+                            render_status_pill(ui, "Not in this build", PillStatus::Neutral);
+                        } else {
+                            render_status_pill(ui, "Not set up", PillStatus::Warning);
+                        }
+                    });
+                });
+                ui.add_space(spacing::SPACE_4);
+                ui.label(
+                    egui::RichText::new(
+                        "Installs the print tool and a private Python environment on this computer so \"Print with MaMo Connector\" on the website can open it. Needs Python 3.10+ (installed via winget if missing). Card-stock (Scribus) output additionally needs Scribus.",
+                    )
+                    .small()
+                    .weak(),
+                );
+                ui.add_space(spacing::SPACE_6);
+                ui.horizontal(|ui| {
+                    if busy {
+                        ui.spinner();
+                    } else if crate::proxy_setup::bundle_available()
+                        && ui
+                            .button(if ready { "Repair / update" } else { "Set up proxy printing" })
+                            .clicked()
+                    {
+                        self.trigger_print_setup(ctx);
+                    }
+                    if let Some(ref msg) = message {
+                        ui.label(egui::RichText::new(msg).small().weak());
+                    }
+                });
+                if let Some(ref err) = error {
+                    ui.add_space(spacing::SPACE_4);
+                    ui.label(egui::RichText::new(format!("Setup failed: {err}")).small().color(colors::ERROR));
                 }
             });
 

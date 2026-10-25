@@ -6,6 +6,7 @@ mod forge;
 mod gamelog;
 mod install;
 mod proxy_print;
+mod proxy_setup;
 mod registration;
 mod settings;
 mod simulation;

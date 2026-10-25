@@ -25,6 +25,12 @@ jobs:
           repository: killriam/mamo-sim
           path: mamo-sim
 
+      - name: Checkout proxy-printing (bundled into the Connector by build.rs)
+        uses: actions/checkout@v4
+        with:
+          repository: killriam/ProxyPrintingScriptCardSize
+          path: proxy-printing
+
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
         with:
