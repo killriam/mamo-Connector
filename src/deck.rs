@@ -3001,6 +3001,7 @@ pub async fn push_local_decks_as_reference() -> Result<LocalDeckPushSummary> {
             source_url: Some(format!("forge-file://{}", stem)),
             source_type: Some("file".to_string()),
             source_date: Some(today.clone()),
+            source_author: None,
             commanders: parsed.commanders,
             maincards: parsed.maincards,
         };
