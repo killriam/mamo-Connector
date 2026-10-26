@@ -78,16 +78,18 @@ pub fn resolve_api_base(requested: Option<&str>) -> String {
     }
 }
 
-/// Only plain `*.xml` file names are written: no separators, no traversal, no odd characters.
+/// Only plain `*.xml` file names are written: no path separators, no traversal, no characters
+/// Windows forbids. Deck names are free text (commas, apostrophes, umlauts …), so this is a
+/// deny-list of unsafe characters rather than an allow-list.
 pub fn is_safe_xml_filename(name: &str) -> bool {
     !name.is_empty()
         && name.len() <= 200
         && name.to_ascii_lowercase().ends_with(".xml")
         && !name.starts_with('.')
-        && name
-            .chars()
-            .all(|c| c.is_alphanumeric() || matches!(c, '_' | '-' | '.' | ' ' | '(' | ')'))
         && !name.contains("..")
+        && !name
+            .chars()
+            .any(|c| c.is_control() || matches!(c, '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|'))
 }
 
 /// First candidate directory that contains `proxy_gui.py`.
@@ -336,6 +338,12 @@ mod tests {
         assert!(!is_safe_xml_filename("deck.exe"));
         assert!(!is_safe_xml_filename(".hidden.xml"));
         assert!(!is_safe_xml_filename("a..b.xml"));
+        assert!(!is_safe_xml_filename("a:b.xml"));
+        assert!(!is_safe_xml_filename("a\0b.xml"));
+        assert!(!is_safe_xml_filename("a|b?.xml"));
+        // Real deck names: commas, apostrophes, non-ASCII.
+        assert!(is_safe_xml_filename("Niko,_blinking_Adventure_against_Fate_2026-10-26_missing_proxy.xml"));
+        assert!(is_safe_xml_filename("Atraxa's Jötun_2026-10-26_all_markers.xml"));
         assert!(!is_safe_xml_filename(""));
     }
 
