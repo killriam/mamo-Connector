@@ -108,7 +108,11 @@ pub async fn handle_command_with_logger(deeplink: &Deeplink, log_collector: Opti
     // so any subsequent network calls (e.g. deck downloads, simulations, or gamelog uploads)
     // use the current web app user's authentication context.
     if let Some(ref token) = deeplink.token {
-        if !token.is_empty() {
+        if crate::deck::jwt_is_expired(token) {
+            // Keep the stored token: it may still be valid, and an expired one fails every request.
+            warn!("Ignoring expired auth token from deeplink");
+            log("Ignoring the website's login token (expired). Log in again on the MaMo website.");
+        } else if !token.is_empty() {
             log("Updating authentication token from deeplink parameter...");
             match Settings::load() {
                 Ok(mut settings) => {
