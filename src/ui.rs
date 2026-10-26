@@ -7231,10 +7231,19 @@ impl LauncherApp {
                     {
                         self.trigger_print_setup(ctx);
                     }
-                    if let Some(ref msg) = message {
-                        ui.label(egui::RichText::new(msg).small().weak());
+                    if busy {
+                        if let Some(ref msg) = message {
+                            ui.label(egui::RichText::new(msg).small().weak());
+                        }
                     }
                 });
+                // Final message can be long (it contains the install path): own line, wrapped.
+                if !busy {
+                    if let Some(ref msg) = message {
+                        ui.add_space(spacing::SPACE_4);
+                        ui.add(egui::Label::new(egui::RichText::new(msg).small().weak()).wrap());
+                    }
+                }
                 if let Some(ref err) = error {
                     ui.add_space(spacing::SPACE_4);
                     ui.label(egui::RichText::new(format!("Setup failed: {err}")).small().color(colors::ERROR));
