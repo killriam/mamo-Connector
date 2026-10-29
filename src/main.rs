@@ -8,6 +8,7 @@ mod install;
 mod proxy_print;
 mod proxy_setup;
 mod registration;
+mod secrets;
 mod settings;
 mod simulation;
 mod ui;

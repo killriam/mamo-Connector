@@ -1,10 +1,11 @@
 use anyhow::{Context, Result};
-use log::info;
+use log::{info, warn};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
 
 use crate::gamelog::GameLogConfig;
+use crate::secrets::{self, SecretStore, ACCOUNT_API_TOKEN, ACCOUNT_GAMELOG_TOKEN};
 
 /// Type of saved link for synchronization
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -117,7 +118,8 @@ pub struct Settings {
     /// Game log reader configuration
     #[serde(default)]
     pub gamelog_config: GameLogConfig,
-    /// Authentication token for MaMo API (JWT)
+    /// Authentication token for MaMo API. In memory this is the live value; on disk it lives in
+    /// the OS credential store, and the settings file only holds it if the store refused it.
     #[serde(default)]
     pub auth_token: Option<String>,
     /// Moxfield API Bearer token (for syncing user decks — copy from browser dev tools)
@@ -144,6 +146,10 @@ pub struct Settings {
     /// deeplink. `None` = look next to the Connector and in Documents\MaMo.
     #[serde(default)]
     pub proxy_printing_path: Option<String>,
+    /// Set when the credential store could not be read at load time. `save` then leaves the
+    /// stored tokens alone, so a transient failure cannot wipe them.
+    #[serde(skip)]
+    secrets_unreadable: bool,
 }
 
 impl Default for Settings {
@@ -162,22 +168,92 @@ impl Default for Settings {
             sync_as_reference_decks: true,
             last_selected_deck_id: None,
             proxy_printing_path: None,
+            secrets_unreadable: false,
+        }
+    }
+}
+
+/// Fills `slot` from the credential store. A token still sitting in the settings file (older
+/// versions, or a store that refused an earlier write) is moved into the store instead.
+/// Returns true when a plaintext token was moved, i.e. the file should be rewritten.
+fn hydrate_slot(slot: &mut Option<String>, account: &str, store: &dyn SecretStore, unreadable: &mut bool) -> bool {
+    if let Some(token) = slot.as_deref().filter(|t| !t.is_empty()) {
+        return match store.set(account, token) {
+            Ok(()) => true,
+            Err(err) => {
+                warn!("Could not move '{}' into the credential store, keeping it in the settings file: {}", account, err);
+                false
+            }
+        };
+    }
+    match store.get(account) {
+        Ok(stored) => *slot = stored,
+        Err(err) => {
+            warn!("Could not read '{}' from the credential store: {}", account, err);
+            *unreadable = true;
+        }
+    }
+    false
+}
+
+/// Writes `slot` to the credential store and blanks it for the settings file. A token the store
+/// refuses stays in `slot`, so it is saved to the file rather than lost. An empty slot deletes
+/// the stored secret (a deliberate sign-out) unless the store was unreadable at load time.
+fn persist_slot(slot: &mut Option<String>, account: &str, store: &dyn SecretStore, unreadable: bool) {
+    match slot.as_deref().filter(|t| !t.is_empty()) {
+        Some(token) => match store.set(account, token) {
+            Ok(()) => *slot = None,
+            Err(err) => warn!("Could not store '{}' in the credential store, keeping it in the settings file: {}", account, err),
+        },
+        None => {
+            *slot = None;
+            if !unreadable {
+                if let Err(err) = store.delete(account) {
+                    warn!("Could not delete '{}' from the credential store: {}", account, err);
+                }
+            }
         }
     }
 }
 
 impl Settings {
+    /// Fills the in-memory tokens from `store`; returns true when plaintext tokens from the
+    /// settings file were moved into it and the file needs rewriting.
+    fn hydrate_secrets(&mut self, store: &dyn SecretStore) -> bool {
+        let mut unreadable = false;
+        let api = hydrate_slot(&mut self.auth_token, ACCOUNT_API_TOKEN, store, &mut unreadable);
+        let gamelog = hydrate_slot(&mut self.gamelog_config.auth_token, ACCOUNT_GAMELOG_TOKEN, store, &mut unreadable);
+        self.secrets_unreadable = unreadable;
+        api || gamelog
+    }
+
+    /// The copy that is serialized to disk: tokens the store accepted are blanked.
+    fn persisted_copy(&self, store: &dyn SecretStore) -> Settings {
+        let mut copy = self.clone();
+        persist_slot(&mut copy.auth_token, ACCOUNT_API_TOKEN, store, self.secrets_unreadable);
+        persist_slot(&mut copy.gamelog_config.auth_token, ACCOUNT_GAMELOG_TOKEN, store, self.secrets_unreadable);
+        copy
+    }
+
     /// Load settings from file, or create default if not exists
+    // ponytail: every load reads the credential store (two lookups); cache the tokens if load()
+    // ever ends up in a hot loop.
     pub fn load() -> Result<Self> {
         let path = get_settings_path()?;
-        
+
         if path.exists() {
             let content = fs::read_to_string(&path)
                 .with_context(|| format!("Failed to read settings from {:?}", path))?;
             let mut settings: Settings = serde_json::from_str(&content)
                 .with_context(|| "Failed to parse settings JSON")?;
             info!("Loaded settings with {} saved links", settings.saved_links.len());
-            
+
+            // Move plaintext tokens from older settings files into the credential store.
+            if settings.hydrate_secrets(secrets::default_store().as_ref()) {
+                info!("Moved the MaMo API tokens from the settings file into the credential store");
+                let _ = settings.save();
+            }
+
             // Migrate: ensure file_extensions uses JSON-only format
             // Old settings may have ["txt", "log"] from before the JSON-only change
             let has_json = settings.gamelog_config.file_extensions.iter().any(|e| e == "json");
@@ -191,7 +267,9 @@ impl Settings {
             Ok(settings)
         } else {
             info!("No settings file found, using defaults");
-            Ok(Settings::default())
+            let mut settings = Settings::default();
+            settings.hydrate_secrets(secrets::default_store().as_ref());
+            Ok(settings)
         }
     }
 
@@ -207,7 +285,7 @@ impl Settings {
             }
         }
 
-        let content = serde_json::to_string_pretty(self)
+        let content = serde_json::to_string_pretty(&self.persisted_copy(secrets::default_store().as_ref()))
             .with_context(|| "Failed to serialize settings")?;
         
         fs::write(&path, content)
@@ -367,5 +445,100 @@ mod tests {
         assert_eq!(parts[2].len(), 4);
         assert_eq!(parts[3].len(), 4);
         assert_eq!(parts[4].len(), 12);
+    }
+
+    #[derive(Default)]
+    struct MemStore {
+        data: std::cell::RefCell<std::collections::HashMap<String, String>>,
+        fail_get: bool,
+        fail_set: bool,
+    }
+
+    impl SecretStore for MemStore {
+        fn get(&self, account: &str) -> Result<Option<String>> {
+            if self.fail_get {
+                anyhow::bail!("store unreadable");
+            }
+            Ok(self.data.borrow().get(account).cloned())
+        }
+
+        fn set(&self, account: &str, value: &str) -> Result<()> {
+            if self.fail_set {
+                anyhow::bail!("store refuses writes");
+            }
+            self.data.borrow_mut().insert(account.to_string(), value.to_string());
+            Ok(())
+        }
+
+        fn delete(&self, account: &str) -> Result<()> {
+            self.data.borrow_mut().remove(account);
+            Ok(())
+        }
+    }
+
+    fn settings_with_tokens(api: Option<&str>, gamelog: Option<&str>) -> Settings {
+        let mut settings = Settings::default();
+        settings.auth_token = api.map(str::to_string);
+        settings.gamelog_config.auth_token = gamelog.map(str::to_string);
+        settings
+    }
+
+    #[test]
+    fn test_plaintext_tokens_move_into_the_store() {
+        let store = MemStore::default();
+        let mut settings = settings_with_tokens(Some("jwt-token"), Some("pat_gamelog"));
+
+        assert!(settings.hydrate_secrets(&store), "file must be rewritten after migration");
+        // the two tokens stay distinct: uploads keep using the credential they used before
+        assert_eq!(store.get(ACCOUNT_API_TOKEN).unwrap().as_deref(), Some("jwt-token"));
+        assert_eq!(store.get(ACCOUNT_GAMELOG_TOKEN).unwrap().as_deref(), Some("pat_gamelog"));
+        assert_eq!(settings.auth_token.as_deref(), Some("jwt-token"));
+
+        let on_disk = serde_json::to_string(&settings.persisted_copy(&store)).unwrap();
+        assert!(!on_disk.contains("jwt-token") && !on_disk.contains("pat_gamelog"));
+    }
+
+    #[test]
+    fn test_tokens_are_read_back_from_the_store() {
+        let store = MemStore::default();
+        store.set(ACCOUNT_API_TOKEN, "stored-api").unwrap();
+        let mut settings = settings_with_tokens(None, None);
+
+        assert!(!settings.hydrate_secrets(&store), "nothing to migrate");
+        assert_eq!(settings.auth_token.as_deref(), Some("stored-api"));
+        assert_eq!(settings.gamelog_config.auth_token, None);
+    }
+
+    #[test]
+    fn test_token_stays_in_file_when_store_refuses_writes() {
+        let store = MemStore { fail_set: true, ..Default::default() };
+        let mut settings = settings_with_tokens(Some("jwt-token"), None);
+
+        assert!(!settings.hydrate_secrets(&store));
+        let copy = settings.persisted_copy(&store);
+        assert_eq!(copy.auth_token.as_deref(), Some("jwt-token"));
+    }
+
+    #[test]
+    fn test_unreadable_store_is_not_wiped_by_a_save() {
+        let store = MemStore { fail_get: true, ..Default::default() };
+        store.data.borrow_mut().insert(ACCOUNT_API_TOKEN.to_string(), "keep-me".to_string());
+        let mut settings = settings_with_tokens(None, None);
+
+        settings.hydrate_secrets(&store);
+        settings.persisted_copy(&store);
+        assert_eq!(store.data.borrow().get(ACCOUNT_API_TOKEN).map(String::as_str), Some("keep-me"));
+    }
+
+    #[test]
+    fn test_clearing_the_token_deletes_the_stored_secret() {
+        let store = MemStore::default();
+        store.set(ACCOUNT_API_TOKEN, "stored-api").unwrap();
+        let mut settings = settings_with_tokens(None, None);
+        settings.hydrate_secrets(&store);
+
+        settings.auth_token = None; // user signs out
+        settings.persisted_copy(&store);
+        assert_eq!(store.get(ACCOUNT_API_TOKEN).unwrap(), None);
     }
 }

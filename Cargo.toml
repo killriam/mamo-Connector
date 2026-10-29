@@ -31,6 +31,7 @@ zip = "2"
 mamo-sim = { path = "../mamo-sim" }
 
 [target.'cfg(windows)'.dependencies]
+keyring = "=4.2.0"
 winreg = "0.52"
 winapi = { version = "0.3", features = ["winuser", "windef", "fileapi", "processthreadsapi", "handleapi"] }
 
