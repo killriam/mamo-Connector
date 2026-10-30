@@ -1533,7 +1533,7 @@ impl LauncherApp {
                         activity_log.log_error(&forge_result.message);
                     }
                 }
-                CommandResult::AuthTokenSaved(msg) => {
+                CommandResult::AuthTokenSaved(msg) | CommandResult::AgentTokenSaved(msg) => {
                     activity_log.log_success(msg);
                 }
                 CommandResult::Error(err) => {
@@ -2341,14 +2341,14 @@ impl LauncherApp {
     fn process_deeplink_with_progress(&mut self, deeplink: Deeplink, ctx: &egui::Context) {
         use log::info;
         
-        info!("Processing deeplink with progress: {}", deeplink.raw);
+        info!("Processing deeplink with progress: {}", crate::deeplink::redact(&deeplink.raw));
         
         // Expand activity panel to show progress (visible on all tabs)
         self.activity_panel_collapsed = false;
         
         // Log the incoming command
         if let Ok(mut log) = self.activity_log.lock() {
-            log.log_info(format!("Received command: {}", deeplink.raw));
+            log.log_info(format!("Received command: {}", crate::deeplink::redact(&deeplink.raw)));
             log.log_info(format!("Processing action: {}", deeplink.action));
             if let Some(ref deck_id) = deeplink.deck_id {
                 log.log_info(format!("Deck ID: {}", deck_id));
@@ -2479,7 +2479,7 @@ impl LauncherApp {
                             wizard_requested.store(true, Ordering::Relaxed);
                         }
                     }
-                    commands::CommandResult::AuthTokenSaved(msg) => {
+                    commands::CommandResult::AuthTokenSaved(msg) | commands::CommandResult::AgentTokenSaved(msg) => {
                         log.log_success(msg);
                     }
                     commands::CommandResult::Error(err) => {
@@ -6741,6 +6741,70 @@ impl LauncherApp {
     /// the first-run wizard's `ConnectAccount` step, so there's one implementation instead of
     /// the two the Setup tab used to be the only home for (the wizard never asked for account
     /// connection at all before).
+    /// Status of the MaMo MCP tokens kept on this computer, and removing them from it. Creating a token
+    /// happens on the MaMo website (it hands over a one-time code through a mamoConnector:// link);
+    /// revoking one everywhere is done there too.
+    fn render_agent_access_section(&mut self, ui: &mut egui::Ui) {
+        use crate::agent_access::{expiry_state, ExpiryState, TokenKind};
+
+        let tokens: Vec<(TokenKind, Option<crate::agent_access::AgentTokenInfo>)> = {
+            let settings = self.settings.lock().unwrap();
+            TokenKind::ALL
+                .iter()
+                .map(|kind| (*kind, settings.agent_access.get(*kind).cloned()))
+                .collect()
+        };
+        let mut remove: Option<TokenKind> = None;
+
+        ui.group(|ui| {
+            ui.label(egui::RichText::new("AI agent access").strong().size(type_scale::SUBHEADING));
+            ui.add_space(spacing::SPACE_6);
+            ui.label("Lets an AI agent on this computer use your MaMo account through the MaMo MCP server. Create the access on the MaMo website; this computer only keeps it.");
+            ui.add_space(spacing::SPACE_5);
+
+            for (kind, token) in &tokens {
+                ui.horizontal(|ui| {
+                    ui.label(kind.label());
+                    match token {
+                        None => render_status_pill(ui, "Not set up", PillStatus::Neutral),
+                        Some(info) => {
+                            match expiry_state(info.expires_at.as_deref(), chrono::Utc::now()) {
+                                ExpiryState::Unknown => {
+                                    render_status_pill(ui, "On this computer", PillStatus::Success)
+                                }
+                                ExpiryState::ValidUntil(day) => {
+                                    render_status_pill(ui, &format!("On this computer, valid until {day}"), PillStatus::Success)
+                                }
+                                ExpiryState::Expired(day) => {
+                                    render_status_pill(ui, &format!("Expired on {day}"), PillStatus::Warning)
+                                }
+                            }
+                            if ui.button("Remove from this computer").clicked() {
+                                remove = Some(*kind);
+                            }
+                        }
+                    }
+                });
+            }
+            ui.add_space(spacing::SPACE_5);
+            ui.label(egui::RichText::new("Removing only deletes it from this computer. To switch an access off everywhere, revoke it on the MaMo website.").small().weak());
+        });
+
+        if let Some(kind) = remove {
+            let outcome = {
+                let mut settings = self.settings.lock().unwrap();
+                let store = crate::secrets::agent_store(crate::secrets::AGENT_SERVICE);
+                crate::agent_access::remove_token(store.as_ref(), &mut settings.agent_access, kind)
+                    .and_then(|_| settings.save())
+            };
+            let mut state = self.settings_state.lock().unwrap();
+            state.status_message = Some(match outcome {
+                Ok(()) => format!("{} removed from this computer.", kind.label()),
+                Err(e) => format!("Could not remove {}: {}", kind.label().to_lowercase(), e),
+            });
+        }
+    }
+
     fn render_mamo_account_section(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         let has_token = !self.settings_state.lock().unwrap().auth_token_input.is_empty();
 
@@ -6816,6 +6880,11 @@ impl LauncherApp {
 
             // ── MaMo account ──────────────────────────────────────────────
             self.render_mamo_account_section(ui, ctx);
+
+            ui.add_space(spacing::SPACE_12);
+
+            // ── AI agent access ───────────────────────────────────────────
+            self.render_agent_access_section(ui);
 
             ui.add_space(spacing::SPACE_12);
 

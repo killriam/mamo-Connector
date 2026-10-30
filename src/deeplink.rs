@@ -14,6 +14,24 @@ pub struct Deeplink {
     pub path_segment: Option<String>,
 }
 
+/// Query parameters whose values are secrets (login tokens, personal access tokens, one-time codes).
+const SECRET_PARAMS: [&str; 4] = ["token", "access_token", "pat", "code"];
+
+/// The deeplink text with secret values masked, for logs and the on-screen activity log.
+pub fn redact(raw: &str) -> String {
+    let Some((head, query)) = raw.split_once('?') else {
+        return raw.to_string();
+    };
+    let masked: Vec<String> = query
+        .split('&')
+        .map(|pair| match pair.split_once('=') {
+            Some((key, _)) if SECRET_PARAMS.contains(&key.to_ascii_lowercase().as_str()) => format!("{key}=***"),
+            _ => pair.to_string(),
+        })
+        .collect();
+    format!("{head}?{}", masked.join("&"))
+}
+
 pub fn parse_deeplink(args: &[String], scheme_prefix: &str) -> Option<Deeplink> {
     let scheme_prefix_lower = scheme_prefix.to_lowercase();
     let raw = args
@@ -88,6 +106,20 @@ pub fn parse_deeplink_url(raw: &str) -> Option<Deeplink> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn test_redact_masks_secret_values_only() {
+        assert_eq!(
+            super::redact("mamoConnector://agent-access?code=abc123&scope=read"),
+            "mamoConnector://agent-access?code=***&scope=read"
+        );
+        assert_eq!(
+            super::redact("mamoConnector://simulate/d1?token=eyJ.a.b&apiUrl=https://x&PAT=pat_1"),
+            "mamoConnector://simulate/d1?token=***&apiUrl=https://x&PAT=***"
+        );
+        assert_eq!(super::redact("mamoConnector://deck/abc"), "mamoConnector://deck/abc");
+        assert_eq!(super::redact("mamoConnector://x?flag&code"), "mamoConnector://x?flag&code");
+    }
+
     use super::*;
 
     const SCHEME_PREFIX: &str = "mamoConnector://";

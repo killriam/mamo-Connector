@@ -146,6 +146,10 @@ pub struct Settings {
     /// deeplink. `None` = look next to the Connector and in Documents\MaMo.
     #[serde(default)]
     pub proxy_printing_path: Option<String>,
+    /// Non-secret facts about the MCP tokens stored in the credential store (service "MaMo MCP");
+    /// the tokens themselves never live in this file. See agent_access.rs.
+    #[serde(default)]
+    pub agent_access: crate::agent_access::AgentAccessSettings,
     /// Set when the credential store could not be read at load time. `save` then leaves the
     /// stored tokens alone, so a transient failure cannot wipe them.
     #[serde(skip)]
@@ -168,6 +172,7 @@ impl Default for Settings {
             sync_as_reference_decks: true,
             last_selected_deck_id: None,
             proxy_printing_path: None,
+            agent_access: Default::default(),
             secrets_unreadable: false,
         }
     }

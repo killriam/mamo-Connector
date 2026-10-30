@@ -33,6 +33,7 @@ pub enum CommandResult {
     UserDecksImported(UserDecksImportResult),
     UserDecksList(Vec<RemoteDeck>),
     AuthTokenSaved(String),  // Success message
+    AgentTokenSaved(String), // MCP agent access token stored; success message
     SimulationCompleted(SimulationResult),
     ScenarioSynced(Vec<ScenarioSyncResult>),
     ProxyPrint(ProxyPrintResult),
@@ -56,6 +57,7 @@ impl CommandResult {
             CommandResult::UserDecksImported(result) => result.message.clone(),
             CommandResult::UserDecksList(decks) => format!("Found {} decks", decks.len()),
             CommandResult::AuthTokenSaved(msg) => msg.clone(),
+            CommandResult::AgentTokenSaved(msg) => msg.clone(),
             CommandResult::SimulationCompleted(result) => result.message.clone(),
             CommandResult::ScenarioSynced(results) => format!("Synchronized {} scenario(s)", results.len()),
             CommandResult::ProxyPrint(result) => result.message.clone(),
@@ -78,6 +80,7 @@ impl CommandResult {
             CommandResult::UserDecksImported(result) => result.success,
             CommandResult::UserDecksList(decks) => !decks.is_empty(),
             CommandResult::AuthTokenSaved(_) => true,
+            CommandResult::AgentTokenSaved(_) => true,
             CommandResult::SimulationCompleted(result) => result.success,
             CommandResult::ScenarioSynced(_) => true,
             CommandResult::ProxyPrint(result) => result.success,
@@ -150,6 +153,7 @@ pub async fn handle_command_with_logger(deeplink: &Deeplink, log_collector: Opti
         "import-user-decks" | "importuserdecks" => handle_import_user_decks(deeplink).await,
         "list-user-decks" | "listuserdecks" => handle_list_user_decks(deeplink).await,
         "auth" | "authenticate" | "connect" => handle_auth(deeplink).await, // Auth token: mamoConnector://auth?token=xxx
+        "agent-access" | "agentaccess" => handle_agent_access(deeplink).await, // AI agent token: mamoConnector://agent-access?code=xxx
         "simulate" => handle_simulate(deeplink, log_collector).await, // Forge simulation: mamoConnector://simulate/DECK_UUID
         "simulate-ai" => handle_simulate_ai(deeplink, log_collector).await, // Native mamo-sim: mamoConnector://simulate-ai/DECK_UUID
         "" => CommandResult::MissingParameters("No action specified in deeplink".to_string()),
@@ -716,6 +720,50 @@ async fn handle_launch_forge_with_logger(deeplink: &Deeplink, log_collector: Opt
             CommandResult::Error(format!("Failed to launch Forge: {}", e))
         }
     }
+}
+
+/// Handle mamoConnector://agent-access?code=ONE_TIME_CODE: exchange the website's one-time code for an
+/// MCP token and keep it in the Windows credential store (see agent_access.rs). The exchange goes to the
+/// Connector's configured API address only, never to an address named in the link, so a crafted link
+/// cannot redirect the code. The code and the token are never logged.
+async fn handle_agent_access(deeplink: &Deeplink) -> CommandResult {
+    let code = match get_parameter(&deeplink.params, "code") {
+        Some(code) if !code.is_empty() => code,
+        _ => {
+            return CommandResult::MissingParameters(
+                "code is required. Create AI agent access on the MaMo website.".to_string(),
+            );
+        }
+    };
+
+    let mut settings = match Settings::load() {
+        Ok(settings) => settings,
+        Err(e) => return CommandResult::Error(format!("Failed to load settings: {}", e)),
+    };
+
+    let redeemed = match crate::agent_access::redeem_code(&settings.gamelog_config.api_url, &code).await {
+        Ok(redeemed) => redeemed,
+        Err(e) => {
+            warn!("AI agent access: could not redeem the code: {}", e);
+            return CommandResult::Error(e.to_string());
+        }
+    };
+
+    let store = crate::secrets::agent_store(crate::secrets::AGENT_SERVICE);
+    if let Err(e) = crate::agent_access::apply_redeemed(store.as_ref(), &mut settings.agent_access, &redeemed) {
+        error!("AI agent access: {}", e);
+        return CommandResult::Error(e.to_string());
+    }
+    if let Err(e) = settings.save() {
+        // The token is stored and works; only the display info could not be remembered.
+        warn!("AI agent access: token stored, but settings could not be saved: {}", e);
+    }
+
+    info!("AI agent access: {} stored", redeemed.kind.label());
+    CommandResult::AgentTokenSaved(format!(
+        "{} for AI agents saved on this computer. Agents using the MaMo MCP server can use it now.",
+        redeemed.kind.label()
+    ))
 }
 
 /// Handle mamoConnector://auth?token=PAT_xxx - save authentication token for gamelog uploads
@@ -2200,5 +2248,16 @@ mod tests {
         assert_eq!(mulligan.min_value_for_round(0), 5.0);
         assert_eq!(mulligan.mana_base_min, 2.0);
         assert_eq!(mulligan.mana_base_max, 6.0);
+    }
+
+    #[tokio::test]
+    async fn test_agent_access_without_a_code_asks_for_it() {
+        let deeplink = crate::deeplink::parse_deeplink_url("mamoConnector://agent-access").unwrap();
+        match handle_command(&deeplink).await {
+            CommandResult::MissingParameters(message) => assert!(message.contains("code")),
+            other => panic!("expected MissingParameters, got {}", other.get_message()),
+        }
+        let empty = crate::deeplink::parse_deeplink_url("mamoConnector://agentaccess?code=").unwrap();
+        assert!(matches!(handle_command(&empty).await, CommandResult::MissingParameters(_)));
     }
 }

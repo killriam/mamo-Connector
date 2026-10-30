@@ -1,3 +1,4 @@
+mod agent_access;
 mod commands;
 mod deck;
 mod deeplink;
@@ -150,7 +151,7 @@ async fn run() -> Result<()> {
     // The UI will switch to Activity tab and show real-time progress
     let command_result: Option<commands::CommandResult> = None;
 
-    info!("Launching UI with {} arguments, deeplink: {:?}", args.len(), deeplink.as_ref().map(|d| &d.raw));
+    info!("Launching UI with {} arguments, deeplink: {:?}", args.len(), deeplink.as_ref().map(|d| deeplink::redact(&d.raw)));
 
     ui::launch(registration, args, deeplink, command_result)?;
 
