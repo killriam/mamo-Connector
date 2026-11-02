@@ -1060,6 +1060,32 @@ fn auto_scan_interval_secs(consecutive_failures: u32) -> u64 {
     BASE_SECS.saturating_mul(1u64 << consecutive_failures.min(4)).min(MAX_SECS)
 }
 
+/// How the taskbar button should flash for a finished action: a gentle flash for success, a more
+/// insistent one for failure, so a result is noticed while the window is in the background.
+fn attention_for(success: bool) -> egui::UserAttentionType {
+    if success {
+        egui::UserAttentionType::Informational
+    } else {
+        egui::UserAttentionType::Critical
+    }
+}
+
+/// Makes the taskbar button flash until the window is focused. Safe to call from any thread.
+fn flash_taskbar(ctx: &egui::Context, success: bool) {
+    ctx.send_viewport_cmd(egui::ViewportCommand::RequestUserAttention(attention_for(success)));
+}
+
+#[cfg(test)]
+mod taskbar_flash_tests {
+    use super::*;
+
+    #[test]
+    fn success_flashes_gently_and_failure_insistently() {
+        assert_eq!(attention_for(true), egui::UserAttentionType::Informational);
+        assert_eq!(attention_for(false), egui::UserAttentionType::Critical);
+    }
+}
+
 #[cfg(test)]
 mod auto_scan_backoff_tests {
     use super::*;
@@ -1422,6 +1448,9 @@ struct LauncherApp {
     wizard: SetupWizardState,
     /// Set by background threads when a Forge launch fails — checked in update()
     wizard_requested: Arc<AtomicBool>,
+    /// Outcome of a command that finished before the window existed (e.g. an `auth` or
+    /// `agent-access` link handled at startup); flashes the taskbar once on the first frame
+    initial_flash: Option<bool>,
     /// Set right after a successful `auth` deeplink so the user's full MaMo deck list loads
     /// automatically — checked in update()
     decks_fetch_requested: Arc<AtomicBool>,
@@ -1498,6 +1527,7 @@ impl LauncherApp {
         
         // Store deeplink for deferred processing with progress logging
         let started_with_deeplink = state.deeplink.is_some();
+        let initial_flash = state.command_result.as_ref().map(|result| result.is_success());
         let pending_initial_deeplink = state.deeplink.clone();
         
         // Log the command result if already present (pre-processed, e.g. auth)
@@ -1707,6 +1737,7 @@ impl LauncherApp {
             show_setup_wizard: forge_not_configured,
             wizard,
             wizard_requested,
+            initial_flash,
             decks_fetch_requested,
             forge_local_decks_refresh_requested,
             is_launching_selected_deck: Arc::new(Mutex::new(false)),
@@ -1721,6 +1752,10 @@ impl LauncherApp {
 
 impl eframe::App for LauncherApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        if let Some(success) = self.initial_flash.take() {
+            flash_taskbar(ctx, success);
+        }
+
         // Process initial deeplink on first frame (with progress logging) - only after setup wizard is completed/closed
         if !self.show_setup_wizard {
             if let Some(deeplink) = self.pending_initial_deeplink.take() {
@@ -2607,6 +2642,7 @@ impl LauncherApp {
                 }
             }
 
+            flash_taskbar(&ctx_clone, result.is_success());
             ctx_clone.request_repaint();
         });
     }
