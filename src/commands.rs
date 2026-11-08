@@ -144,6 +144,7 @@ pub async fn handle_command_with_logger(deeplink: &Deeplink, log_collector: Opti
         "deck" => handle_deck_download(deeplink).await, // New: mamoConnector://deck/DECK_ID
         "mamo" => handle_mamo_deck_download(deeplink).await, // MaMo backend: mamoConnector://mamo/DECK_UUID
         "download-deck" => handle_download_deck_only(deeplink).await, // Save .dck to Forge dir without launching Forge
+        "download-legacy-factions" => handle_download_legacy_factions(deeplink).await, // Legacy Game precon decks -> Forge dir
         "playtest-scenario" => handle_playtest_with_scenario(deeplink, log_collector).await, // Scenario-ordered deck + JSON + launch Forge
         "sync-scenarios" | "syncscenarios" | "sync-scenario" | "syncscenario" => handle_sync_scenarios(deeplink, log_collector).await, // Sync Forge scenario(s) back to MaMo
         "launch-forge" | "launchforge" | "playtest" => handle_launch_forge_with_logger(deeplink, log_collector).await, // Launch Forge with deck
@@ -307,6 +308,33 @@ async fn handle_download_deck_only(deeplink: &Deeplink) -> CommandResult {
         Err(err) => {
             error!("Failed to download deck for Forge: {:?}", err);
             CommandResult::Error(format!("Failed to download deck: {}", err))
+        }
+    }
+}
+
+/// Handle mamoConnector://download-legacy-factions?playgroup=PLAYGROUP_UUID&deck=SET|Deck%20Name&deck=...
+/// Saves the precon decks of a Legacy Game universe to the Forge deck directory (no Forge launch).
+async fn handle_download_legacy_factions(deeplink: &Deeplink) -> CommandResult {
+    let playgroup_id = get_parameter(&deeplink.params, "playgroup")
+        .or_else(|| get_parameter(&deeplink.params, "playgroupId"))
+        .unwrap_or_default();
+    let values: Vec<String> = deeplink
+        .params
+        .iter()
+        .filter(|(key, _)| key == "deck")
+        .map(|(_, value)| value.clone())
+        .collect();
+    let factions = crate::deck::parse_faction_refs(&values);
+    if !crate::deck::is_valid_playgroup_id(&playgroup_id) || factions.is_empty() {
+        return CommandResult::MissingParameters(
+            "Usage: mamoConnector://download-legacy-factions?playgroup=PLAYGROUP_UUID&deck=SET|Deck Name".to_string()
+        );
+    }
+    match crate::deck::download_legacy_factions(&playgroup_id, &factions).await {
+        Ok(result) => CommandResult::DeckCreated(result),
+        Err(err) => {
+            error!("Failed to download Legacy faction decks: {:?}", err);
+            CommandResult::Error(format!("Failed to download the precon decks: {}", err))
         }
     }
 }

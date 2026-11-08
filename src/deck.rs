@@ -4290,3 +4290,145 @@ Name=Example Commander Deck
         assert!(!reference_failures_are_expired_login(&[]));
     }
 }
+
+// ==================== Legacy Game factions (precon decks) ====================
+
+#[derive(Debug, Serialize)]
+struct FactionRef<'a> {
+    #[serde(rename = "setCode")]
+    set_code: &'a str,
+    #[serde(rename = "deckName")]
+    deck_name: &'a str,
+}
+
+#[derive(Debug, Deserialize)]
+struct FactionForgeFile {
+    name: String,
+    content: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct FactionForgeResponse {
+    files: Vec<FactionForgeFile>,
+    #[serde(default)]
+    missing: Vec<String>,
+}
+
+/// `deck` deeplink values ("TRC|Landing Party") -> (set code, deck name); malformed values are skipped.
+pub fn parse_faction_refs(values: &[String]) -> Vec<(String, String)> {
+    values
+        .iter()
+        .filter_map(|v| v.split_once('|'))
+        .map(|(set, name)| (set.trim().to_string(), name.trim().to_string()))
+        .filter(|(set, name)| !set.is_empty() && !name.is_empty())
+        .collect()
+}
+
+/// A playgroup id is a UUID; anything else is refused before it reaches a URL path.
+pub fn is_valid_playgroup_id(id: &str) -> bool {
+    id.len() == 36 && id.chars().all(|c| c.is_ascii_hexdigit() || c == '-')
+}
+
+/// Downloads the Forge .dck files of Legacy Game factions (precon decks) from the MaMo backend
+/// and saves each into the Forge commander deck folder. Does not launch Forge.
+pub async fn download_legacy_factions(
+    playgroup_id: &str,
+    factions: &[(String, String)],
+) -> Result<DeckCreationResult> {
+    let url = format!(
+        "{}/api/playgroups/{}/legacy/factions/forge",
+        MAMO_API_URL, playgroup_id
+    );
+    let decks: Vec<FactionRef> = factions
+        .iter()
+        .map(|(set_code, deck_name)| FactionRef { set_code, deck_name })
+        .collect();
+    info!("Downloading {} Legacy faction deck(s) from {}", decks.len(), url);
+
+    let response = reqwest::Client::new()
+        .post(&url)
+        .header("User-Agent", "MaMo-Connector/1.0")
+        .json(&serde_json::json!({ "decks": decks }))
+        .send()
+        .await
+        .context("Failed to send request to the MaMo backend")?;
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        return Ok(DeckCreationResult::failed(format!("MaMo API error {}: {}", status, body)));
+    }
+    let payload: FactionForgeResponse = response
+        .json()
+        .await
+        .context("Failed to parse the faction deck files from the MaMo backend")?;
+
+    let mut saved = 0usize;
+    let mut last_path: Option<PathBuf> = None;
+    let mut failed: Vec<String> = Vec::new();
+    for file in &payload.files {
+        let content = post_process_forge_content(&file.content);
+        match write_deck_file(&file.name, &content).await {
+            Ok((path, _)) => {
+                saved += 1;
+                last_path = Some(path);
+            }
+            Err(e) => {
+                warn!("Failed to save faction deck {}: {:?}", file.name, e);
+                failed.push(file.name.clone());
+            }
+        }
+    }
+
+    let mut message = format!("Saved {} precon deck(s) to Forge", saved);
+    if !payload.missing.is_empty() {
+        message.push_str(&format!("; not found: {}", payload.missing.join(", ")));
+    }
+    if !failed.is_empty() {
+        message.push_str(&format!("; could not save: {}", failed.join(", ")));
+    }
+    Ok(match last_path {
+        Some(path) if failed.is_empty() => DeckCreationResult::success(message, path),
+        _ => DeckCreationResult::failed(message),
+    })
+}
+
+#[cfg(test)]
+mod legacy_faction_tests {
+    use super::*;
+
+    #[test]
+    fn parses_faction_refs_and_skips_malformed_ones() {
+        let values = vec![
+            "TRC|Landing Party".to_string(),
+            " LTC | Food and Fellowship ".to_string(),
+            "no-separator".to_string(),
+            "|Missing set".to_string(),
+        ];
+        assert_eq!(
+            parse_faction_refs(&values),
+            vec![
+                ("TRC".to_string(), "Landing Party".to_string()),
+                ("LTC".to_string(), "Food and Fellowship".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn reads_repeated_encoded_deck_params_from_the_deeplink() {
+        let link = crate::deeplink::parse_deeplink_url(
+            "mamoConnector://download-legacy-factions?playgroup=115bef54-6025-4cdc-b9ef-d0c75018cc30&deck=TRC%7CLanding%20Party&deck=TRC%7CAway%20Team",
+        )
+        .expect("deeplink parses");
+        assert_eq!(link.action, "download-legacy-factions");
+        let values: Vec<String> = link.params.iter().filter(|(k, _)| k == "deck").map(|(_, v)| v.clone()).collect();
+        assert_eq!(parse_faction_refs(&values).len(), 2);
+        assert_eq!(parse_faction_refs(&values)[0], ("TRC".to_string(), "Landing Party".to_string()));
+    }
+
+    #[test]
+    fn accepts_only_uuid_playgroup_ids() {
+        assert!(is_valid_playgroup_id("115bef54-6025-4cdc-b9ef-d0c75018cc30"));
+        assert!(!is_valid_playgroup_id("../../api/admin"));
+        assert!(!is_valid_playgroup_id(""));
+    }
+}
