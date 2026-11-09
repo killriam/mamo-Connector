@@ -7,6 +7,7 @@
 //! `mamoConnector://list-user-decks`.
 
 use anyhow::Result;
+use chrono::{DateTime, Utc};
 use log::warn;
 
 use crate::deck::{self, DeckStatus, MamoDeckEntry, MoxfieldDeckEntry, UserDecksImportResult};
@@ -195,9 +196,106 @@ pub async fn import_all(source: &UserDeckSource, api_base_url: &str, settings: &
     import(source, &ids).await
 }
 
+/// The signed-in user's MaMo decks that are in Forge's deck folder but were edited on MaMo
+/// after the Connector last downloaded them, so Forge would launch with an outdated copy.
+///
+/// A deck only counts when a local .dck written for it still exists — decks the user never
+/// downloaded (or has since deleted from Forge) are not "outdated", just absent. The download
+/// time comes from `DeckMappings::downloaded_at`; decks downloaded by a Connector build that
+/// predates that field fall back to the local file's modification time.
+///
+/// `exclude_deck_id` is the deck the pending launch is about to download anyway.
+pub async fn find_decks_changed_since_download(
+    config: &gamelog::GameLogConfig,
+    exclude_deck_id: Option<&str>,
+) -> Result<Vec<UserDeck>> {
+    let remote = gamelog::fetch_my_decks(config).await?;
+    let mappings = gamelog::DeckMappings::load()?;
+    let deck_dir = deck::get_deck_directory()?;
+
+    Ok(remote
+        .into_iter()
+        .filter(|d| exclude_deck_id != Some(d.deck_id.as_str()))
+        .filter(|d| {
+            // One entry per local .dck file that exists for this deck; the inner Option is the
+            // file's modification time, if the filesystem reports one.
+            let local_files: Vec<Option<DateTime<Utc>>> = mappings
+                .names_for_deck_id(&d.deck_id)
+                .map(|name| deck_dir.join(format!("{}.dck", deck::sanitize_filename(name))))
+                .filter_map(|path| std::fs::metadata(path).ok())
+                .map(|meta| meta.modified().ok().map(DateTime::<Utc>::from))
+                .collect();
+            is_outdated(
+                d.updated_at.as_deref(),
+                mappings.downloaded_at.get(&d.deck_id).map(String::as_str),
+                &local_files,
+            )
+        })
+        .collect())
+}
+
+/// Whether a local copy is older than the deck on MaMo. `local_files` holds one entry per
+/// existing local .dck for the deck (its modification time, if known); empty means the deck is
+/// not in Forge at all. Unparseable or missing remote timestamps never count as outdated, so a
+/// backend format change degrades to "no prompt" rather than a prompt on every launch.
+fn is_outdated(remote_updated_at: Option<&str>, recorded_download: Option<&str>, local_files: &[Option<DateTime<Utc>>]) -> bool {
+    if local_files.is_empty() {
+        return false;
+    }
+    let Some(updated_at) = remote_updated_at.and_then(parse_utc) else {
+        return false;
+    };
+    let downloaded_at = recorded_download
+        .and_then(parse_utc)
+        .or_else(|| local_files.iter().flatten().max().copied());
+    downloaded_at.is_some_and(|at| updated_at > at)
+}
+
+fn parse_utc(s: &str) -> Option<DateTime<Utc>> {
+    DateTime::parse_from_rfc3339(s).ok().map(|d| d.with_timezone(&Utc))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_utc_reads_backend_iso_timestamps_and_rejects_garbage() {
+        let backend = parse_utc("2026-11-09T10:15:00.000Z").expect("backend toISOString format");
+        let stored = parse_utc("2026-11-09T11:15:00+01:00").expect("chrono to_rfc3339 format");
+        assert_eq!(backend, stored);
+        assert!(parse_utc("2026-11-09").is_none());
+        assert!(parse_utc("").is_none());
+    }
+
+    #[test]
+    fn is_outdated_compares_remote_edit_with_recorded_download() {
+        let file = [parse_utc("2026-01-01T00:00:00Z")];
+        let downloaded = Some("2026-11-09T10:00:00+00:00");
+
+        assert!(is_outdated(Some("2026-11-09T10:00:01.000Z"), downloaded, &file), "edited after download");
+        assert!(!is_outdated(Some("2026-11-09T09:59:59.000Z"), downloaded, &file), "edited before download");
+        assert!(!is_outdated(Some("2026-11-09T10:00:00.000Z"), downloaded, &file), "same instant is up to date");
+    }
+
+    #[test]
+    fn is_outdated_falls_back_to_newest_file_mtime_without_a_recorded_download() {
+        let files = [parse_utc("2026-11-01T00:00:00Z"), None, parse_utc("2026-11-05T00:00:00Z")];
+
+        assert!(is_outdated(Some("2026-11-06T00:00:00.000Z"), None, &files));
+        assert!(!is_outdated(Some("2026-11-04T00:00:00.000Z"), None, &files));
+        assert!(!is_outdated(Some("2026-11-06T00:00:00.000Z"), None, &[None]), "no time known at all");
+    }
+
+    #[test]
+    fn is_outdated_ignores_decks_not_in_forge_or_without_a_remote_timestamp() {
+        let downloaded = Some("2026-01-01T00:00:00+00:00");
+        let file = [parse_utc("2026-01-01T00:00:00Z")];
+
+        assert!(!is_outdated(Some("2026-11-09T00:00:00.000Z"), downloaded, &[]), "no local file");
+        assert!(!is_outdated(None, downloaded, &file), "no remote timestamp");
+        assert!(!is_outdated(Some("not a date"), downloaded, &file), "unparseable remote timestamp");
+    }
 
     #[test]
     fn source_username_covers_all_three_variants() {

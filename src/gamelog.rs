@@ -1226,6 +1226,13 @@ pub struct DeckMappings {
     /// played, not just whatever revision is "latest" when the log is later uploaded.
     #[serde(default)]
     pub revisions: std::collections::HashMap<String, String>,
+    /// Maps MaMo deck id -> RFC 3339 time the Connector last wrote that deck's .dck file.
+    /// Keyed by id rather than deck name because the exported name embeds the deck's
+    /// last-updated date, so the name changes every time the deck is edited. Used to detect
+    /// decks edited on MaMo since they were last downloaded (see
+    /// `user_decks::find_decks_changed_since_download`).
+    #[serde(default)]
+    pub downloaded_at: std::collections::HashMap<String, String>,
     /// When mappings were last updated
     pub updated_at: Option<String>,
 }
@@ -1281,6 +1288,20 @@ impl DeckMappings {
     /// Get the last-known revision id exported/launched for a log deck name
     pub fn get_revision_mapping(&self, log_deck_name: &str) -> Option<&String> {
         self.revisions.get(log_deck_name)
+    }
+
+    /// Record when the deck with this MaMo id was written to the Forge deck directory
+    pub fn set_downloaded_at(&mut self, mamo_deck_id: &str, at: chrono::DateTime<chrono::Utc>) {
+        self.downloaded_at.insert(mamo_deck_id.to_string(), at.to_rfc3339());
+        self.updated_at = Some(chrono::Local::now().to_rfc3339());
+    }
+
+    /// Every Forge deck name ever recorded for this MaMo deck id
+    pub fn names_for_deck_id<'a>(&'a self, mamo_deck_id: &'a str) -> impl Iterator<Item = &'a String> + 'a {
+        self.mappings
+            .iter()
+            .filter(move |(_, id)| id.as_str() == mamo_deck_id)
+            .map(|(name, _)| name)
     }
 }
 

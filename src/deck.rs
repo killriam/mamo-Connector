@@ -1238,6 +1238,8 @@ pub async fn create_deck_from_mamo_with_progress(
     
     log(&format!("Deck saved to: {:?}", deck_path));
 
+    record_mamo_deck_download(deck_id, response_headers.get("date").map(String::as_str));
+
     // Also sync any playable scenarios for this deck so Forge's Scenario dropdown has them ready
     if let Ok(settings) = Settings::load() {
         if let Ok(scenarios) = crate::gamelog::fetch_deck_scenarios(&settings.gamelog_config, deck_id).await {
@@ -1291,6 +1293,28 @@ pub async fn create_deck_from_mamo_with_progress(
 /// Checks if deck already exists by hash to avoid duplicate downloads
 pub async fn create_deck_from_mamo(deck_id: &str) -> Result<DeckCreationResult> {
     create_deck_from_mamo_with_progress(deck_id, None).await
+}
+
+/// Remember when a MaMo deck's .dck was last written, so a later Forge launch can tell whether
+/// the deck has been edited on MaMo since. Best-effort: never fails the download.
+///
+/// `server_date` is the export response's HTTP `Date` header. It is preferred over the local
+/// clock because the comparison is against the backend's `updatedAt`: a PC clock running behind
+/// the server would otherwise make a freshly downloaded deck look outdated on every launch.
+fn record_mamo_deck_download(deck_id: &str, server_date: Option<&str>) {
+    let downloaded_at = server_date
+        .and_then(|d| chrono::DateTime::parse_from_rfc2822(d).ok())
+        .map(|d| d.with_timezone(&chrono::Utc))
+        .unwrap_or_else(chrono::Utc::now);
+    match crate::gamelog::DeckMappings::load() {
+        Ok(mut mappings) => {
+            mappings.set_downloaded_at(deck_id, downloaded_at);
+            if let Err(e) = mappings.save() {
+                warn!("Could not persist deck download time: {}", e);
+            }
+        }
+        Err(e) => warn!("Could not load deck mappings to record download time: {}", e),
+    }
 }
 
 // ==================== Forge Scenario Export ====================
@@ -2762,11 +2786,13 @@ pub async fn sync_mamo_deck(deck_id: &str) -> Result<DeckSyncResult> {
         let archived_path = archive_deck_with_prefix(&existing_path)?;
         
         let (new_path, _) = write_deck_file(deck_name, &body).await?;
-        
+        record_mamo_deck_download(deck_id, None);
+
         Ok(DeckSyncResult::updated(name.to_string(), archived_path, new_path))
     } else {
         let (new_path, _) = write_deck_file(deck_name, &body).await?;
-        
+        record_mamo_deck_download(deck_id, None);
+
         Ok(DeckSyncResult::new_downloaded(name.to_string(), new_path))
     }
 }

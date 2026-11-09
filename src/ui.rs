@@ -528,6 +528,13 @@ fn deeplink_has_deck_reference(deeplink: &Deeplink) -> bool {
         || crate::commands::get_parameter(&deeplink.params, "deck_path").is_some()
 }
 
+/// Formats a backend RFC 3339 timestamp (e.g. a deck's `updatedAt`) in local time for display
+fn format_local_timestamp(rfc3339: &str) -> Option<String> {
+    chrono::DateTime::parse_from_rfc3339(rfc3339)
+        .ok()
+        .map(|d| d.with_timezone(&Local).format("%Y-%m-%d %H:%M").to_string())
+}
+
 /// Helper to extract date tag (e.g. "2026-09-20") from a deck file stem if present
 fn extract_date_from_stem(stem: &str) -> Option<&str> {
     let paren_pos = stem.rfind(" (")?;
@@ -993,6 +1000,22 @@ enum PendingForgeLaunch {
 /// State of the pre-launch Forge update check and prompt
 #[derive(Clone)]
 enum PreLaunchUpdateState {
+    /// Asking MaMo which already-downloaded decks were edited since their last download
+    CheckingDeckChanges {
+        started_at: Instant,
+        result_rx: Arc<Mutex<Option<Result<Vec<crate::gamelog::UserDeck>, String>>>>,
+    },
+    /// Some decks in Forge are older than on MaMo: ask whether to refresh them before launching.
+    /// `selected[i]` is whether `decks[i]` is ticked for updating.
+    ChangedDecksPrompt {
+        decks: Vec<crate::gamelog::UserDeck>,
+        selected: Vec<bool>,
+    },
+    /// Re-downloading the decks the user ticked; yields one (deck name, outcome) per deck
+    UpdatingDecks {
+        count: usize,
+        result_rx: Arc<Mutex<Option<Vec<(String, Result<(), String>)>>>>,
+    },
     /// Actively downloading/preparing the deck from MaMo before checking Forge updates
     PreparingDeck {
         deck_name: String,
@@ -1836,8 +1859,45 @@ impl eframe::App for LauncherApp {
 
         // Poll pre-launch Forge update check / download state
         let mut prelaunch_action: Option<PendingForgeLaunch> = None;
+        // Set once the changed-decks step is done (nothing outdated, check failed, or updates
+        // finished): the launch then continues with deck preparation and the Forge update check.
+        let mut deck_check_done: Option<PendingForgeLaunch> = None;
         if let Some(ref mut dialog) = self.prelaunch_update_dialog {
             match &mut dialog.state {
+                PreLaunchUpdateState::CheckingDeckChanges { started_at, result_rx } => {
+                    let res = result_rx.lock().unwrap().take();
+                    match res {
+                        Some(Ok(decks)) if !decks.is_empty() => {
+                            let selected = vec![true; decks.len()];
+                            dialog.state = PreLaunchUpdateState::ChangedDecksPrompt { decks, selected };
+                        }
+                        Some(Ok(_)) => deck_check_done = Some(dialog.launch.clone()),
+                        Some(Err(e)) => {
+                            log::info!("Changed-decks check bypassed ({e}) — continuing launch");
+                            deck_check_done = Some(dialog.launch.clone());
+                        }
+                        // Backstop for the in-thread 5 s cap
+                        None if started_at.elapsed().as_secs() > 6 => {
+                            log::info!("Changed-decks check timed out — continuing launch");
+                            deck_check_done = Some(dialog.launch.clone());
+                        }
+                        None => {}
+                    }
+                }
+                PreLaunchUpdateState::UpdatingDecks { result_rx, .. } => {
+                    let results = result_rx.lock().unwrap().take();
+                    if let Some(results) = results {
+                        if let Ok(mut log) = self.activity_log.lock() {
+                            for (deck_name, outcome) in &results {
+                                match outcome {
+                                    Ok(()) => log.log_success(format!("Updated deck '{deck_name}' from MaMo")),
+                                    Err(e) => log.log_error(format!("Could not update deck '{deck_name}': {e}")),
+                                }
+                            }
+                        }
+                        deck_check_done = Some(dialog.launch.clone());
+                    }
+                }
                 PreLaunchUpdateState::PreparingDeck { result_rx, .. } => {
                     let res = result_rx.lock().unwrap().take();
                     if let Some(res) = res {
@@ -1939,6 +1999,11 @@ impl eframe::App for LauncherApp {
                 }
                 _ => {}
             }
+        }
+
+        if let Some(launch) = deck_check_done {
+            self.prelaunch_update_dialog = None;
+            self.continue_forge_launch(launch, ctx);
         }
 
         if let Some(action) = prelaunch_action {
@@ -2922,8 +2987,103 @@ impl LauncherApp {
         }
     }
 
-    /// Request a Forge launch: always ensures the deck is downloaded upfront before any Forge update check.
+    /// The MaMo deck id a launch downloads fresh anyway, so the outdated-decks prompt doesn't
+    /// list it. Scenario launches write a separate scenario-ordered deck, so their regular deck
+    /// can still be outdated and is not excluded.
+    fn launch_downloads_deck_id(launch: &PendingForgeLaunch) -> Option<String> {
+        match launch {
+            PendingForgeLaunch::AccountDeck(deck) => Some(deck.deck_id.clone()),
+            PendingForgeLaunch::Deeplink(deeplink) if Self::launch_deck_download_needed(launch).is_some() => {
+                deeplink.deck_id.clone()
+                    .or_else(|| crate::commands::get_parameter(&deeplink.params, "id"))
+                    .or_else(|| crate::commands::get_parameter(&deeplink.params, "deck_id"))
+                    .or_else(|| crate::commands::get_parameter(&deeplink.params, "deckId"))
+            }
+            _ => None,
+        }
+    }
+
+    /// Request a Forge launch. When signed in to MaMo, first checks whether any decks already in
+    /// Forge were edited on MaMo since they were downloaded and offers to refresh them; then
+    /// continues with `continue_forge_launch`. Replays play back a recorded game, so they skip it.
     fn request_forge_launch(&mut self, launch: PendingForgeLaunch, ctx: &egui::Context) {
+        let is_replay = matches!(&launch, PendingForgeLaunch::Deeplink(d) if matches!(d.action.as_str(), "replay-game" | "replaygame"));
+        let config = self.settings.lock().unwrap().gamelog_config.clone();
+        if is_replay || config.auth_token.is_none() {
+            self.continue_forge_launch(launch, ctx);
+            return;
+        }
+
+        let exclude_deck_id = Self::launch_downloads_deck_id(&launch);
+        let result_rx = Arc::new(Mutex::new(None));
+        let result_rx_bg = Arc::clone(&result_rx);
+        let ctx_bg = ctx.clone();
+        let runtime_handle = self.runtime_handle.clone();
+
+        std::thread::spawn(move || {
+            let res = runtime_handle.block_on(async {
+                // Capped like the Forge update check, so a slow backend never holds up a launch
+                tokio::select! {
+                    res = crate::user_decks::find_decks_changed_since_download(&config, exclude_deck_id.as_deref()) => {
+                        res.map_err(|e| format!("{e:#}"))
+                    }
+                    _ = tokio::time::sleep(tokio::time::Duration::from_secs(5)) => {
+                        Err("Deck change check timed out".to_string())
+                    }
+                }
+            });
+            *result_rx_bg.lock().unwrap() = Some(res);
+            ctx_bg.request_repaint();
+        });
+
+        self.prelaunch_update_dialog = Some(PreLaunchUpdateDialog {
+            launch,
+            state: PreLaunchUpdateState::CheckingDeckChanges {
+                started_at: Instant::now(),
+                result_rx,
+            },
+        });
+        ctx.request_repaint();
+    }
+
+    /// Re-download the ticked decks from MaMo in the background, then continue the launch.
+    fn start_updating_changed_decks(&mut self, launch: PendingForgeLaunch, decks: Vec<crate::gamelog::UserDeck>, ctx: &egui::Context) {
+        let count = decks.len();
+        if let Ok(mut log) = self.activity_log.lock() {
+            log.log_info(format!("Updating {count} changed deck(s) from MaMo before launching Forge…"));
+        }
+        let result_rx = Arc::new(Mutex::new(None));
+        let result_rx_bg = Arc::clone(&result_rx);
+        let ctx_bg = ctx.clone();
+        let runtime_handle = self.runtime_handle.clone();
+
+        std::thread::spawn(move || {
+            let results = runtime_handle.block_on(async {
+                let mut results = Vec::with_capacity(decks.len());
+                for deck in decks {
+                    let outcome = match crate::deck::create_deck_from_mamo(&deck.deck_id).await {
+                        Ok(r) if r.success => Ok(()),
+                        Ok(r) => Err(r.message),
+                        Err(e) => Err(format!("{e:#}")),
+                    };
+                    results.push((deck.deck_name, outcome));
+                }
+                results
+            });
+            *result_rx_bg.lock().unwrap() = Some(results);
+            ctx_bg.request_repaint();
+        });
+
+        self.prelaunch_update_dialog = Some(PreLaunchUpdateDialog {
+            launch,
+            state: PreLaunchUpdateState::UpdatingDecks { count, result_rx },
+        });
+        ctx.request_repaint();
+    }
+
+    /// Continue a Forge launch after the changed-decks check: ensures the launch's own deck is
+    /// downloaded upfront before any Forge update check.
+    fn continue_forge_launch(&mut self, launch: PendingForgeLaunch, ctx: &egui::Context) {
         if let Some(deck_name) = Self::launch_deck_download_needed(&launch) {
             let result_rx = Arc::new(Mutex::new(None));
             let result_rx_bg = Arc::clone(&result_rx);
@@ -3077,6 +3237,9 @@ impl LauncherApp {
         let Some(ref mut dialog) = self.prelaunch_update_dialog else { return; };
         
         let title = match &dialog.state {
+            PreLaunchUpdateState::CheckingDeckChanges { .. } => "Checking Your Decks…",
+            PreLaunchUpdateState::ChangedDecksPrompt { .. } => "🔄 Decks Changed on MaMo",
+            PreLaunchUpdateState::UpdatingDecks { .. } => "📥 Updating Decks…",
             PreLaunchUpdateState::PreparingDeck { .. } => "📥 Preparing Deck…",
             PreLaunchUpdateState::AlreadyRunningPrompt => "🎮 Forge is Already Open",
             PreLaunchUpdateState::Checking { .. } => "Checking for Updates…",
@@ -3091,6 +3254,10 @@ impl LauncherApp {
         let mut action_cancel = false;
         let mut action_start_download = false;
         let mut action_apply_staged = false;
+        // Changed-decks step: continue the launch without (further) deck updates
+        let mut action_skip_deck_updates = false;
+        let mut action_update_decks = false;
+        let mut toggled_deck: Option<usize> = None;
 
         // Gentle ~1.3 Hz pulse (0..=1) so the update prompt draws the eye without strobing.
         // Only the "update available/ready" prompt pulses; other states stay static.
@@ -3117,6 +3284,92 @@ impl LauncherApp {
             .show(ctx, |ui| {
                 ui.set_min_width(400.0);
                 match &dialog.state {
+                    PreLaunchUpdateState::CheckingDeckChanges { .. } => {
+                        ui.horizontal(|ui| {
+                            ui.spinner();
+                            ui.label(egui::RichText::new("Checking whether your decks changed on MaMo since they were downloaded…").small());
+                        });
+                        ui.add_space(spacing::SPACE_14);
+                        ui.horizontal(|ui| {
+                            if ui.button("Cancel").clicked() {
+                                action_cancel = true;
+                            }
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                if ui.button("Skip Check").clicked() {
+                                    action_skip_deck_updates = true;
+                                }
+                            });
+                        });
+                    }
+                    PreLaunchUpdateState::ChangedDecksPrompt { decks, selected } => {
+                        let selected_count = selected.iter().filter(|s| **s).count();
+                        ui.label(
+                            egui::RichText::new(if decks.len() == 1 {
+                                "1 deck in Forge was changed on MaMo since it was last downloaded:".to_string()
+                            } else {
+                                format!("{} decks in Forge were changed on MaMo since they were last downloaded:", decks.len())
+                            })
+                            .strong(),
+                        );
+                        ui.add_space(spacing::SPACE_8);
+                        egui::ScrollArea::vertical()
+                            .max_height(240.0)
+                            .auto_shrink([false, true])
+                            .show(ui, |ui| {
+                                for (i, deck) in decks.iter().enumerate() {
+                                    ui.horizontal(|ui| {
+                                        let mut checked = selected[i];
+                                        if ui.checkbox(&mut checked, &deck.deck_name).changed() {
+                                            toggled_deck = Some(i);
+                                        }
+                                        if let Some(edited) = deck.updated_at.as_deref().and_then(format_local_timestamp) {
+                                            ui.label(
+                                                egui::RichText::new(format!("edited {edited}"))
+                                                    .small()
+                                                    .color(egui::Color32::GRAY),
+                                            );
+                                        }
+                                    });
+                                }
+                            });
+                        ui.add_space(spacing::SPACE_12);
+                        ui.label("Update the selected decks before starting Forge?");
+                        ui.add_space(spacing::SPACE_16);
+                        ui.horizontal(|ui| {
+                            if ui.button("Cancel").clicked() {
+                                action_cancel = true;
+                            }
+                            if ui.button("Launch Without Updating").clicked() {
+                                action_skip_deck_updates = true;
+                            }
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                let label = if selected_count == 1 {
+                                    "Update 1 Deck & Launch".to_string()
+                                } else {
+                                    format!("Update {selected_count} Decks & Launch")
+                                };
+                                if ui.add_enabled(
+                                    selected_count > 0,
+                                    egui::Button::new(egui::RichText::new(label).color(egui::Color32::WHITE).strong())
+                                        .fill(colors::PRIMARY_ACTION),
+                                ).clicked() {
+                                    action_update_decks = true;
+                                }
+                            });
+                        });
+                    }
+                    PreLaunchUpdateState::UpdatingDecks { count, .. } => {
+                        ui.horizontal(|ui| {
+                            ui.spinner();
+                            ui.label(egui::RichText::new(format!("Downloading {count} updated deck(s) from MaMo…")).small());
+                        });
+                        ui.add_space(spacing::SPACE_14);
+                        ui.horizontal(|ui| {
+                            if ui.button("Cancel").clicked() {
+                                action_cancel = true;
+                            }
+                        });
+                    }
                     PreLaunchUpdateState::PreparingDeck { deck_name, .. } => {
                         ui.horizontal(|ui| {
                             ui.spinner();
@@ -3316,6 +3569,38 @@ impl LauncherApp {
                     }
                 }
             });
+
+        if let Some(i) = toggled_deck {
+            if let Some(PreLaunchUpdateDialog { state: PreLaunchUpdateState::ChangedDecksPrompt { selected, .. }, .. }) =
+                self.prelaunch_update_dialog.as_mut()
+            {
+                if let Some(s) = selected.get_mut(i) {
+                    *s = !*s;
+                }
+            }
+        }
+
+        if action_skip_deck_updates {
+            if let Some(d) = self.prelaunch_update_dialog.take() {
+                self.continue_forge_launch(d.launch, ctx);
+            }
+            return;
+        }
+        if action_update_decks {
+            if let Some(d) = self.prelaunch_update_dialog.take() {
+                if let PreLaunchUpdateState::ChangedDecksPrompt { decks, selected } = d.state {
+                    let chosen: Vec<_> = decks
+                        .into_iter()
+                        .zip(selected)
+                        .filter_map(|(deck, keep)| keep.then_some(deck))
+                        .collect();
+                    self.start_updating_changed_decks(d.launch, chosen, ctx);
+                } else {
+                    self.continue_forge_launch(d.launch, ctx);
+                }
+            }
+            return;
+        }
 
         if action_cancel {
             if let Some(ref d) = self.prelaunch_update_dialog {
