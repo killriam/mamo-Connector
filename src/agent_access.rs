@@ -1,9 +1,10 @@
 //! AI agent access: redeems the one-time code the MaMo website hands over (`mamoConnector://agent-access?code=...`)
 //! for an MCP token, and keeps that token in the OS credential store where the MaMo MCP server reads it
-//! (service `MaMo MCP`, accounts `read` and `write`). The token never touches `settings.json`; only
+//! (service `MaMo MCP`, accounts `read`, `write` and `invite`). The token never touches `settings.json`; only
 //! non-secret facts (token id, expiry) are remembered there for display.
 //!
-//! Two tokens exist on purpose (read-only and write); the website issues them separately.
+//! Separate tokens exist on purpose (read-only, write, and the opt-in invite token that lets an agent add
+//! name-only playgroup members and create join links); the website issues each one separately.
 
 use anyhow::{anyhow, bail, Context, Result};
 use serde::{Deserialize, Serialize};
@@ -17,16 +18,18 @@ const EXCHANGE_TIMEOUT: Duration = Duration::from_secs(15);
 pub enum TokenKind {
     Read,
     Write,
+    Invite,
 }
 
 impl TokenKind {
-    pub const ALL: [TokenKind; 2] = [TokenKind::Read, TokenKind::Write];
+    pub const ALL: [TokenKind; 3] = [TokenKind::Read, TokenKind::Write, TokenKind::Invite];
 
     /// Credential store account name; the MCP server reads the same names.
     pub fn account(self) -> &'static str {
         match self {
             TokenKind::Read => "read",
             TokenKind::Write => "write",
+            TokenKind::Invite => "invite",
         }
     }
 
@@ -34,6 +37,7 @@ impl TokenKind {
         match self {
             TokenKind::Read => "mcp:read",
             TokenKind::Write => "mcp:write",
+            TokenKind::Invite => "mcp:invite",
         }
     }
 
@@ -41,6 +45,7 @@ impl TokenKind {
         match self {
             TokenKind::Read => "Read access",
             TokenKind::Write => "Write access",
+            TokenKind::Invite => "Invite access",
         }
     }
 
@@ -67,6 +72,8 @@ pub struct AgentAccessSettings {
     pub read: Option<AgentTokenInfo>,
     #[serde(default)]
     pub write: Option<AgentTokenInfo>,
+    #[serde(default)]
+    pub invite: Option<AgentTokenInfo>,
 }
 
 impl AgentAccessSettings {
@@ -74,6 +81,7 @@ impl AgentAccessSettings {
         match kind {
             TokenKind::Read => self.read.as_ref(),
             TokenKind::Write => self.write.as_ref(),
+            TokenKind::Invite => self.invite.as_ref(),
         }
     }
 
@@ -81,6 +89,7 @@ impl AgentAccessSettings {
         match kind {
             TokenKind::Read => self.read = info,
             TokenKind::Write => self.write = info,
+            TokenKind::Invite => self.invite = info,
         }
     }
 }
@@ -369,6 +378,8 @@ mod tests {
     fn test_kind_follows_the_single_scope() {
         assert_eq!(TokenKind::from_scopes(&["mcp:read".into()]), Some(TokenKind::Read));
         assert_eq!(TokenKind::from_scopes(&["mcp:write".into()]), Some(TokenKind::Write));
+        assert_eq!(TokenKind::from_scopes(&["mcp:invite".into()]), Some(TokenKind::Invite));
+        assert_eq!(TokenKind::from_scopes(&["mcp:write".into(), "mcp:invite".into()]), None);
         assert_eq!(TokenKind::from_scopes(&["gamelog:upload".into()]), None);
         assert_eq!(TokenKind::from_scopes(&["mcp:read".into(), "mcp:write".into()]), None);
         assert_eq!(TokenKind::from_scopes(&[]), None);
@@ -453,6 +464,15 @@ mod tests {
         assert_eq!(store.get("read").unwrap(), None);
         assert!(settings.get(TokenKind::Read).is_none());
         assert!(store.get("write").unwrap().is_some() && settings.get(TokenKind::Write).is_some());
+
+        // the opt-in invite token has its own account and is removed on its own
+        let invite = Redeemed { token: token("ef"), kind: TokenKind::Invite, info: AgentTokenInfo { id: "i1".into(), expires_at: None, saved_at: "t".into() } };
+        apply_redeemed(&store, &mut settings, &invite).unwrap();
+        assert_eq!(store.get("invite").unwrap().as_deref(), Some(token("ef").as_str()));
+        remove_token(&store, &mut settings, TokenKind::Invite).unwrap();
+        assert_eq!(store.get("invite").unwrap(), None);
+        assert!(settings.get(TokenKind::Invite).is_none());
+        assert!(store.get("write").unwrap().is_some());
     }
 
     #[test]
