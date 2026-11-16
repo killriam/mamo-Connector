@@ -415,11 +415,12 @@ pub async fn create_deck_from_moxfield(deck_id: &str) -> Result<DeckCreationResu
     
     // Imports used to stop at the Forge file, so decks imported in bulk (e.g. "Sync All via
     // Connector" for a creator) never showed up in MaMo. Register them like a regular sync does.
-    let mamo_note = register_moxfield_reference(&deck, deck_id, None).await;
-    let message = match mamo_note {
-        Some(note) => format!("Successfully created deck '{}' at {:?} [{}]", full_name, deck_path, note),
-        None => format!("Successfully created deck '{}' at {:?}", full_name, deck_path),
-    };
+    // A missing note used to end in a bare "Successfully created deck", so users looked for the
+    // deck on the MaMo website in vain: always say whether it reached MaMo, and why not.
+    let mamo_note = register_moxfield_reference(&deck, deck_id, None)
+        .await
+        .unwrap_or_else(|| reference_skip_reason(&Settings::load().unwrap_or_default()).to_string());
+    let message = format!("Successfully created deck '{}' at {:?} [{}]", full_name, deck_path, mamo_note);
     Ok(DeckCreationResult::success(message, deck_path))
 }
 
@@ -862,7 +863,7 @@ pub async fn create_deck_from_archidekt(deck_id: &str) -> Result<DeckCreationRes
         .context("Failed to create deck file")?;
     
     Ok(DeckCreationResult::success(
-        format!("Successfully created deck '{}' at {:?}", full_name, deck_path),
+        format!("Successfully created deck '{}' at {:?} [{}]", full_name, deck_path, FORGE_ONLY_NOTE),
         deck_path,
     ))
 }
@@ -1000,7 +1001,7 @@ pub async fn create_deck_from_deckstats(owner_id: &str, deck_id: &str) -> Result
         .context("Failed to create deck file")?;
     
     Ok(DeckCreationResult::success(
-        format!("Successfully created deck '{}' at {:?}", full_name, deck_path),
+        format!("Successfully created deck '{}' at {:?} [{}]", full_name, deck_path, FORGE_ONLY_NOTE),
         deck_path,
     ))
 }
@@ -2344,6 +2345,27 @@ fn with_mamo_note(mut result: DeckSyncResult, note: Option<String>) -> DeckSyncR
 const REFERENCE_CREATED_NOTE: &str = "Imported to MaMo as reference deck";
 const REFERENCE_UPDATED_PREFIX: &str = "MaMo reference updated";
 const REFERENCE_FAILED_PREFIX: &str = "MaMo registration failed";
+
+/// Why an import added a Moxfield deck to Forge only (no reference deck in MaMo).
+pub const NOT_ADDED_SYNC_OFF: &str =
+    "not added to MaMo: turn on 'Import & update synced decks as Reference Decks' in the Sync tab";
+pub const NOT_ADDED_SIGNED_OUT: &str = "not added to MaMo: sign in to your MaMo account in the Setup tab";
+pub const NOT_ADDED_UNKNOWN: &str = "not added to MaMo (no reference deck was created; see the activity log)";
+/// Single Archidekt / Deckstats imports only write the Forge file.
+pub const FORGE_ONLY_NOTE: &str =
+    "saved to Forge only, not added to MaMo: import it on the MaMo website (Import Deck) to see it there";
+
+/// Why `register_moxfield_reference` created nothing, for the import message: reference syncing
+/// switched off, no MaMo login stored, or (neither) an unknown reason.
+pub fn reference_skip_reason(settings: &Settings) -> &'static str {
+    if !settings.sync_as_reference_decks {
+        NOT_ADDED_SYNC_OFF
+    } else if settings.auth_token.is_none() && settings.gamelog_config.auth_token.is_none() {
+        NOT_ADDED_SIGNED_OUT
+    } else {
+        NOT_ADDED_UNKNOWN
+    }
+}
 
 /// How many of `results` were registered (or updated) as MaMo reference decks.
 pub fn count_reference_registrations(results: &[DeckCreationResult]) -> usize {
@@ -4276,6 +4298,30 @@ Name=Example Commander Deck
         );
         let local_only = DeckCreationResult::success("Successfully created deck 'C'".to_string(), path);
         assert_eq!(count_reference_registrations(&[created, updated, local_only]), 2);
+    }
+
+    #[test]
+    fn reference_skip_reason_names_the_missing_setting_or_login() {
+        let mut settings = Settings::default();
+        settings.auth_token = None;
+        settings.gamelog_config.auth_token = None;
+
+        settings.sync_as_reference_decks = false;
+        assert_eq!(reference_skip_reason(&settings), NOT_ADDED_SYNC_OFF);
+
+        settings.sync_as_reference_decks = true;
+        assert_eq!(reference_skip_reason(&settings), NOT_ADDED_SIGNED_OUT);
+
+        settings.gamelog_config.auth_token = Some("jwt".to_string());
+        assert_eq!(reference_skip_reason(&settings), NOT_ADDED_UNKNOWN);
+
+        // A skip note is neither a registration nor a failure for the bulk-import summary.
+        let skipped = DeckCreationResult::success(
+            format!("Successfully created deck 'A' [{}]", NOT_ADDED_SIGNED_OUT),
+            PathBuf::from("x.dck"),
+        );
+        assert_eq!(count_reference_registrations(std::slice::from_ref(&skipped)), 0);
+        assert_eq!(count_reference_failures(&[skipped]), 0);
     }
 
     #[test]

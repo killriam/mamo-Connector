@@ -1153,7 +1153,6 @@ async fn handle_import_user_decks(deeplink: &Deeplink) -> CommandResult {
             if matches!(source, UserDeckSource::MoxfieldProfile(_)) && !result.imported_decks.is_empty() {
                 let registered = crate::deck::count_reference_registrations(&result.imported_decks);
                 let failed = crate::deck::count_reference_failures(&result.imported_decks);
-                let signed_in = settings.auth_token.is_some() || settings.gamelog_config.auth_token.is_some();
                 let note = if failed > 0 && crate::deck::reference_failures_are_expired_login(&result.imported_decks) {
                     result.success = false;
                     format!(
@@ -1166,12 +1165,8 @@ async fn handle_import_user_decks(deeplink: &Deeplink) -> CommandResult {
                     format!("{} registered in MaMo, {} failed: {}", registered, failed, reason)
                 } else if registered > 0 {
                     format!("{} registered as reference decks in MaMo", registered)
-                } else if !settings.sync_as_reference_decks {
-                    "not added to MaMo: turn on 'Import & update synced decks as Reference Decks' in the Sync tab".to_string()
-                } else if !signed_in {
-                    "not added to MaMo: sign in to your MaMo account in the Setup tab".to_string()
                 } else {
-                    "not added to MaMo (no reference decks were created; see the activity log)".to_string()
+                    crate::deck::reference_skip_reason(&settings).to_string()
                 };
                 result.message = format!("{} - {}", result.message, note);
             }
