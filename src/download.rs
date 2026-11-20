@@ -874,6 +874,21 @@ pub fn connector_updates_dir() -> PathBuf {
         .join("updates")
 }
 
+/// Returns the path of `asset` if a previous session already fully downloaded it into
+/// `updates_dir` (e.g. the user closed the Connector instead of clicking "Restart Now").
+/// Release asset names are versioned, and a file only gets its final name after the `.staged`
+/// download completes, so existence means complete; the size check (when the release reports
+/// one) additionally rejects a truncated or mismatched file.
+pub fn find_already_downloaded_connector_update(updates_dir: &Path, asset: &ConnectorAsset) -> Option<PathBuf> {
+    let path = updates_dir.join(&asset.name);
+    let len = std::fs::metadata(&path).ok().filter(|m| m.is_file())?.len();
+    match asset.size {
+        Some(expected) if expected != len => None,
+        _ if len == 0 => None,
+        _ => Some(path),
+    }
+}
+
 /// Downloads the MaMo Connector binary to a staged file in the updates folder.
 pub async fn download_connector_update_staged(
     asset: &ConnectorAsset,
@@ -881,6 +896,10 @@ pub async fn download_connector_update_staged(
     cancelled: Arc<AtomicBool>,
 ) -> Result<PathBuf> {
     let dest_dir = connector_updates_dir();
+    if let Some(existing) = find_already_downloaded_connector_update(&dest_dir, asset) {
+        log::info!("MaMo Connector update {} already downloaded at {:?}; reusing it", asset.version, existing);
+        return Ok(existing);
+    }
     let temp_name = format!("{}.staged", asset.name);
     let staged_path = download_to_file(
         &asset.download_url,
@@ -1437,6 +1456,32 @@ mod tests {
     fn connector_updates_dir_creates_valid_path() {
         let dir = connector_updates_dir();
         assert!(dir.ends_with("updates"));
+    }
+
+    #[test]
+    fn find_already_downloaded_connector_update_matches_name_and_size() {
+        let dir = std::env::temp_dir().join("mamo-connector-find-downloaded-update-test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let asset = |size| ConnectorAsset {
+            version: "9.9.9".to_string(),
+            download_url: String::new(),
+            name: "mamo-connector-v9.9.9-windows-x64.exe".to_string(),
+            size,
+        };
+
+        assert_eq!(find_already_downloaded_connector_update(&dir, &asset(Some(4))), None, "missing file");
+
+        let path = dir.join("mamo-connector-v9.9.9-windows-x64.exe");
+        std::fs::write(&path, b"abcd").unwrap();
+        assert_eq!(find_already_downloaded_connector_update(&dir, &asset(Some(4))), Some(path.clone()));
+        assert_eq!(find_already_downloaded_connector_update(&dir, &asset(None)), Some(path.clone()));
+        assert_eq!(find_already_downloaded_connector_update(&dir, &asset(Some(5))), None, "size mismatch");
+
+        std::fs::write(&path, b"").unwrap();
+        assert_eq!(find_already_downloaded_connector_update(&dir, &asset(None)), None, "empty file");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

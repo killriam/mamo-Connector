@@ -1683,9 +1683,16 @@ impl LauncherApp {
                 runtime_handle_bg.block_on(async {
                     if let Ok(asset) = crate::download::resolve_connector_release_asset().await {
                         if is_newer_version(&asset.version, env!("CARGO_PKG_VERSION")) {
+                            let already_downloaded = crate::download::find_already_downloaded_connector_update(
+                                &crate::download::connector_updates_dir(),
+                                &asset,
+                            );
                             if let Ok(mut s) = update_check_bg.lock() {
                                 s.available_version = Some(asset.version.clone());
                                 s.asset = Some(asset);
+                                if already_downloaded.is_some() {
+                                    s.staged_path = already_downloaded;
+                                }
                             }
                             ctx_bg.request_repaint();
                         }
@@ -4158,6 +4165,13 @@ impl LauncherApp {
                         if let Ok(mut s) = update_check.lock() {
                             s.busy = false;
                             if is_newer {
+                                let already_downloaded = crate::download::find_already_downloaded_connector_update(
+                                    &crate::download::connector_updates_dir(),
+                                    &asset,
+                                );
+                                if already_downloaded.is_some() {
+                                    s.staged_path = already_downloaded;
+                                }
                                 s.available_version = Some(asset.version.clone());
                                 s.asset = Some(asset);
                                 s.dismissed = false;
