@@ -182,6 +182,8 @@ enum ConfirmAction {
     /// "Launch Forge" clicked with no deck picked in the "Your decks" selector — confirms the
     /// player actually wants a deck-less Forge session rather than having missed the picker.
     LaunchWithoutDeck,
+    /// The Connector window is being closed while Forge is still open.
+    CloseWhileForgeRunning,
 }
 
 /// The MaMo website's own base URL — the one place the Connector links back out to it.
@@ -1445,6 +1447,9 @@ struct LauncherApp {
     last_changed_decks_refresh: Option<Instant>,
     /// True while that refresh runs, so two never overlap
     changed_decks_refresh_running: Arc<AtomicBool>,
+    /// Set once closing is confirmed (or done by the app itself), so the "Forge is still
+    /// running" prompt doesn't cancel that close again.
+    close_confirmed: bool,
     /// Whether the bottom activity panel is collapsed
     activity_panel_collapsed: bool,
     /// Whether the Play tab's 6-card session timeline shows every step (true) or is narrowed to
@@ -1762,6 +1767,7 @@ impl LauncherApp {
             last_auto_gamelog_scan: None,
             last_changed_decks_refresh: None,
             changed_decks_refresh_running: Arc::new(AtomicBool::new(false)),
+            close_confirmed: false,
             activity_panel_collapsed: !started_with_deeplink,
             play_timeline_expanded: false,
             last_seen_entry_count: 0,
@@ -1799,6 +1805,17 @@ impl eframe::App for LauncherApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         if let Some(success) = self.initial_flash.take() {
             flash_taskbar(ctx, success);
+        }
+
+        // Closing the Connector while Forge is open asks first: the game log of the game in
+        // progress could no longer be uploaded, and Forge may close along with it.
+        if ctx.input(|i| i.viewport().close_requested()) && !self.close_confirmed {
+            let forge_running = self.forge_pid.lock().unwrap().is_some_and(crate::forge::is_process_running)
+                || crate::forge::is_forge_window_open();
+            if forge_running {
+                ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                self.confirm_action = Some(ConfirmAction::CloseWhileForgeRunning);
+            }
         }
 
         // Process initial deeplink on first frame (with progress logging) - only after setup wizard is completed/closed
@@ -3917,6 +3934,12 @@ impl LauncherApp {
                 "Launch Anyway",
                 colors::PRIMARY_ACTION,
             ),
+            ConfirmAction::CloseWhileForgeRunning => (
+                "Close MaMo Connector while Forge is running?",
+                "Forge is still open. Closing the Connector may close Forge too, and the game you're playing won't be uploaded to MaMo.\n\nFinish your game and close Forge first if you want it analysed.",
+                "Close Anyway",
+                colors::ERROR,
+            ),
         };
 
         egui::Window::new(title)
@@ -3943,6 +3966,10 @@ impl LauncherApp {
                                 ConfirmAction::Uninstall => self.do_uninstall(ctx),
                                 ConfirmAction::LaunchWithoutDeck => {
                                     self.request_forge_launch(PendingForgeLaunch::Plain, ctx);
+                                }
+                                ConfirmAction::CloseWhileForgeRunning => {
+                                    self.close_confirmed = true;
+                                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                                 }
                             }
                         }
@@ -4006,6 +4033,7 @@ impl LauncherApp {
             }
         }
 
+        self.close_confirmed = true;
         ctx.send_viewport_cmd(egui::ViewportCommand::Close);
     }
 
