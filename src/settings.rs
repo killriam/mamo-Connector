@@ -138,6 +138,10 @@ pub struct Settings {
     /// Whether to backward-import and synchronize decks as Reference Decks in MaMo
     #[serde(default = "default_true")]
     pub sync_as_reference_decks: bool,
+    /// Re-download MaMo decks already in Forge's deck folder in the background whenever they
+    /// are edited on MaMo, instead of only offering it at the next Forge launch.
+    #[serde(default = "default_true")]
+    pub auto_update_mamo_decks: bool,
     /// The last MaMo account deck picked in the Play tab's "Your decks" selector, so a
     /// relaunch doesn't forget it. `None` for "— none —" explicitly picked, or never set.
     #[serde(default)]
@@ -170,6 +174,7 @@ impl Default for Settings {
             simulation_games: default_simulation_games(),
             simulation_opponent_deck: default_simulation_opponent_deck(),
             sync_as_reference_decks: true,
+            auto_update_mamo_decks: true,
             last_selected_deck_id: None,
             proxy_printing_path: None,
             agent_access: Default::default(),

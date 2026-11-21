@@ -588,6 +588,15 @@ fn stem_matches_deck_name(stem: &str, deck_name: &str) -> bool {
     false
 }
 
+/// How often the background refresh checks MaMo for edited decks (same cadence as the gamelog scan).
+const CHANGED_DECKS_REFRESH_SECS: u64 = 300;
+
+/// Whether the background changed-decks refresh should run now: right away on the first check of
+/// a session, then once per `CHANGED_DECKS_REFRESH_SECS`.
+fn changed_decks_refresh_due(last: Option<Instant>, now: Instant) -> bool {
+    last.is_none_or(|t| now.saturating_duration_since(t).as_secs() >= CHANGED_DECKS_REFRESH_SECS)
+}
+
 /// If `deck` has already been downloaded into the Forge deck directory, return its file stem.
 ///
 /// Looks up known deck mappings (by `deck_id`) first, then falls back to sanitized filename
@@ -1432,6 +1441,10 @@ struct LauncherApp {
     forge_launcher_exited_at: Option<Instant>,
     /// Timestamp of last automatic gamelog scan
     last_auto_gamelog_scan: Option<Instant>,
+    /// When the background "decks edited on MaMo" refresh last ran (None = not yet this session)
+    last_changed_decks_refresh: Option<Instant>,
+    /// True while that refresh runs, so two never overlap
+    changed_decks_refresh_running: Arc<AtomicBool>,
     /// Whether the bottom activity panel is collapsed
     activity_panel_collapsed: bool,
     /// Whether the Play tab's 6-card session timeline shows every step (true) or is narrowed to
@@ -1747,6 +1760,8 @@ impl LauncherApp {
             forge_window_seen: false,
             forge_launcher_exited_at: None,
             last_auto_gamelog_scan: None,
+            last_changed_decks_refresh: None,
+            changed_decks_refresh_running: Arc::new(AtomicBool::new(false)),
             activity_panel_collapsed: !started_with_deeplink,
             play_timeline_expanded: false,
             last_seen_entry_count: 0,
@@ -2153,7 +2168,9 @@ impl eframe::App for LauncherApp {
                 }
             }
         }
-        
+
+        self.maybe_refresh_changed_decks(ctx);
+
         // Request a repaint in 500ms to keep checking for pending commands
         ctx.request_repaint_after(std::time::Duration::from_millis(500));
         
@@ -3051,6 +3068,70 @@ impl LauncherApp {
             },
         });
         ctx.request_repaint();
+    }
+
+    /// Keeps Forge's copies of the user's MaMo decks current without waiting for a launch: on
+    /// startup and every few minutes, re-downloads decks edited on MaMo since the Connector last
+    /// wrote them. Only decks already in Forge's deck folder are touched (see
+    /// `find_decks_changed_since_download`). A Forge that is already open keeps its in-memory copy
+    /// until it is restarted.
+    fn maybe_refresh_changed_decks(&mut self, ctx: &egui::Context) {
+        let now = Instant::now();
+        if !changed_decks_refresh_due(self.last_changed_decks_refresh, now)
+            || self.changed_decks_refresh_running.load(Ordering::SeqCst)
+            // The launch flow runs the same check itself; don't race it.
+            || self.prelaunch_update_dialog.is_some()
+        {
+            return;
+        }
+        self.last_changed_decks_refresh = Some(now);
+
+        let (enabled, config) = {
+            let s = self.settings.lock().unwrap();
+            (s.auto_update_mamo_decks, s.gamelog_config.clone())
+        };
+        if !enabled || config.auth_token.is_none() {
+            return;
+        }
+
+        self.changed_decks_refresh_running.store(true, Ordering::SeqCst);
+        let running = Arc::clone(&self.changed_decks_refresh_running);
+        let refresh_requested = Arc::clone(&self.forge_local_decks_refresh_requested);
+        let activity_log = Arc::clone(&self.activity_log);
+        let runtime_handle = self.runtime_handle.clone();
+        let ctx_bg = ctx.clone();
+
+        std::thread::spawn(move || {
+            runtime_handle.block_on(async {
+                let decks = match crate::user_decks::find_decks_changed_since_download(&config, None).await {
+                    Ok(decks) => decks,
+                    Err(e) => {
+                        // Offline or signed out: quietly try again next interval.
+                        log::info!("Background changed-decks check skipped: {e:#}");
+                        return;
+                    }
+                };
+                for deck in decks {
+                    let outcome = match crate::deck::create_deck_from_mamo(&deck.deck_id).await {
+                        Ok(r) if r.success => Ok(()),
+                        Ok(r) => Err(r.message),
+                        Err(e) => Err(format!("{e:#}")),
+                    };
+                    if let Ok(mut log) = activity_log.lock() {
+                        match outcome {
+                            Ok(()) => log.log_success(format!(
+                                "\u{1F504} Deck '{}' changed on MaMo — updated in Forge's deck folder",
+                                deck.deck_name
+                            )),
+                            Err(e) => log.log_error(format!("Could not update deck '{}' from MaMo: {e}", deck.deck_name)),
+                        }
+                    }
+                    refresh_requested.store(true, Ordering::Relaxed);
+                }
+            });
+            running.store(false, Ordering::SeqCst);
+            ctx_bg.request_repaint();
+        });
     }
 
     /// Re-download the ticked decks from MaMo in the background, then continue the launch.
@@ -5888,6 +5969,20 @@ impl LauncherApp {
             let _ = settings.save();
         }
 
+        let mut auto_update = self.settings.lock().unwrap().auto_update_mamo_decks;
+        if ui.checkbox(&mut auto_update, "Keep my MaMo decks in Forge up to date automatically")
+            .on_hover_text("Every 5 minutes, re-downloads your MaMo decks that are already in Forge's deck folder when you've edited them on MaMo. Restart Forge to see changes if it is already open.")
+            .changed()
+        {
+            let mut settings = self.settings.lock().unwrap();
+            settings.auto_update_mamo_decks = auto_update;
+            let _ = settings.save();
+            if auto_update {
+                // Check right away instead of waiting out the interval
+                self.last_changed_decks_refresh = None;
+            }
+        }
+
         if ui
             .add_enabled(!is_syncing, egui::Button::new("📤 Push local decks to MaMo as Reference"))
             .on_hover_text("Registers .dck files from your Forge deck folder that MaMo does not know yet as Reference Decks, so they can be picked as an archenemy / playtest opponent")
@@ -7844,6 +7939,16 @@ mod deck_picker_tests {
             find_local_deck_path(&deck, &local, None),
             Some("my commander deck".to_string())
         );
+    }
+
+    #[test]
+    fn changed_decks_refresh_runs_first_then_once_per_interval() {
+        let start = Instant::now();
+        assert!(changed_decks_refresh_due(None, start), "first check of a session runs at once");
+        let just_ran = start.checked_sub(std::time::Duration::from_secs(10)).unwrap_or(start);
+        assert!(!changed_decks_refresh_due(Some(just_ran), start), "not again within the interval");
+        let later = start + std::time::Duration::from_secs(CHANGED_DECKS_REFRESH_SECS);
+        assert!(changed_decks_refresh_due(Some(start), later), "due again once the interval passed");
     }
 
     #[test]
