@@ -1173,20 +1173,27 @@ pub fn list_forge_decks() -> Vec<String> {
 pub fn is_process_running(pid: u32) -> bool {
     #[cfg(windows)]
     {
-        use winapi::um::processthreadsapi::OpenProcess;
+        use winapi::um::processthreadsapi::{GetExitCodeProcess, OpenProcess};
         use winapi::um::handleapi::CloseHandle;
-        
+
         // PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
         const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
-        
+        const STILL_ACTIVE: u32 = 259;
+
+        // OpenProcess succeeding is NOT proof the process is running: an exited process's
+        // kernel object stays openable for as long as anyone (AV, shell, a parent) still holds
+        // a handle to it. Treating that as "alive" made the Connector believe Forge was open
+        // hours after it closed (close-confirmation dialog, endless periodic gamelog scans).
+        // The exit code is only STILL_ACTIVE while the process is actually running.
         unsafe {
             let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
             if handle.is_null() {
-                false
-            } else {
-                CloseHandle(handle);
-                true
+                return false;
             }
+            let mut exit_code: u32 = 0;
+            let ok = GetExitCodeProcess(handle, &mut exit_code);
+            CloseHandle(handle);
+            ok != 0 && exit_code == STILL_ACTIVE
         }
     }
     
@@ -1288,6 +1295,32 @@ pub fn is_forge_window_open() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Regression: an exited process whose handle is still held (here by our own `Child`)
+    /// stays openable via OpenProcess and must still be reported as not running.
+    #[cfg(windows)]
+    #[test]
+    fn test_is_process_running_exited_process_with_open_handle() {
+        let mut child = Command::new("cmd").args(["/c", "exit 0"]).spawn().expect("spawn cmd");
+        let pid = child.id();
+        child.wait().expect("wait cmd");
+        // `child` is still alive here, so the process object (and its PID) is not yet released.
+        assert!(!is_process_running(pid), "exited process reported as running");
+        drop(child);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn test_is_process_running_live_process() {
+        let mut child = Command::new("ping")
+            .args(["-n", "30", "127.0.0.1"])
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn ping");
+        assert!(is_process_running(child.id()), "live process reported as not running");
+        let _ = child.kill();
+        let _ = child.wait();
+    }
 
     #[test]
     fn test_validate_forge_path_nonexistent() {
