@@ -485,6 +485,15 @@ fn is_deck_uuid(id: &str) -> bool {
 /// listed deck is downloaded (a failed one is skipped and logged); when none of them could be
 /// downloaded, or the link has none, this falls back to the single opponent of
 /// `resolve_opponent_deck_path`. Never fails the launch.
+/// The deeplink's `opponentVersion`: `locked` asks for each opponent's last locked Legacy revision;
+/// anything else (or nothing) means the latest revision.
+fn opponent_revision(raw: Option<&str>) -> Option<crate::deck::MamoDeckRevision> {
+    match raw {
+        Some(v) if v.eq_ignore_ascii_case("locked") => Some(crate::deck::MamoDeckRevision::LegacyLocked),
+        _ => None,
+    }
+}
+
 async fn resolve_opponent_deck_paths(
     deck1_id: Option<&str>,
     deeplink: &Deeplink,
@@ -496,10 +505,13 @@ async fn resolve_opponent_deck_paths(
         .map(|raw| parse_opponent_ids(&raw))
         .unwrap_or_default();
     if !opponent_ids.is_empty() {
+        // opponentVersion=locked: each opponent plays the version it locked for its latest
+        // Legacy session (the Legacy Game table), not its unfinished edits.
+        let revision = opponent_revision(get_parameter(&deeplink.params, "opponentVersion").as_deref());
         log(&format!("Downloading {} opponent decks from MaMo", opponent_ids.len()));
         let mut paths = Vec::new();
         for id in &opponent_ids {
-            match create_deck_from_mamo(id).await {
+            match crate::deck::create_deck_from_mamo_revision(id, revision).await {
                 Ok(result) if result.success => {
                     if let Some(path) = result.deck_path {
                         paths.push(path.to_string_lossy().to_string());
@@ -1740,6 +1752,15 @@ fn parse_mana_cost(cost: &str) -> (u8, u8, u8, u8, u8, u8) {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn opponent_version_locked_asks_for_the_legacy_locked_revision() {
+        use crate::deck::MamoDeckRevision;
+        assert_eq!(opponent_revision(Some("locked")), Some(MamoDeckRevision::LegacyLocked));
+        assert_eq!(opponent_revision(Some("Locked")), Some(MamoDeckRevision::LegacyLocked));
+        assert_eq!(opponent_revision(Some("latest")), None);
+        assert_eq!(opponent_revision(None), None);
+    }
 
     #[test]
     fn opponent_ids_keep_uuids_only_once_and_at_most_seven() {

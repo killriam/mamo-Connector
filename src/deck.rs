@@ -1130,6 +1130,39 @@ pub async fn create_deck_from_mamo_with_progress(
     deck_id: &str,
     on_progress: Option<&ProgressCallback>,
 ) -> Result<DeckCreationResult> {
+    download_mamo_deck(deck_id, None, on_progress).await
+}
+
+/// Which revision of a MaMo deck to download.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MamoDeckRevision {
+    /// The revision the deck locked for its latest Legacy session (its latest when it never
+    /// locked one): what a Legacy Game opponent actually plays.
+    LegacyLocked,
+}
+
+/// The Forge export URL of a MaMo deck, optionally for a specific revision.
+fn mamo_forge_export_url(deck_id: &str, revision: Option<MamoDeckRevision>) -> String {
+    let base = format!("{}/api/deck/export/{}/forge", MAMO_API_URL, deck_id);
+    match revision {
+        Some(MamoDeckRevision::LegacyLocked) => format!("{}?revision=legacyLocked", base),
+        None => base,
+    }
+}
+
+/// Download a MaMo deck at the given revision (see [`MamoDeckRevision`]).
+pub async fn create_deck_from_mamo_revision(
+    deck_id: &str,
+    revision: Option<MamoDeckRevision>,
+) -> Result<DeckCreationResult> {
+    download_mamo_deck(deck_id, revision, None).await
+}
+
+async fn download_mamo_deck(
+    deck_id: &str,
+    revision: Option<MamoDeckRevision>,
+    on_progress: Option<&ProgressCallback>,
+) -> Result<DeckCreationResult> {
     let log = |msg: &str| {
         info!("{}", msg);
         if let Some(cb) = on_progress {
@@ -1140,7 +1173,7 @@ pub async fn create_deck_from_mamo_with_progress(
     log(&format!("Starting deck download for ID: {}", deck_id));
     
     // MaMo backend returns plain text Forge format
-    let url = format!("{}/api/deck/export/{}/forge", MAMO_API_URL, deck_id);
+    let url = mamo_forge_export_url(deck_id, revision);
     log("Fetching deck from MaMo API...");
 
     let (body, response_headers) = fetch_with_curl_and_headers(&url, &[
@@ -1239,7 +1272,11 @@ pub async fn create_deck_from_mamo_with_progress(
     
     log(&format!("Deck saved to: {:?}", deck_path));
 
-    record_mamo_deck_download(deck_id, response_headers.get("date").map(String::as_str));
+    // An older locked revision is not "the deck as on MaMo now": recording it would stop a later
+    // normal launch of this deck from fetching its latest version.
+    if revision.is_none() {
+        record_mamo_deck_download(deck_id, response_headers.get("date").map(String::as_str));
+    }
 
     // Also sync any playable scenarios for this deck so Forge's Scenario dropdown has them ready
     if let Ok(settings) = Settings::load() {
@@ -3138,6 +3175,16 @@ pub fn ensure_dummy_defender_deck() -> Result<()> {
 
 mod tests {
     use super::*;
+
+    #[test]
+    fn legacy_locked_revision_adds_the_export_parameter() {
+        let plain = mamo_forge_export_url("d1", None);
+        assert!(plain.ends_with("/api/deck/export/d1/forge"));
+        assert_eq!(
+            mamo_forge_export_url("d1", Some(MamoDeckRevision::LegacyLocked)),
+            format!("{}?revision=legacyLocked", plain)
+        );
+    }
 
     // ==================== Forge Scenario Export — Live Verification ====================
     //
