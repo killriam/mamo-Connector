@@ -545,10 +545,35 @@ fn opponent_seat_args(opponent_names: &[&str]) -> Vec<String> {
         .collect()
 }
 
+/// `--deck2 ...` for the opponents, then `--name1 <player> ...` for every seat that has a player
+/// name (index 0 is seat 1). Names beyond the seated players are dropped. `--nameN` needs a Forge
+/// build that knows it; older builds exit on it.
+fn seat_args(opponent_names: &[&str], seat_names: &[Option<&str>]) -> Vec<String> {
+    let seats = 1 + opponent_names.len().min(MAX_FORGE_OPPONENTS);
+    let mut args = opponent_seat_args(opponent_names);
+    for (i, name) in seat_names.iter().enumerate().take(seats) {
+        if let Some(name) = name.map(str::trim).filter(|n| !n.is_empty()) {
+            args.push(format!("--name{}", i + 1));
+            args.push(name.to_string());
+        }
+    }
+    args
+}
+
 /// `forge_launch_args_with_options` for any number of opponents (seats 2..8).
 fn forge_launch_args_for_seats(
     deck_name: Option<&str>,
     opponent_names: &[&str],
+    guarantee_cards_under_test: bool,
+) -> Vec<String> {
+    forge_launch_args_for_named_seats(deck_name, opponent_names, &[], guarantee_cards_under_test)
+}
+
+/// `forge_launch_args_for_seats` with player names per seat (see `seat_args`).
+fn forge_launch_args_for_named_seats(
+    deck_name: Option<&str>,
+    opponent_names: &[&str],
+    seat_names: &[Option<&str>],
     guarantee_cards_under_test: bool,
 ) -> Vec<String> {
     let mut args = vec!["gui".to_string(), "--format".to_string(), "commander".to_string()];
@@ -556,7 +581,7 @@ fn forge_launch_args_for_seats(
         args.push("--deck".to_string());
         args.push(deck.to_string());
     }
-    args.extend(opponent_seat_args(opponent_names));
+    args.extend(seat_args(opponent_names, seat_names));
     if guarantee_cards_under_test && deck_name.is_some() {
         args.push("--guarantee-cards-under-test".to_string());
     }
@@ -665,6 +690,17 @@ pub fn launch_forge_with_opponents(
     opponent_names: &[&str],
     guarantee_cards_under_test: bool,
 ) -> Result<ForgeLaunchResult> {
+    launch_forge_with_named_seats(forge_path, deck_name, opponent_names, &[], guarantee_cards_under_test)
+}
+
+/// `launch_forge_with_opponents` with player names per seat (`seat_names[0]` is seat 1).
+pub fn launch_forge_with_named_seats(
+    forge_path: &str,
+    deck_name: Option<&str>,
+    opponent_names: &[&str],
+    seat_names: &[Option<&str>],
+    guarantee_cards_under_test: bool,
+) -> Result<ForgeLaunchResult> {
     let forge_path_buf = PathBuf::from(forge_path);
     debug!("[launch_forge] Input forge_path: {}", forge_path);
     debug!("[launch_forge] Input deck_name: {:?}", deck_name);
@@ -756,7 +792,7 @@ pub fn launch_forge_with_opponents(
                 debug!("[launch_forge] Setting working directory: {}", dir.display());
                 cmd.current_dir(dir);
             }
-            cmd.args(forge_launch_args_for_seats(deck_name, opponent_names, guarantee_cards_under_test));
+            cmd.args(forge_launch_args_for_named_seats(deck_name, opponent_names, seat_names, guarantee_cards_under_test));
             cmd
         }
         "exe" | "cmd" | "bat" => {
@@ -776,7 +812,7 @@ pub fn launch_forge_with_opponents(
                 // line — so it needs the same args as every other launch path. This branch
                 // previously passed none at all, which is why a specific deck never got
                 // pre-selected when Forge was installed as an .exe.
-                cmd.args(forge_launch_args_for_seats(deck_name, opponent_names, guarantee_cards_under_test));
+                cmd.args(forge_launch_args_for_named_seats(deck_name, opponent_names, seat_names, guarantee_cards_under_test));
                 cmd.creation_flags(DETACHED_PROCESS);
                 debug!("[launch_forge] Using DETACHED_PROCESS flag");
                 cmd
@@ -793,7 +829,7 @@ pub fn launch_forge_with_opponents(
                     debug!("[launch_forge] Adding --deck argument: {}", deck);
                     cmd.arg("--deck").arg(deck);
                 }
-                cmd.args(opponent_seat_args(opponent_names));
+                cmd.args(seat_args(opponent_names, seat_names));
                 if guarantee_cards_under_test && deck_name.is_some() {
                     cmd.arg("--guarantee-cards-under-test");
                 }
@@ -810,7 +846,7 @@ pub fn launch_forge_with_opponents(
                     debug!("[launch_forge] Adding --deck argument for macOS: {}", deck);
                     cmd.arg("--deck").arg(deck);
                 }
-                cmd.args(opponent_seat_args(opponent_names));
+                cmd.args(seat_args(opponent_names, seat_names));
                 if guarantee_cards_under_test && deck_name.is_some() {
                     cmd.arg("--guarantee-cards-under-test");
                 }
@@ -828,7 +864,7 @@ pub fn launch_forge_with_opponents(
                 debug!("[launch_forge] Adding --deck argument: {}", deck);
                 cmd.arg("--deck").arg(deck);
             }
-            cmd.args(opponent_seat_args(opponent_names));
+            cmd.args(seat_args(opponent_names, seat_names));
             if guarantee_cards_under_test && deck_name.is_some() {
                 cmd.arg("--guarantee-cards-under-test");
             }
@@ -845,7 +881,7 @@ pub fn launch_forge_with_opponents(
                 debug!("[launch_forge] Adding --deck argument: {}", deck);
                 cmd.arg("--deck").arg(deck);
             }
-            cmd.args(opponent_seat_args(opponent_names));
+            cmd.args(seat_args(opponent_names, seat_names));
             if guarantee_cards_under_test && deck_name.is_some() {
                 cmd.arg("--guarantee-cards-under-test");
             }
@@ -1066,6 +1102,18 @@ pub fn launch_forge_from_settings_with_opponents(
     opponent_paths: &[&str],
     guarantee_cards_under_test: bool,
 ) -> Result<ForgeLaunchResult> {
+    launch_forge_from_settings_with_named_seats(deck_path, opponent_paths, &[], guarantee_cards_under_test)
+}
+
+/// `launch_forge_from_settings_with_opponents` with player names per seat (`seat_names[0]` is
+/// seat 1), e.g. the Legacy Game players. A Forge build without `--nameN` gets the same launch
+/// without names; one without `--deck3` falls back to the first opponent.
+pub fn launch_forge_from_settings_with_named_seats(
+    deck_path: Option<&str>,
+    opponent_paths: &[&str],
+    seat_names: &[Option<&str>],
+    guarantee_cards_under_test: bool,
+) -> Result<ForgeLaunchResult> {
     // Log if Forge is already running, but do not skip launch
     if is_forge_window_open() {
         info!("Forge is already running (window detected), but will attempt to launch again.");
@@ -1109,29 +1157,44 @@ pub fn launch_forge_from_settings_with_opponents(
         .collect();
     let opponent_refs: Vec<&str> = opponent_names.iter().map(String::as_str).collect();
 
-    let result = launch_forge_with_opponents(
-        &forge_path,
-        deck_name.as_deref(),
-        &opponent_refs,
-        guarantee_cards_under_test,
-    )?;
-    if !result.success && opponent_refs.len() > 1 && is_unknown_seat_option_error(&result.message) {
-        warn!("This Forge build cannot seat more than 2 players; launching against the first opponent only.");
-        let mut retry = launch_forge_with_opponents(
+    // Older Forge builds exit on options they do not know: drop the player names (`--nameN`),
+    // then the extra seats (`--deck3`..), and launch again.
+    let mut names: &[Option<&str>] = seat_names;
+    let mut opponents: &[&str] = &opponent_refs;
+    let mut notes: Vec<String> = Vec::new();
+    loop {
+        let mut result = launch_forge_with_named_seats(
             &forge_path,
             deck_name.as_deref(),
-            &opponent_refs[..1],
+            opponents,
+            names,
             guarantee_cards_under_test,
         )?;
-        if retry.success {
-            retry.message = format!(
-                "{} Your Forge cannot seat a whole table yet, so only {} plays against you. Update Forge to play against all opponents.",
-                retry.message, opponent_refs[0]
-            );
+        if !result.success && !names.is_empty() && is_unknown_name_option_error(&result.message) {
+            warn!("This Forge build cannot name seats; launching without player names.");
+            names = &[];
+            notes.push("Update Forge to see the players' names at the table.".to_string());
+            continue;
         }
-        return Ok(retry);
+        if !result.success && opponents.len() > 1 && is_unknown_seat_option_error(&result.message) {
+            warn!("This Forge build cannot seat more than 2 players; launching against the first opponent only.");
+            notes.push(format!(
+                "Your Forge cannot seat a whole table yet, so only {} plays against you. Update Forge to play against all opponents.",
+                opponents[0]
+            ));
+            opponents = &opponents[..1];
+            continue;
+        }
+        if result.success && !notes.is_empty() {
+            result.message = format!("{} {}", result.message, notes.join(" "));
+        }
+        return Ok(result);
     }
-    Ok(result)
+}
+
+/// Forge's own error for a name option it does not know, i.e. a build from before `--name1`.
+fn is_unknown_name_option_error(message: &str) -> bool {
+    message.contains("Unknown GUI option: --name")
 }
 
 /// Forge's own error for a deck option it does not know, i.e. a build from before `--deck3`.
@@ -1387,6 +1450,18 @@ mod tests {
         let args = forge_launch_args_for_seats(Some("Me"), &nine, false);
         assert!(args.contains(&"--deck8".to_string()));
         assert!(!args.contains(&"--deck9".to_string()));
+    }
+
+    #[test]
+    fn named_seats_add_name_options_after_the_decks() {
+        assert_eq!(
+            seat_args(&["Borg", "Klingons"], &[Some("killriam"), None, Some(" Q ")]),
+            vec!["--deck2", "Borg", "--deck3", "Klingons", "--name1", "killriam", "--name3", "Q"]
+        );
+        // A name for a seat nobody sits in is dropped.
+        assert_eq!(seat_args(&["Borg"], &[None, Some("a"), Some("b")]), vec!["--deck2", "Borg", "--name2", "a"]);
+        assert!(is_unknown_name_option_error("Unknown GUI option: --name1"));
+        assert!(!is_unknown_name_option_error("Unknown GUI option: --deck3"));
     }
 
     #[test]

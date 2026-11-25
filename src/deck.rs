@@ -174,6 +174,8 @@ pub struct DeckCreationResult {
     pub success: bool,
     pub message: String,
     pub deck_path: Option<PathBuf>,
+    /// The Legacy Game player whose deck this is (MaMo's `X-MaMo-Player-Name`), if any.
+    pub player_name: Option<String>,
 }
 
 impl DeckCreationResult {
@@ -182,6 +184,7 @@ impl DeckCreationResult {
             success: true,
             message,
             deck_path: Some(deck_path),
+            player_name: None,
         }
     }
 
@@ -190,6 +193,7 @@ impl DeckCreationResult {
             success: false,
             message,
             deck_path: None,
+            player_name: None,
         }
     }
 }
@@ -1320,10 +1324,23 @@ async fn download_mamo_deck(
         }
     }
     
-    Ok(DeckCreationResult::success(
+    let mut created = DeckCreationResult::success(
         format!("Successfully created MaMo deck '{}' at {:?}", deck_name, deck_path),
         deck_path,
-    ))
+    );
+    created.player_name = response_headers
+        .get("x-mamo-player-name")
+        .and_then(|v| decode_player_name_header(v));
+    Ok(created)
+}
+
+/// `X-MaMo-Player-Name` is URI-encoded (a header carries ASCII only); empty means no name.
+fn decode_player_name_header(raw: &str) -> Option<String> {
+    let query = format!("n={}", raw.replace('+', "%2B"));
+    url::form_urlencoded::parse(query.as_bytes())
+        .next()
+        .map(|(_, v)| v.trim().to_string())
+        .filter(|v| !v.is_empty())
 }
 
 /// Create a deck from MaMo backend
@@ -3175,6 +3192,13 @@ pub fn ensure_dummy_defender_deck() -> Result<()> {
 
 mod tests {
     use super::*;
+
+    #[test]
+    fn player_name_header_is_uri_decoded() {
+        assert_eq!(decode_player_name_header("Q%20Continuum").as_deref(), Some("Q Continuum"));
+        assert_eq!(decode_player_name_header("J%C3%BCrgen%2B1").as_deref(), Some("J\u{fc}rgen+1"));
+        assert_eq!(decode_player_name_header("%20"), None);
+    }
 
     #[test]
     fn legacy_locked_revision_adds_the_export_parameter() {

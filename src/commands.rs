@@ -3,7 +3,7 @@ use std::sync::{Arc, Mutex};
 use crate::deeplink::Deeplink;
 use crate::deck::{create_deck_from_id, create_deck_from_moxfield, create_deck_from_mamo, create_deck_from_mamo_with_progress, create_deck_and_scenario_for_forge, get_deck_directory, DeckCreationResult, DeckSyncResult, SyncStatus, sync_moxfield_deck_with_mamo_id, parse_moxfield_url, UserDecksImportResult, ProgressCallback};
 use crate::user_decks::{self, RemoteDeck, UserDeckSource};
-use crate::forge::{launch_forge_from_settings, launch_forge_from_settings_with_opponents, launch_forge_replay, ForgeLaunchResult, MAX_FORGE_OPPONENTS};
+use crate::forge::{launch_forge_from_settings, launch_forge_from_settings_with_named_seats, launch_forge_replay, ForgeLaunchResult, MAX_FORGE_OPPONENTS};
 use crate::gamelog::{download_replay_content, save_replay_to_forge_dir, ScenarioSyncResult, sync_forge_scenario_file, sync_all_scenario_files};
 use crate::proxy_print::{handle_print_proxies, ProxyPrintResult};
 use crate::settings::Settings;
@@ -387,9 +387,10 @@ async fn handle_playtest_with_scenario(deeplink: &Deeplink, log_collector: Optio
     // wins; otherwise the deck's archenemy, then the curated pool.
     let deck2_id = get_parameter(&deeplink.params, "deck2Id")
         .or_else(|| get_parameter(&deeplink.params, "deck2_id"));
-    let opponent_paths = resolve_opponent_deck_paths(Some(&deck_id), deeplink, deck2_id, None, &log).await;
-    let opponent_refs: Vec<&str> = opponent_paths.iter().map(String::as_str).collect();
-    match launch_forge_from_settings_with_opponents(deck_path_str.as_deref(), &opponent_refs, false) {
+    let opponents = resolve_opponent_deck_paths(Some(&deck_id), deeplink, deck2_id, None, &log).await;
+    let opponent_refs = opponents.refs();
+    let seat_names = opponents.seat_names(result.player_name.as_deref());
+    match launch_forge_from_settings_with_named_seats(deck_path_str.as_deref(), &opponent_refs, &seat_names, false) {
         Ok(forge_res) => CommandResult::DeckCreatedAndLaunched(result, forge_res),
         Err(e) => {
             error!("Forge launch failed: {}", e);
@@ -481,10 +482,6 @@ fn is_deck_uuid(id: &str) -> bool {
         })
 }
 
-/// All opponent deck paths for a launch, seat 2 first. With `opponentIds` in the link every
-/// listed deck is downloaded (a failed one is skipped and logged); when none of them could be
-/// downloaded, or the link has none, this falls back to the single opponent of
-/// `resolve_opponent_deck_path`. Never fails the launch.
 /// The deeplink's `opponentVersion`: `locked` asks for each opponent's last locked Legacy revision;
 /// anything else (or nothing) means the latest revision.
 fn opponent_revision(raw: Option<&str>) -> Option<crate::deck::MamoDeckRevision> {
@@ -494,13 +491,41 @@ fn opponent_revision(raw: Option<&str>) -> Option<crate::deck::MamoDeckRevision>
     }
 }
 
+/// The opponents of a launch, seat 2 first: each deck path with the Legacy Game player whose deck
+/// it is (from `opponentIds` downloads only; `None` otherwise).
+struct OpponentDecks {
+    paths: Vec<String>,
+    player_names: Vec<Option<String>>,
+}
+
+impl OpponentDecks {
+    fn refs(&self) -> Vec<&str> {
+        self.paths.iter().map(String::as_str).collect()
+    }
+
+    /// Player name per seat (`[0]` is seat 1, the player's own deck) — empty when no opponent
+    /// has one, so a normal playtest keeps Forge's own names.
+    fn seat_names<'a>(&'a self, own_player_name: Option<&'a str>) -> Vec<Option<&'a str>> {
+        if self.player_names.iter().all(Option::is_none) {
+            return Vec::new();
+        }
+        std::iter::once(own_player_name)
+            .chain(self.player_names.iter().map(Option::as_deref))
+            .collect()
+    }
+}
+
+/// All opponent deck paths for a launch, seat 2 first. With `opponentIds` in the link every
+/// listed deck is downloaded (a failed one is skipped and logged); when none of them could be
+/// downloaded, or the link has none, this falls back to the single opponent of
+/// `resolve_opponent_deck_path`. Never fails the launch.
 async fn resolve_opponent_deck_paths(
     deck1_id: Option<&str>,
     deeplink: &Deeplink,
     deck2_id: Option<String>,
     deck2_name_direct: Option<String>,
     log: &dyn Fn(&str),
-) -> Vec<String> {
+) -> OpponentDecks {
     let opponent_ids = get_parameter(&deeplink.params, "opponentIds")
         .map(|raw| parse_opponent_ids(&raw))
         .unwrap_or_default();
@@ -510,11 +535,13 @@ async fn resolve_opponent_deck_paths(
         let revision = opponent_revision(get_parameter(&deeplink.params, "opponentVersion").as_deref());
         log(&format!("Downloading {} opponent decks from MaMo", opponent_ids.len()));
         let mut paths = Vec::new();
+        let mut player_names = Vec::new();
         for id in &opponent_ids {
             match crate::deck::create_deck_from_mamo_revision(id, revision).await {
                 Ok(result) if result.success => {
                     if let Some(path) = result.deck_path {
                         paths.push(path.to_string_lossy().to_string());
+                        player_names.push(result.player_name);
                     }
                 }
                 Ok(result) => log(&format!("Opponent deck {} download failed: {}", id, result.message)),
@@ -523,14 +550,16 @@ async fn resolve_opponent_deck_paths(
         }
         if !paths.is_empty() {
             log(&format!("{} opponent decks ready", paths.len()));
-            return paths;
+            return OpponentDecks { paths, player_names };
         }
         log("No opponent deck could be downloaded — falling back to the default opponent.");
     }
-    resolve_opponent_deck_path(deck1_id, deck2_id, deck2_name_direct, log)
+    let paths: Vec<String> = resolve_opponent_deck_path(deck1_id, deck2_id, deck2_name_direct, log)
         .await
         .into_iter()
-        .collect()
+        .collect();
+    let player_names = vec![None; paths.len()];
+    OpponentDecks { paths, player_names }
 }
 
 /// Resolves the Forge `--deck2` opponent path for a launch, in priority order:
@@ -713,14 +742,14 @@ async fn handle_launch_forge_with_logger(deeplink: &Deeplink, log_collector: Opt
     // own lobby. If nothing resolves, this silently falls through to None — exactly today's
     // behavior.
     // `opponentIds` (a whole Legacy Game table) fills seats 2..8 and wins over all of the above.
-    let opponent_paths = resolve_opponent_deck_paths(
+    let opponents = resolve_opponent_deck_paths(
         deck_id.as_deref(),
         deeplink,
         deck2_id,
         deck2_name_direct,
         &log,
     ).await;
-    let opponent_refs: Vec<&str> = opponent_paths.iter().map(String::as_str).collect();
+    let opponent_refs = opponents.refs();
 
     // If we have a deck ID and shouldn't skip download, download it first
     let deck_path: Option<String> = if let Some(ref id) = deck_id {
@@ -748,9 +777,12 @@ async fn handle_launch_forge_with_logger(deeplink: &Deeplink, log_collector: Opt
                             .map(|p| p.to_string_lossy().to_string());
 
                         log("Launching Forge with deck...");
-                        let forge_result = launch_forge_from_settings_with_opponents(
+                        // At the Legacy Game table every seat carries its player's name.
+                        let seat_names = opponents.seat_names(result.player_name.as_deref());
+                        let forge_result = launch_forge_from_settings_with_named_seats(
                             deck_path_str.as_deref(),
                             &opponent_refs,
+                            &seat_names,
                             guarantee_cards_under_test,
                         );
                         match forge_result {
@@ -813,9 +845,10 @@ async fn handle_launch_forge_with_logger(deeplink: &Deeplink, log_collector: Opt
 
     // Launch Forge (without deck download, or deck already exists)
     log("Launching Forge...");
-    match launch_forge_from_settings_with_opponents(
+    match launch_forge_from_settings_with_named_seats(
         deck_path.as_deref(),
         &opponent_refs,
+        &opponents.seat_names(None),
         guarantee_cards_under_test,
     ) {
         Ok(result) => {
@@ -1752,6 +1785,17 @@ fn parse_mana_cost(cost: &str) -> (u8, u8, u8, u8, u8, u8) {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn seat_names_only_at_a_named_table() {
+        let named = OpponentDecks {
+            paths: vec!["a.dck".into(), "b.dck".into()],
+            player_names: vec![Some("icemagma1".into()), None],
+        };
+        assert_eq!(named.seat_names(Some("killriam")), vec![Some("killriam"), Some("icemagma1"), None]);
+        let unnamed = OpponentDecks { paths: vec!["a.dck".into()], player_names: vec![None] };
+        assert!(unnamed.seat_names(Some("killriam")).is_empty());
+    }
 
     #[test]
     fn opponent_version_locked_asks_for_the_legacy_locked_revision() {
